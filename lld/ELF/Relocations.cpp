@@ -1657,7 +1657,18 @@ template <class ELFT> void elf::scanRelocations() {
     auto fn = [f]() {
       RelocationScanner scanner;
       for (InputSectionBase *s : f->getSections()) {
-        if (s && s->kind() == SectionBase::Regular && s->isLive() &&
+        if (!s)
+          continue;
+        auto splitIt = riscvFunctionSplitChildren.find(s);
+        if (splitIt != riscvFunctionSplitChildren.end()) {
+          for (InputSectionBase *child : splitIt->second)
+            if (child->kind() == SectionBase::Regular && child->isLive() &&
+                (child->flags & SHF_ALLOC) &&
+                !(child->type == SHT_ARM_EXIDX && config->emachine == EM_ARM))
+              scanner.template scanSection<ELFT>(*child);
+          continue;
+        }
+        if (s->kind() == SectionBase::Regular && s->isLive() &&
             (s->flags & SHF_ALLOC) &&
             !(s->type == SHT_ARM_EXIDX && config->emachine == EM_ARM))
           scanner.template scanSection<ELFT>(*s);

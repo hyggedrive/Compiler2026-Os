@@ -375,6 +375,10 @@ def print_map: F<"print-map">,
 def print_memory_usage: F<"print-memory-usage">,
   HelpText<"Report target memory usage">;
 
+def print_riscv_function_sections_split: FF<"print-riscv-function-sections-split">,
+  HelpText<"Print RISC-V function section split audit statistics">,
+  Flags<[HelpHidden]>;
+
 defm relax: BB<"relax",
   "Enable target-specific relaxations if supported (default)",
   "Disable target-specific relaxations">;
@@ -382,6 +386,10 @@ defm relax: BB<"relax",
 defm relax_gp: BB<"relax-gp",
   "Enable global pointer relaxation",
   "Disable global pointer relaxation (default)">;
+
+def riscv_function_sections_split: FF<"riscv-function-sections-split">,
+  HelpText<"Audit RISC-V function-level InputSection splitting candidates">,
+  Flags<[HelpHidden]>;
 
 defm remap_inputs: EEq<"remap-inputs",
   "Remap input files matching <from-glob> to <to-file>">,

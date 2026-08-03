@@ -33,6 +33,10 @@ using namespace llvm::sys;
 using namespace lld;
 using namespace lld::elf;
 
+DenseMap<const InputSectionBase *, RISCVFunctionSplitRelocStorage>
+    elf::riscvFunctionSplitRelocStorage;
+DenseMap<const InputSectionBase *, SmallVector<InputSectionBase *, 0>>
+    elf::riscvFunctionSplitChildren;
 DenseSet<std::pair<const Symbol *, uint64_t>> elf::ppc64noTocRelax;
 
 // Returns a string to construct an error message.
@@ -133,6 +137,20 @@ void InputSectionBase::decompress() const {
 }
 
 template <class ELFT> RelsOrRelas<ELFT> InputSectionBase::relsOrRelas() const {
+  auto splitIt = riscvFunctionSplitRelocStorage.find(this);
+  if (splitIt != riscvFunctionSplitRelocStorage.end()) {
+    const RISCVFunctionSplitRelocStorage &storage = splitIt->second;
+    RelsOrRelas<ELFT> ret;
+    if (storage.relocsAreRela)
+      ret.relas = ArrayRef(
+          reinterpret_cast<const typename ELFT::Rela *>(storage.relocs),
+          storage.relocCount);
+    else
+      ret.rels = ArrayRef(
+          reinterpret_cast<const typename ELFT::Rel *>(storage.relocs),
+          storage.relocCount);
+    return ret;
+  }
   if (relSecIdx == 0)
     return {};
   RelsOrRelas<ELFT> ret;

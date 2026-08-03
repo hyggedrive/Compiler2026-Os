@@ -14,6 +14,7 @@
 #include "lld/Common/LLVM.h"
 #include "lld/Common/Memory.h"
 #include "llvm/ADT/CachedHashString.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TinyPtrVector.h"
@@ -266,6 +267,21 @@ protected:
   void parseCompressedHeader();
   void decompress() const;
 };
+
+struct RISCVFunctionSplitRelocStorage {
+  bool relocsAreRela = false;
+  const void *relocs = nullptr;
+  uint32_t relocCount = 0;
+  InputSectionBase *parent = nullptr;
+  uint64_t originalBegin = 0;
+  uint64_t originalEnd = 0;
+};
+
+extern llvm::DenseMap<const InputSectionBase *, RISCVFunctionSplitRelocStorage>
+    riscvFunctionSplitRelocStorage;
+extern llvm::DenseMap<const InputSectionBase *,
+                      llvm::SmallVector<InputSectionBase *, 0>>
+    riscvFunctionSplitChildren;
 
 // SectionPiece represents a piece of splittable section contents.
 // We allocate a lot of these and binary search on them. This means that they
