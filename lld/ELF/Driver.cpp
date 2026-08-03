@@ -50,6 +50,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/LTO/LTO.h"
@@ -1374,8 +1375,18 @@ static void readConfigs(opt::InputArgList &args) {
       args.getLastArgValue(OPT_print_symbol_order);
   config->relax = args.hasFlag(OPT_relax, OPT_no_relax, true);
   config->relaxGP = args.hasFlag(OPT_relax_gp, OPT_no_relax_gp, false);
+  config->riscvFunctionSectionsSplitDebugRelocs =
+      args.hasArg(OPT_riscv_function_sections_split_debug_relocs);
+  config->riscvFunctionSectionsSplitGC =
+      args.hasFlag(OPT_riscv_function_sections_split_gc,
+                   OPT_no_riscv_function_sections_split_gc, false);
+  config->riscvFunctionSectionsSplitGC =
+      config->riscvFunctionSectionsSplitGC ||
+      config->riscvFunctionSectionsSplitDebugRelocs;
+
   config->riscvFunctionSectionsSplit =
-      args.hasArg(OPT_riscv_function_sections_split);
+      args.hasArg(OPT_riscv_function_sections_split) ||
+      config->riscvFunctionSectionsSplitGC;
   config->rpath = getRpath(args);
   config->relocatable = args.hasArg(OPT_relocatable);
 
@@ -1768,8 +1779,21 @@ static void setConfigs(opt::InputArgList &args) {
 
   const bool isRISCV32 = config->emachine == EM_RISCV && !config->is64;
 
+  if (!args.hasArg(OPT_gc_sections, OPT_no_gc_sections))
+    config->gcSections = isRISCV32;
+
   if (!args.hasArg(OPT_relax_gp, OPT_no_relax_gp))
     config->relaxGP = isRISCV32;
+
+  if (!args.hasArg(OPT_riscv_function_sections_split_gc,
+                   OPT_no_riscv_function_sections_split_gc))
+    config->riscvFunctionSectionsSplitGC = isRISCV32;
+  config->riscvFunctionSectionsSplitGC =
+      config->riscvFunctionSectionsSplitGC ||
+      config->riscvFunctionSectionsSplitDebugRelocs;
+  config->riscvFunctionSectionsSplit =
+      config->riscvFunctionSectionsSplit ||
+      config->riscvFunctionSectionsSplitGC;
 
   config->copyRelocs = (config->relocatable || config->emitRelocs);
   config->is64 = (k == ELF64LEKind || k == ELF64BEKind);
@@ -1779,6 +1803,19 @@ static void setConfigs(opt::InputArgList &args) {
   config->isPic = config->pie || config->shared;
   config->picThunk = args.hasArg(OPT_pic_veneer, config->isPic);
   config->wordsize = config->is64 ? 8 : 4;
+
+  if (m == EM_RISCV && !config->is64 &&
+      config->riscvFunctionSectionsSplitDebugRelocs &&
+      llvm::none_of(config->deadRelocInNonAlloc,
+                    [](const std::pair<GlobPattern, uint64_t> &patAndValue) {
+                      return patAndValue.first.match(".debug_info");
+                    })) {
+    Expected<GlobPattern> pat = GlobPattern::create(".debug_info");
+    if (!pat)
+      error(toString(pat.takeError()));
+    else
+      config->deadRelocInNonAlloc.emplace_back(std::move(*pat), 0xffffffff);
+  }
 
   // ELF defines two different ways to store relocation addends as shown below:
   //
@@ -2815,6 +2852,88 @@ struct RISCVFunctionRange {
   uint64_t end;
 };
 
+enum class RISCVFunctionSplitDebugFallbackReason {
+  AllocSource,
+  NonDebugSource,
+  EhFrame,
+  NonDefinedTarget,
+  SectionSymbol,
+  OtherSection,
+  UnsupportedRel,
+  TargetGap,
+  TargetOutOfRange,
+  AmbiguousBoundary,
+  AddendCrossesChild,
+  InconsistentSymbolMapping,
+  Count,
+};
+
+static StringRef debugFallbackReasonToString(
+    RISCVFunctionSplitDebugFallbackReason r) {
+  switch (r) {
+  case RISCVFunctionSplitDebugFallbackReason::AllocSource:
+    return "alloc-source";
+  case RISCVFunctionSplitDebugFallbackReason::NonDebugSource:
+    return "non-debug-source";
+  case RISCVFunctionSplitDebugFallbackReason::EhFrame:
+    return "eh-frame";
+  case RISCVFunctionSplitDebugFallbackReason::NonDefinedTarget:
+    return "non-defined-target";
+  case RISCVFunctionSplitDebugFallbackReason::SectionSymbol:
+    return "section-symbol";
+  case RISCVFunctionSplitDebugFallbackReason::OtherSection:
+    return "other-section";
+  case RISCVFunctionSplitDebugFallbackReason::UnsupportedRel:
+    return "unsupported-rel";
+  case RISCVFunctionSplitDebugFallbackReason::TargetGap:
+    return "target-gap";
+  case RISCVFunctionSplitDebugFallbackReason::TargetOutOfRange:
+    return "target-out-of-range";
+  case RISCVFunctionSplitDebugFallbackReason::AmbiguousBoundary:
+    return "ambiguous-boundary";
+  case RISCVFunctionSplitDebugFallbackReason::AddendCrossesChild:
+    return "addend-crosses-child";
+  case RISCVFunctionSplitDebugFallbackReason::InconsistentSymbolMapping:
+    return "inconsistent-symbol-mapping";
+  case RISCVFunctionSplitDebugFallbackReason::Count:
+    break;
+  }
+  llvm_unreachable("invalid RISC-V function split debug fallback reason");
+}
+
+struct RISCVDebugRelocMapping {
+  InputSectionBase *source = nullptr;
+  Defined *target = nullptr;
+  uint64_t parentOffset = 0;
+  uint32_t childIndex = 0;
+  uint64_t symbolValue = 0;
+  uint64_t targetLocalOffset = 0;
+  bool parentEnd = false;
+  bool boundaryStart = false;
+};
+
+struct RISCVIncomingRelocAudit {
+  std::string sourceFile;
+  std::string sourceSection;
+  uint32_t sourceSectionType = 0;
+  uint64_t sourceSectionFlags = 0;
+  uint64_t sourceOffset = 0;
+  bool sourceAlloc = false;
+  bool sourceDebug = false;
+  bool sourceEhFrame = false;
+  RelType relocType = static_cast<RelType>(0);
+  std::string targetSymbol;
+  uint8_t targetSymbolType = STT_NOTYPE;
+  bool targetSectionSymbol = false;
+  int64_t addend = 0;
+  bool hasTargetOffset = false;
+  uint64_t targetOffset = 0;
+  bool uniquelyMappable = false;
+  bool targetGap = false;
+  bool targetBoundary = false;
+  uint64_t childLocalOffset = 0;
+};
+
 struct RISCVFunctionSplitAuditResult {
   InputSection *parent = nullptr;
   SmallVector<RISCVFunctionRange, 0> ranges;
@@ -2828,6 +2947,14 @@ struct RISCVFunctionSplitAuditResult {
   bool safe = true;
   std::bitset<static_cast<size_t>(RISCVFunctionSplitBlockReason::Count)>
       reasons;
+  SmallVector<RISCVIncomingRelocAudit, 0> incomingRelocs;
+  SmallVector<RISCVDebugRelocMapping, 0> debugRelocMappings;
+  std::bitset<
+      static_cast<size_t>(RISCVFunctionSplitDebugFallbackReason::Count)>
+      debugFallbackReasons;
+  std::array<uint32_t,
+             static_cast<size_t>(RISCVFunctionSplitDebugFallbackReason::Count)>
+      debugFallbackRelocCounts = {};
 };
 
 struct RISCVFunctionSplitDetail {
@@ -2857,6 +2984,50 @@ static void addReason(RISCVFunctionSplitAuditResult &r,
 static bool hasReason(const RISCVFunctionSplitAuditResult &r,
                       RISCVFunctionSplitBlockReason reason) {
   return r.reasons.test(static_cast<size_t>(reason));
+}
+
+static void addDebugFallback(
+    RISCVFunctionSplitAuditResult &r,
+    RISCVFunctionSplitDebugFallbackReason reason) {
+  r.debugFallbackReasons.set(static_cast<size_t>(reason));
+  ++r.debugFallbackRelocCounts[static_cast<size_t>(reason)];
+}
+
+static bool addDebugRelocMapping(RISCVFunctionSplitAuditResult &result,
+                                 InputSectionBase &from, Defined &d,
+                                 uint64_t parentOffset, uint32_t childIndex,
+                                 uint64_t symbolValue,
+                                 uint64_t targetLocalOffset, bool parentEnd,
+                                 bool boundaryStart) {
+  for (const RISCVDebugRelocMapping &m : result.debugRelocMappings)
+    if (m.target == &d &&
+        (m.childIndex != childIndex || m.symbolValue != symbolValue ||
+         m.parentEnd != parentEnd || m.boundaryStart != boundaryStart)) {
+      addDebugFallback(
+          result,
+          RISCVFunctionSplitDebugFallbackReason::InconsistentSymbolMapping);
+      return false;
+    }
+  result.debugRelocMappings.push_back({&from, &d, parentOffset, childIndex,
+                                       symbolValue, targetLocalOffset,
+                                       parentEnd, boundaryStart});
+  return true;
+}
+
+static int functionRangeStartIndex(ArrayRef<RISCVFunctionRange> ranges,
+                                   uint64_t off) {
+  for (auto [i, r] : llvm::enumerate(ranges))
+    if (r.begin == off)
+      return static_cast<int>(i);
+  return -1;
+}
+
+static bool isDebugBoundaryStartSymbol(Defined &d,
+                                       ArrayRef<RISCVFunctionRange> ranges,
+                                       uint64_t parentSize) {
+  return d.type == STT_NOTYPE && d.size == 0 && !d.isSection() &&
+         d.value != parentSize &&
+         functionRangeStartIndex(ranges, d.value) != -1;
 }
 
 static int rangeIndex(ArrayRef<RISCVFunctionRange> ranges, uint64_t off) {
@@ -3023,6 +3194,186 @@ static int64_t getRISCVFunctionSplitAddend(const RelTy &rel) {
   if constexpr (RelTy::IsRela)
     return rel.r_addend;
   return 0;
+}
+
+template <class RelTy>
+static void recordIncomingRelocAudit(InputSection &parent,
+                                     ArrayRef<RISCVFunctionRange> ranges,
+                                     InputSectionBase &from, const RelTy &rel,
+                                     Defined &d,
+                                     RISCVFunctionSplitAuditResult &result) {
+  RISCVIncomingRelocAudit audit;
+  audit.sourceFile = toString(from.file);
+  audit.sourceSection = from.name.str();
+  audit.sourceSectionType = from.type;
+  audit.sourceSectionFlags = from.flags;
+  audit.sourceOffset = rel.r_offset;
+  audit.sourceAlloc = from.flags & SHF_ALLOC;
+  audit.sourceDebug = isDebugSection(from);
+  audit.sourceEhFrame = isa<EhInputSection>(&from);
+  audit.relocType = rel.getType(config->isMips64EL);
+  audit.targetSymbol = d.getName().str();
+  audit.targetSymbolType = d.type;
+  audit.targetSectionSymbol = d.isSection();
+  audit.addend = getRISCVFunctionSplitAddend(rel);
+
+  uint64_t target = d.value;
+  bool hasTarget = true;
+  if constexpr (RelTy::IsRela)
+    hasTarget = checkedAddend(d.value, rel.r_addend, target);
+  audit.hasTargetOffset = hasTarget;
+  if (hasTarget) {
+    audit.targetOffset = target;
+    int piece = rangeIndex(ranges, target);
+    audit.uniquelyMappable = piece != -1;
+    if (audit.uniquelyMappable)
+      audit.childLocalOffset = target - ranges[piece].begin;
+    else
+      audit.targetGap = target < parent.content().size();
+    audit.targetBoundary = hasRISCVFunctionRangeStart(ranges, target) ||
+                           isRISCVFunctionSplitBoundary(ranges, target);
+  }
+  result.incomingRelocs.push_back(std::move(audit));
+}
+
+template <class RelTy>
+static bool planDebugIncomingReloc(InputSection &parent,
+                                   ArrayRef<RISCVFunctionRange> ranges,
+                                   InputSectionBase &from, const RelTy &rel,
+                                   Defined *d,
+                                   RISCVFunctionSplitAuditResult &result) {
+  if (from.flags & SHF_ALLOC) {
+    addDebugFallback(result,
+                     RISCVFunctionSplitDebugFallbackReason::AllocSource);
+    return false;
+  }
+  if (!isDebugSection(from)) {
+    addDebugFallback(result,
+                     RISCVFunctionSplitDebugFallbackReason::NonDebugSource);
+    return false;
+  }
+  if (isa<EhInputSection>(&from)) {
+    addDebugFallback(result, RISCVFunctionSplitDebugFallbackReason::EhFrame);
+    return false;
+  }
+  if (!d) {
+    addDebugFallback(
+        result, RISCVFunctionSplitDebugFallbackReason::NonDefinedTarget);
+    return false;
+  }
+  if (d->isSection()) {
+    addDebugFallback(result,
+                     RISCVFunctionSplitDebugFallbackReason::SectionSymbol);
+    return false;
+  }
+  if (d->section != &parent) {
+    addDebugFallback(result, RISCVFunctionSplitDebugFallbackReason::OtherSection);
+    return false;
+  }
+  if constexpr (!RelTy::IsRela) {
+    addDebugFallback(result,
+                     RISCVFunctionSplitDebugFallbackReason::UnsupportedRel);
+    return false;
+  } else {
+    uint64_t target;
+    if (!checkedAddend(d->value, rel.r_addend, target)) {
+      addDebugFallback(
+          result, RISCVFunctionSplitDebugFallbackReason::TargetOutOfRange);
+      return false;
+    }
+    uint64_t parentSize = parent.content().size();
+    if (target > parentSize) {
+      addDebugFallback(
+          result, RISCVFunctionSplitDebugFallbackReason::TargetOutOfRange);
+      return false;
+    }
+
+    if (target == parentSize) {
+      if (d->value != parentSize || rel.r_addend != 0 || ranges.empty() ||
+          ranges.back().end != parentSize) {
+        addDebugFallback(result,
+                         RISCVFunctionSplitDebugFallbackReason::TargetGap);
+        return false;
+      }
+      uint64_t value = ranges.back().end - ranges.back().begin;
+      return addDebugRelocMapping(
+          result, from, *d, target, static_cast<uint32_t>(ranges.size() - 1),
+          value, value, true, false);
+    }
+
+    int symbolPiece = rangeIndex(ranges, d->value);
+    if (symbolPiece == -1) {
+      addDebugFallback(result,
+                       d->value < parentSize
+                           ? RISCVFunctionSplitDebugFallbackReason::TargetGap
+                           : RISCVFunctionSplitDebugFallbackReason::
+                                 TargetOutOfRange);
+      return false;
+    }
+    int targetPiece = rangeIndex(ranges, target);
+    if (targetPiece == -1) {
+      addDebugFallback(result,
+                       target < parentSize
+                           ? RISCVFunctionSplitDebugFallbackReason::TargetGap
+                           : RISCVFunctionSplitDebugFallbackReason::
+                                 TargetOutOfRange);
+      return false;
+    }
+    int boundaryStart = -1;
+    if (d->type == STT_NOTYPE && d->size == 0 && d->value != parentSize)
+      boundaryStart = functionRangeStartIndex(ranges, d->value);
+
+    if (boundaryStart != -1) {
+      if (symbolPiece != boundaryStart) {
+        addDebugFallback(
+            result, RISCVFunctionSplitDebugFallbackReason::AmbiguousBoundary);
+        return false;
+      }
+      if (symbolPiece != targetPiece) {
+        addDebugFallback(
+            result, RISCVFunctionSplitDebugFallbackReason::AddendCrossesChild);
+        return false;
+      }
+      return addDebugRelocMapping(
+          result, from, *d, target, static_cast<uint32_t>(boundaryStart), 0,
+          target - ranges[targetPiece].begin, false, true);
+    }
+
+    if (d->size) {
+      if (d->size > std::numeric_limits<uint64_t>::max() - d->value ||
+          !rangeInOnePiece(ranges, d->value, d->value + d->size)) {
+        addDebugFallback(
+            result, RISCVFunctionSplitDebugFallbackReason::AmbiguousBoundary);
+        return false;
+      }
+    } else if (isRISCVFunctionSplitBoundary(ranges, d->value) &&
+               (d->type != STT_FUNC ||
+                !hasRISCVFunctionRangeStart(ranges, d->value))) {
+      addDebugFallback(
+          result, RISCVFunctionSplitDebugFallbackReason::AmbiguousBoundary);
+      return false;
+    }
+
+    if (symbolPiece != targetPiece) {
+      addDebugFallback(
+          result, RISCVFunctionSplitDebugFallbackReason::AddendCrossesChild);
+      return false;
+    }
+
+    bool atBoundary = isRISCVFunctionSplitBoundary(ranges, target);
+    bool isFunctionStart = hasRISCVFunctionRangeStart(ranges, target);
+    if (atBoundary && target != 0 &&
+        !(d->type == STT_FUNC && isFunctionStart)) {
+      addDebugFallback(
+          result, RISCVFunctionSplitDebugFallbackReason::AmbiguousBoundary);
+      return false;
+    }
+
+    return addDebugRelocMapping(
+        result, from, *d, target, static_cast<uint32_t>(symbolPiece),
+        d->value - ranges[symbolPiece].begin,
+        target - ranges[targetPiece].begin, false, false);
+  }
 }
 
 template <class ELFT, class RelTy>
@@ -3225,11 +3576,36 @@ static void auditIncomingRelocs(InputSection &parent,
     if (!d || d->section != &parent)
       continue;
     ++result.incomingRelocationCount;
+    recordIncomingRelocAudit(parent, ranges, from, rel, *d, result);
+    if (config->riscvFunctionSectionsSplitDebugRelocs &&
+        from.name.starts_with(".debug") && (from.flags & SHF_ALLOC)) {
+      addDebugFallback(result,
+                       RISCVFunctionSplitDebugFallbackReason::AllocSource);
+      addReason(result, RISCVFunctionSplitBlockReason::IncomingDebugRelocation);
+      continue;
+    }
+    if (config->riscvFunctionSectionsSplitDebugRelocs &&
+        isDebugBoundaryStartSymbol(*d, ranges, parent.content().size()) &&
+        !isDebugSection(from)) {
+      if (isa<EhInputSection>(&from))
+        addDebugFallback(result, RISCVFunctionSplitDebugFallbackReason::EhFrame);
+      else if (from.flags & SHF_ALLOC)
+        addDebugFallback(result,
+                         RISCVFunctionSplitDebugFallbackReason::AllocSource);
+      else
+        addDebugFallback(
+            result, RISCVFunctionSplitDebugFallbackReason::NonDebugSource);
+      addReason(result, RISCVFunctionSplitBlockReason::IncomingDebugRelocation);
+      continue;
+    }
     if (isa<EhInputSection>(&from)) {
       addReason(result, RISCVFunctionSplitBlockReason::IncomingEhFrame);
       continue;
     }
     if (isDebugSection(from)) {
+      if (config->riscvFunctionSectionsSplitDebugRelocs &&
+          planDebugIncomingReloc(parent, ranges, from, rel, d, result))
+        continue;
       addReason(result,
                 RISCVFunctionSplitBlockReason::IncomingDebugRelocation);
       continue;
@@ -3393,7 +3769,18 @@ static bool splitRISCVFunctionSplitSection(
   if (rels.areRelocsRel())
     return false;
 
-  SmallVector<std::pair<Defined *, uint32_t>, 0> rebindings;
+  struct SymbolRebind {
+    Defined *sym = nullptr;
+    uint32_t childIndex = 0;
+    uint64_t value = 0;
+  };
+  SmallVector<SymbolRebind, 0> rebindings;
+  auto findDebugMapping = [&](Defined *d) -> const RISCVDebugRelocMapping * {
+    for (const RISCVDebugRelocMapping &m : plan.debugRelocMappings)
+      if (m.target == d)
+        return &m;
+    return nullptr;
+  };
   auto *file = cast<ObjFile<ELFT>>(parent->file);
   for (Symbol *sym : file->getSymbols()) {
     auto *d = dyn_cast_or_null<Defined>(sym);
@@ -3401,8 +3788,14 @@ static bool splitRISCVFunctionSplitSection(
       continue;
 
     int i = rangeIndex(plan.ranges, d->value);
-    if (i == -1)
+    if (i == -1) {
+      if (const RISCVDebugRelocMapping *m = findDebugMapping(d);
+          m && m->parentEnd) {
+        rebindings.push_back({d, m->childIndex, m->symbolValue});
+        continue;
+      }
       return false;
+    }
     if (d->size) {
       if (d->size > std::numeric_limits<uint64_t>::max() - d->value ||
           !rangeInOnePiece(plan.ranges, d->value, d->value + d->size))
@@ -3410,9 +3803,15 @@ static bool splitRISCVFunctionSplitSection(
     } else if (isRISCVFunctionSplitBoundary(plan.ranges, d->value) &&
                (d->type != STT_FUNC ||
                 !hasRISCVFunctionRangeStart(plan.ranges, d->value))) {
+      if (const RISCVDebugRelocMapping *m = findDebugMapping(d);
+          m && m->boundaryStart) {
+        rebindings.push_back({d, m->childIndex, m->symbolValue});
+        continue;
+      }
       return false;
     }
-    rebindings.push_back({d, static_cast<uint32_t>(i)});
+    rebindings.push_back(
+        {d, static_cast<uint32_t>(i), d->value - plan.ranges[i].begin});
   }
 
   using Elf_Rela = typename ELFT::Rela;
@@ -3456,12 +3855,13 @@ static bool splitRISCVFunctionSplitSection(
     children.push_back(child);
   }
 
-  for (size_t i = 0, e = children.size(); i != e; ++i)
-    children[i]->nextInSectionGroup = children[(i + 1) % e];
+  if (!config->riscvFunctionSectionsSplitGC)
+    for (size_t i = 0, e = children.size(); i != e; ++i)
+      children[i]->nextInSectionGroup = children[(i + 1) % e];
 
-  for (auto [d, i] : rebindings) {
-    d->section = children[i];
-    d->value -= plan.ranges[i].begin;
+  for (SymbolRebind r : rebindings) {
+    r.sym->section = children[r.childIndex];
+    r.sym->value = r.value;
   }
 
   SmallVector<InputSectionBase *, 0> childBases;
@@ -3508,6 +3908,155 @@ splitRISCVFunctionSections(ArrayRef<RISCVFunctionSplitAuditResult> results) {
   }
 
   return stats;
+}
+
+static bool hasAcceptedDebugReloc(const RISCVFunctionSplitAuditResult &r) {
+  return !r.debugRelocMappings.empty();
+}
+
+static void printRISCVFunctionSplitDebugRelocStats(
+    ArrayRef<RISCVFunctionSplitAuditResult> results,
+    const RISCVFunctionSplitStats &splitStats) {
+  if (!config->riscvFunctionSectionsSplitDebugRelocs)
+    return;
+
+  uint64_t accepted = 0, interior = 0, parentEnd = 0;
+  uint64_t planned = 0, plannedBoundaryStart = 0, rejectedAmbiguous = 0;
+  uint32_t newlySafeParents = 0, newlySplitParents = 0;
+  uint64_t newlySplitFunctions = 0, newlySplitBytes = 0;
+  uint32_t fallbackParents = 0;
+  SmallVector<Defined *, 0> reboundTargets;
+  std::array<uint32_t,
+             static_cast<size_t>(RISCVFunctionSplitDebugFallbackReason::Count)>
+      fallbackCounts = {};
+
+  for (const RISCVFunctionSplitAuditResult &r : results) {
+    planned += r.debugRelocMappings.size();
+    for (const RISCVDebugRelocMapping &m : r.debugRelocMappings)
+      if (m.boundaryStart)
+        ++plannedBoundaryStart;
+    rejectedAmbiguous +=
+        r.debugFallbackRelocCounts[static_cast<size_t>(
+            RISCVFunctionSplitDebugFallbackReason::AmbiguousBoundary)];
+
+    if (r.safe && hasAcceptedDebugReloc(r)) {
+      accepted += r.debugRelocMappings.size();
+      for (const RISCVDebugRelocMapping &m : r.debugRelocMappings) {
+        if (m.parentEnd)
+          ++parentEnd;
+        else
+          ++interior;
+        if (!llvm::is_contained(reboundTargets, m.target))
+          reboundTargets.push_back(m.target);
+      }
+      if (r.safe)
+        ++newlySafeParents;
+    }
+
+    if (!r.safe) {
+      bool hasFallback = false;
+      for (size_t i = 0; i != fallbackCounts.size(); ++i)
+        if (r.debugFallbackReasons.test(i)) {
+          ++fallbackCounts[i];
+          hasFallback = true;
+        }
+      if (hasFallback)
+        ++fallbackParents;
+    }
+  }
+
+  for (const RISCVFunctionSplitDetail &d : splitStats.details) {
+    auto it = llvm::find_if(results, [&](const RISCVFunctionSplitAuditResult &r) {
+      return r.parent == d.parent;
+    });
+    if (it == results.end() || !hasAcceptedDebugReloc(*it))
+      continue;
+    ++newlySplitParents;
+    newlySplitFunctions += d.ranges.size();
+    newlySplitBytes += d.parent->content().size();
+  }
+
+  message(Twine("riscv-function-sections-split: phase2b-debug: accepted debug relocation count: ") +
+          Twine(accepted));
+  message(Twine("riscv-function-sections-split: phase2b-debug: planned debug relocation count: ") +
+          Twine(planned));
+  message(Twine("riscv-function-sections-split: phase2b-debug: accepted interior relocation count: ") +
+          Twine(interior));
+  message(Twine("riscv-function-sections-split: phase2b-debug: planned boundary-start relocation count: ") +
+          Twine(plannedBoundaryStart));
+  message(Twine("riscv-function-sections-split: phase2b-debug: accepted parent-end relocation count: ") +
+          Twine(parentEnd));
+  message(Twine("riscv-function-sections-split: phase2b-debug: rejected ambiguous-boundary relocation count: ") +
+          Twine(rejectedAmbiguous));
+  message(Twine("riscv-function-sections-split: phase2b-debug: rebound target symbol count: ") +
+          Twine(reboundTargets.size()));
+  message(Twine("riscv-function-sections-split: phase2b-debug: newly safe parent count: ") +
+          Twine(newlySafeParents));
+  message(Twine("riscv-function-sections-split: phase2b-debug: newly split parent count: ") +
+          Twine(newlySplitParents));
+  message(Twine("riscv-function-sections-split: phase2b-debug: newly split function count: ") +
+          Twine(newlySplitFunctions));
+  message(Twine("riscv-function-sections-split: phase2b-debug: newly split bytes: ") +
+          Twine(newlySplitBytes));
+  message(Twine("riscv-function-sections-split: phase2b-debug: fallback parent count: ") +
+          Twine(fallbackParents));
+
+  SmallVector<std::pair<std::string, uint32_t>, 0> fallbackStats;
+  for (size_t i = 0; i != fallbackCounts.size(); ++i)
+    if (fallbackCounts[i])
+      fallbackStats.push_back(
+          {debugFallbackReasonToString(
+               static_cast<RISCVFunctionSplitDebugFallbackReason>(i))
+               .str(),
+           fallbackCounts[i]});
+  llvm::sort(fallbackStats, [](const auto &a, const auto &b) {
+    return a.first < b.first;
+  });
+  for (const auto &it : fallbackStats)
+    message(Twine("riscv-function-sections-split: phase2b-debug: fallback: ") +
+            it.first + ": parents " + Twine(it.second));
+
+  SmallVector<const RISCVFunctionSplitAuditResult *, 0> debugParents;
+  for (const RISCVFunctionSplitAuditResult &r : results)
+    if (!r.safe &&
+        (!r.debugRelocMappings.empty() || r.debugFallbackReasons.any()))
+      debugParents.push_back(&r);
+  llvm::sort(debugParents, [](const RISCVFunctionSplitAuditResult *a,
+                              const RISCVFunctionSplitAuditResult *b) {
+    std::string af = toString(a->parent->file);
+    std::string bf = toString(b->parent->file);
+    if (af != bf)
+      return af < bf;
+    return a->parent->name < b->parent->name;
+  });
+  for (const RISCVFunctionSplitAuditResult *r : debugParents) {
+    uint32_t boundary = 0, parentEndRelocs = 0;
+    for (const RISCVDebugRelocMapping &m : r->debugRelocMappings) {
+      if (m.boundaryStart)
+        ++boundary;
+      if (m.parentEnd)
+        ++parentEndRelocs;
+    }
+    uint32_t rejected = 0;
+    SmallVector<std::string, 0> fallbacks;
+    for (size_t i = 0; i != r->debugFallbackRelocCounts.size(); ++i)
+      if (r->debugFallbackRelocCounts[i]) {
+        rejected += r->debugFallbackRelocCounts[i];
+        fallbacks.push_back(
+            debugFallbackReasonToString(
+                static_cast<RISCVFunctionSplitDebugFallbackReason>(i))
+                .str());
+      }
+    llvm::sort(fallbacks);
+    message(Twine("riscv-function-sections-split: phase2b-debug: parent: ") +
+            toString(r->parent->file) + ":(" + r->parent->name +
+            ") planned relocations: " + Twine(r->debugRelocMappings.size()) +
+            " boundary-start relocations: " + Twine(boundary) +
+            " parent-end relocations: " + Twine(parentEndRelocs) +
+            " rejected relocations: " + Twine(rejected) + " fallbacks: " +
+            (fallbacks.empty() ? Twine("none")
+                               : Twine(llvm::join(fallbacks, ","))));
+  }
 }
 
 template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
@@ -3639,6 +4188,75 @@ template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
               offsetList);
     }
   }
+  printRISCVFunctionSplitDebugRelocStats(results, splitStats);
+}
+
+static void printRISCVFunctionSplitGCStats() {
+  if (!config->riscvFunctionSectionsSplitGC ||
+      !config->printRISCVFunctionSectionsSplit)
+    return;
+
+  uint32_t independentChildCount = 0, liveChildCount = 0, deadChildCount = 0;
+  uint64_t liveChildBytes = 0, deadChildBytes = 0;
+
+  struct ParentGCDetail {
+    InputSectionBase *parent = nullptr;
+    uint32_t liveChildren = 0;
+    uint32_t deadChildren = 0;
+    uint64_t liveBytes = 0;
+    uint64_t deadBytes = 0;
+  };
+  SmallVector<ParentGCDetail, 0> details;
+
+  for (auto &it : riscvFunctionSplitChildren) {
+    ParentGCDetail detail;
+    detail.parent = const_cast<InputSectionBase *>(it.first);
+    for (InputSectionBase *child : it.second) {
+      auto storageIt = riscvFunctionSplitRelocStorage.find(child);
+      uint64_t size =
+          storageIt == riscvFunctionSplitRelocStorage.end()
+              ? child->getSize()
+              : storageIt->second.originalEnd - storageIt->second.originalBegin;
+      ++independentChildCount;
+      if (child->isLive()) {
+        ++liveChildCount;
+        ++detail.liveChildren;
+        liveChildBytes += size;
+        detail.liveBytes += size;
+      } else {
+        ++deadChildCount;
+        ++detail.deadChildren;
+        deadChildBytes += size;
+        detail.deadBytes += size;
+      }
+    }
+    details.push_back(detail);
+  }
+
+  llvm::sort(details, [](const ParentGCDetail &a, const ParentGCDetail &b) {
+    std::string aFile = toString(a.parent->file);
+    std::string bFile = toString(b.parent->file);
+    if (aFile != bFile)
+      return aFile < bFile;
+    return a.parent->name < b.parent->name;
+  });
+
+  message(Twine("riscv-function-sections-split: phase2a: independent GC child count: ") +
+          Twine(independentChildCount));
+  message(Twine("riscv-function-sections-split: phase2a: live child count: ") +
+          Twine(liveChildCount));
+  message(Twine("riscv-function-sections-split: phase2a: dead child count: ") +
+          Twine(deadChildCount));
+  message(Twine("riscv-function-sections-split: phase2a: live child bytes: ") +
+          Twine(liveChildBytes));
+  message(Twine("riscv-function-sections-split: phase2a: dead child bytes: ") +
+          Twine(deadChildBytes));
+  for (const ParentGCDetail &d : details)
+    message(Twine("riscv-function-sections-split: phase2a: parent: ") +
+            toString(d.parent->file) + ":(" + d.parent->name +
+            ") live children " + Twine(d.liveChildren) + " dead children " +
+            Twine(d.deadChildren) + " live bytes " + Twine(d.liveBytes) +
+            " dead bytes " + Twine(d.deadBytes));
 }
 } // namespace
 
@@ -3888,6 +4506,11 @@ void LinkerDriver::link(opt::InputArgList &args) {
   // Replace common symbols with regular symbols.
   replaceCommonSymbols();
 
+  // Phase 0 of RISC-V function-level InputSection splitting only audits
+  // candidates. It must run after ObjFile::postParse() has assigned Defined
+  // symbols to sections and before original sections are aggregated.
+  invokeELFT(auditRISCVFunctionSectionsSplit,);
+
   {
     llvm::TimeTraceScope timeScope("Aggregate sections");
     // Now that we have a complete list of input files.
@@ -3982,6 +4605,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
 
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);
+  printRISCVFunctionSplitGCStats();
   demoteSharedAndLazySymbols();
 
   // Make copies of any input sections that need to be copied into each
