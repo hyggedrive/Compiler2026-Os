@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Writer.h"
+#include "Arch/RISCVGP.h"
 #include "AArch64ErrataFix.h"
 #include "ARMErrataFix.h"
 #include "CallGraphSort.h"
@@ -1431,15 +1432,86 @@ static void sortSection(OutputSection &osec,
   }
 }
 
+static bool isRISCVGPDataOutputSection(const OutputSection &osec) {
+  return osec.name == ".sdata" || osec.name == ".data" ||
+         osec.name == ".sbss" || osec.name == ".bss";
+}
+
+static bool isMovableRISCVGPDataSection(const InputSection *sec) {
+  if (!sec || !sec->file || !sec->isLive())
+    return false;
+
+  return (sec->flags & SHF_ALLOC) && (sec->flags & SHF_WRITE) &&
+         !(sec->flags & (SHF_EXECINSTR | SHF_MERGE | SHF_LINK_ORDER));
+}
+
+static uint64_t getRISCVGPSectionFootprint(const InputSection *sec) {
+  return std::max<uint64_t>(sec->getSize(), 1);
+}
+
+static bool compareRISCVGPDataSections(const InputSection *a,
+                                       const InputSection *b) {
+  const uint64_t aBenefit = getRISCVGPSectionBenefit(a);
+  const uint64_t bBenefit = getRISCVGPSectionBenefit(b);
+
+  if ((aBenefit != 0) != (bBenefit != 0))
+    return aBenefit != 0;
+  if (aBenefit == 0)
+    return false;
+
+  const uint64_t aSize = getRISCVGPSectionFootprint(a);
+  const uint64_t bSize = getRISCVGPSectionFootprint(b);
+  const __uint128_t lhs = static_cast<__uint128_t>(aBenefit) * bSize;
+  const __uint128_t rhs = static_cast<__uint128_t>(bBenefit) * aSize;
+  if (lhs != rhs)
+    return lhs > rhs;
+  if (aBenefit != bBenefit)
+    return aBenefit > bBenefit;
+  if (aSize != bSize)
+    return aSize < bSize;
+  return false;
+}
+
+static void sortRISCVGPDataInputSections(OutputSection &osec) {
+  for (SectionCommand *command : osec.commands) {
+    auto *isd = dyn_cast<InputSectionDescription>(command);
+    if (!isd)
+      continue;
+
+    SmallVector<size_t, 0> positions;
+    SmallVector<InputSection *, 0> movable;
+    for (size_t i = 0; i < isd->sections.size(); ++i) {
+      InputSection *sec = isd->sections[i];
+      if (!isMovableRISCVGPDataSection(sec))
+        continue;
+      positions.push_back(i);
+      movable.push_back(sec);
+    }
+
+    llvm::stable_sort(movable, compareRISCVGPDataSections);
+    for (size_t i = 0; i < movable.size(); ++i)
+      isd->sections[positions[i]] = movable[i];
+  }
+}
+
 // If no layout was provided by linker script, we want to apply default
 // sorting for special input sections. This also handles --symbol-ordering-file.
 template <class ELFT> void Writer<ELFT>::sortInputSections() {
   // Build the order once since it is expensive.
   DenseMap<const InputSectionBase *, int> order = buildSectionOrder();
   maybeShuffle(order);
+  const bool reorderRISCVGP =
+      config->emachine == EM_RISCV && config->relaxGP &&
+      !config->relocatable && !script->hasSectionsCommand && order.empty();
+  if (reorderRISCVGP)
+    collectRISCVGPSectionBenefits(ctx);
+
   for (SectionCommand *cmd : script->sectionCommands)
-    if (auto *osd = dyn_cast<OutputDesc>(cmd))
+    if (auto *osd = dyn_cast<OutputDesc>(cmd)) {
       sortSection(osd->osec, order);
+      if (reorderRISCVGP && isRISCVGPDataOutputSection(osd->osec))
+        sortRISCVGPDataInputSections(osd->osec);
+    }
 }
 
 template <class ELFT> void Writer<ELFT>::sortSections() {

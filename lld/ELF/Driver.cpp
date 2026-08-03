@@ -1756,6 +1756,11 @@ static void setConfigs(opt::InputArgList &args) {
   ELFKind k = config->ekind;
   uint16_t m = config->emachine;
 
+  const bool isRISCV32 = config->emachine == EM_RISCV && !config->is64;
+
+  if (!args.hasArg(OPT_relax_gp, OPT_no_relax_gp))
+    config->relaxGP = isRISCV32;
+
   config->copyRelocs = (config->relocatable || config->emitRelocs);
   config->is64 = (k == ELF64LEKind || k == ELF64BEKind);
   config->isLE = (k == ELF32LEKind || k == ELF64LEKind);

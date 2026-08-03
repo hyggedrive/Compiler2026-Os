@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "RISCVGP.h"
 #include "InputFiles.h"
 #include "OutputSections.h"
 #include "Symbols.h"
@@ -24,6 +25,150 @@ using namespace llvm::support::endian;
 using namespace llvm::ELF;
 using namespace lld;
 using namespace lld::elf;
+
+namespace lld {
+namespace elf {
+namespace {
+
+constexpr uint64_t gpHi20Saving = 4;
+constexpr uint64_t gpAddressSpan = 4095;
+
+DenseMap<const InputSectionBase *, uint64_t> gpSectionBenefits;
+
+struct GPCandidate {
+  uint64_t address;
+  uint64_t benefit;
+};
+
+static bool isRelaxableHI20(ArrayRef<Relocation> relocs, size_t i) {
+  return relocs[i].type == R_RISCV_HI20 && i + 1 < relocs.size() &&
+         relocs[i + 1].type == R_RISCV_RELAX;
+}
+
+static const InputSectionBase *getGPDataSection(const Relocation &rel,
+                                                bool writableOnly) {
+  auto *d = dyn_cast_or_null<Defined>(rel.sym);
+  if (!d || !d->section || d->isFunc())
+    return nullptr;
+
+  auto *sec = dyn_cast<InputSectionBase>(d->section);
+  if (!sec || !sec->isLive())
+    return nullptr;
+
+  if (!(sec->flags & SHF_ALLOC) || (sec->flags & SHF_EXECINSTR) ||
+      (sec->flags & SHF_MERGE))
+    return nullptr;
+
+  if (writableOnly && !(sec->flags & SHF_WRITE))
+    return nullptr;
+
+  return sec;
+}
+
+template <class Fn> static void forEachGPCandidate(Ctx &ctx, Fn fn) {
+  for (InputSectionBase *secBase : ctx.inputSections) {
+    auto *sec = dyn_cast<InputSection>(secBase);
+    if (!sec || !sec->isLive() || !(sec->flags & SHF_EXECINSTR))
+      continue;
+
+    ArrayRef<Relocation> relocs = sec->relocs();
+    for (size_t i = 0; i < relocs.size(); ++i)
+      if (isRelaxableHI20(relocs, i))
+        fn(relocs[i]);
+  }
+}
+
+} // namespace
+
+void collectRISCVGPSectionBenefits(Ctx &ctx) {
+  gpSectionBenefits.clear();
+
+  forEachGPCandidate(ctx, [&](const Relocation &rel) {
+    if (const InputSectionBase *sec = getGPDataSection(rel, true))
+      gpSectionBenefits[sec] += gpHi20Saving;
+  });
+}
+
+uint64_t getRISCVGPSectionBenefit(const InputSectionBase *sec) {
+  auto it = gpSectionBenefits.find(sec);
+  return it == gpSectionBenefits.end() ? 0 : it->second;
+}
+
+void optimizeRISCVGP(Ctx &ctx) {
+  Defined *gp = ElfSym::riscvGlobalPointer;
+  if (!gp || !gp->section)
+    return;
+
+  DenseMap<uint64_t, uint64_t> addressBenefits;
+  forEachGPCandidate(ctx, [&](const Relocation &rel) {
+    if (!getGPDataSection(rel, false))
+      return;
+    addressBenefits[rel.sym->getVA(rel.addend)] += gpHi20Saving;
+  });
+
+  if (addressBenefits.empty())
+    return;
+
+  SmallVector<GPCandidate, 0> candidates;
+  candidates.reserve(addressBenefits.size());
+  for (const auto &entry : addressBenefits)
+    candidates.push_back({entry.first, entry.second});
+
+  llvm::sort(candidates, [](const GPCandidate &a, const GPCandidate &b) {
+    return a.address < b.address;
+  });
+
+  size_t left = 0;
+  size_t bestLeft = 0;
+  size_t bestRight = 0;
+  uint64_t currentBenefit = 0;
+  uint64_t bestBenefit = 0;
+
+  for (size_t right = 0; right < candidates.size(); ++right) {
+    currentBenefit += candidates[right].benefit;
+    while (candidates[right].address - candidates[left].address >
+           gpAddressSpan) {
+      currentBenefit -= candidates[left].benefit;
+      ++left;
+    }
+
+    if (currentBenefit > bestBenefit) {
+      bestBenefit = currentBenefit;
+      bestLeft = left;
+      bestRight = right;
+    }
+  }
+
+  const uint64_t oldGP = gp->getVA();
+  uint64_t oldBenefit = 0;
+  for (const GPCandidate &candidate : candidates) {
+    int64_t offset = static_cast<int64_t>(candidate.address) -
+                     static_cast<int64_t>(oldGP);
+    if (isInt<12>(offset))
+      oldBenefit += candidate.benefit;
+  }
+
+  if (oldBenefit >= bestBenefit)
+    return;
+
+  const uint64_t lowAddress = candidates[bestLeft].address;
+  const uint64_t highAddress = candidates[bestRight].address;
+  const uint64_t minGP = highAddress >= 2047 ? highAddress - 2047 : 0;
+  const uint64_t maxGP = lowAddress + 2048;
+  if (minGP > maxGP)
+    return;
+
+  uint64_t bestGP = oldGP;
+  if (bestGP < minGP)
+    bestGP = minGP;
+  else if (bestGP > maxGP)
+    bestGP = maxGP;
+
+  gp->value = bestGP - gp->section->getVA();
+}
+
+} // namespace elf
+} // namespace lld
 
 namespace {
 
@@ -734,8 +879,11 @@ bool RISCV::relaxOnce(int pass) const {
   if (config->relocatable)
     return false;
 
-  if (pass == 0)
+  if (pass == 0) {
     initSymbolAnchors();
+    if (config->relaxGP)
+      optimizeRISCVGP(ctx);
+  }
 
   SmallVector<InputSection *, 0> storage;
   bool changed = false;
