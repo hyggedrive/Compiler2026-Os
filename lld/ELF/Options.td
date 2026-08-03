@@ -387,6 +387,10 @@ defm relax_gp: BB<"relax-gp",
   "Enable global pointer relaxation",
   "Disable global pointer relaxation (default)">;
 
+defm riscv_relax_jal_rvc: BB<"riscv-relax-jal-rvc",
+  "Allow relaxing RISC-V JAL to compressed jumps without a R_RISCV_RELAX marker",
+  "Disable relaxing RISC-V JAL without a R_RISCV_RELAX marker">;
+
 def riscv_function_sections_split: FF<"riscv-function-sections-split">,
   HelpText<"Audit RISC-V function-level InputSection splitting candidates">,
   Flags<[HelpHidden]>;

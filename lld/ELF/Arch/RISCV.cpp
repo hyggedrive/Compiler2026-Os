@@ -26,10 +26,14 @@ using namespace llvm::ELF;
 using namespace lld;
 using namespace lld::elf;
 
+
 namespace lld {
 namespace elf {
 namespace {
 
+// A relaxable absolute HI20 removes one 4-byte LUI when the referenced
+// address is reachable from gp. Store bytes, rather than a vague hotness
+// count, so both section ordering and GP selection optimize the same metric.
 constexpr uint64_t gpHi20Saving = 4;
 constexpr uint64_t gpAddressSpan = 4095;
 
@@ -45,6 +49,9 @@ static bool isRelaxableHI20(ArrayRef<Relocation> relocs, size_t i) {
          relocs[i + 1].type == R_RISCV_RELAX;
 }
 
+// Return an ordinary live data input section referenced by a relocation.
+// writableOnly is used by layout: this patch only reorders writable data,
+// while GP selection may still benefit already-positioned read-only data.
 static const InputSectionBase *getGPDataSection(const Relocation &rel,
                                                 bool writableOnly) {
   auto *d = dyn_cast_or_null<Defined>(rel.sym);
@@ -66,6 +73,9 @@ static const InputSectionBase *getGPDataSection(const Relocation &rel,
 }
 
 template <class Fn> static void forEachGPCandidate(Ctx &ctx, Fn fn) {
+  // GC and ICF have already selected the live input sections before Writer
+  // performs input-section ordering. Ignore discarded references so their
+  // relocations cannot influence either the layout or GP position.
   for (InputSectionBase *secBase : ctx.inputSections) {
     auto *sec = dyn_cast<InputSection>(secBase);
     if (!sec || !sec->isLive() || !(sec->flags & SHF_EXECINSTR))
@@ -148,16 +158,22 @@ void optimizeRISCVGP(Ctx &ctx) {
       oldBenefit += candidate.benefit;
   }
 
+  // Preserve the ABI/default position when moving gp cannot improve size.
   if (oldBenefit >= bestBenefit)
     return;
 
   const uint64_t lowAddress = candidates[bestLeft].address;
   const uint64_t highAddress = candidates[bestRight].address;
+
+  // For every covered target T, T-gp must be in [-2048, 2047].
+  // Therefore gp must be in [highAddress-2047, lowAddress+2048].
   const uint64_t minGP = highAddress >= 2047 ? highAddress - 2047 : 0;
   const uint64_t maxGP = lowAddress + 2048;
   if (minGP > maxGP)
     return;
 
+  // Choose the legal point nearest the original gp to minimize unnecessary
+  // symbol movement while retaining the maximum estimated byte saving.
   uint64_t bestGP = oldGP;
   if (bestGP < minGP)
     bestGP = minGP;
@@ -740,6 +756,33 @@ static void relaxCall(const InputSection &sec, size_t i, uint64_t loc,
   }
 }
 
+// Relax R_RISCV_JAL to c.j or c.jal. C.JAL is only available in RV32C.
+static void relaxJalToRVC(const InputSection &sec, size_t i, uint64_t loc,
+                          Relocation &r, uint32_t &remove) {
+  if (!(config->eflags & EF_RISCV_RVC))
+    return;
+
+  const uint32_t insn = read32le(sec.content().data() + r.offset);
+  if ((insn & 0x7f) != 0x6f)
+    return;
+
+  const uint32_t rd = extractBits(insn, 11, 7);
+  if (rd != 0 && rd != X_RA)
+    return;
+  if (rd == X_RA && config->is64)
+    return;
+
+  const uint64_t dest = r.sym->getVA(r.addend);
+  const int64_t displace =
+      static_cast<int64_t>(dest) - static_cast<int64_t>(loc);
+  if (!isInt<12>(displace) || (displace & 1))
+    return;
+
+  sec.relaxAux->relocTypes[i] = R_RISCV_RVC_JUMP;
+  sec.relaxAux->writes.push_back(rd == 0 ? 0xa001 : 0x2001);
+  remove = 2;
+}
+
 // Relax local-exec TLS when hi20 is zero.
 static void relaxTlsLe(const InputSection &sec, size_t i, uint64_t loc,
                        Relocation &r, uint32_t &remove) {
@@ -821,6 +864,13 @@ static bool relax(InputSection &sec) {
           sec.relocs()[i + 1].type == R_RISCV_RELAX)
         relaxCall(sec, i, loc, r, remove);
       break;
+    case R_RISCV_JAL: {
+      const bool hasRelaxMarker = i + 1 != sec.relocs().size() &&
+                                  sec.relocs()[i + 1].type == R_RISCV_RELAX;
+      if (config->relax && (hasRelaxMarker || config->riscvRelaxJalRVC))
+        relaxJalToRVC(sec, i, loc, r, remove);
+      break;
+    }
     case R_RISCV_TPREL_HI20:
     case R_RISCV_TPREL_ADD:
     case R_RISCV_TPREL_LO12_I:

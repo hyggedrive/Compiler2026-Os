@@ -1,49 +1,51 @@
 # REQUIRES: riscv
 
-# RUN: llvm-mc -filetype=obj -triple=riscv32-unknown-elf %s -o %t.o
-# RUN: ld.lld --gc-sections %t.o -o %t.off
-# RUN: ld.lld --gc-sections --riscv-function-sections-split %t.o -o %t.on
-# RUN: cmp %t.off %t.on
+# RUN: rm -rf %t && split-file %s %t
+# RUN: llvm-mc -filetype=obj -triple=riscv32-unknown-elf %t/main.s -o %t/main.o
+# RUN: llvm-mc -filetype=obj -triple=riscv32-unknown-elf %t/got.s -o %t/got.o
+# RUN: ld.lld --gc-sections %t/main.o -o %t/off
+# RUN: ld.lld --gc-sections --riscv-function-sections-split %t/main.o -o %t/on
+# RUN: cmp %t/off %t/on
 # RUN: ld.lld --gc-sections --print-riscv-function-sections-split \
-# RUN:   %t.o -o %t.print-only 2>&1 | count 0
-# RUN: cmp %t.off %t.print-only
-# RUN: llvm-nm %t.on | FileCheck %s --check-prefix=NM \
+# RUN:   %t/main.o -o %t/print-only 2>&1 | count 0
+# RUN: cmp %t/off %t/print-only
+# RUN: llvm-nm %t/on | FileCheck %s --check-prefix=NM \
 # RUN:   --implicit-check-not=dead0 --implicit-check-not=dead1
-# RUN: llvm-readelf -sW %t.off > %t.off.sym
-# RUN: llvm-readelf -sW %t.on > %t.on.sym
-# RUN: cmp %t.off.sym %t.on.sym
+# RUN: llvm-readelf -sW %t/off > %t/off.sym
+# RUN: llvm-readelf -sW %t/on > %t/on.sym
+# RUN: cmp %t/off.sym %t/on.sym
 # RUN: ld.lld --gc-sections --icf=safe --riscv-function-sections-split \
-# RUN:   %t.o -o %t.icf
-# RUN: llvm-nm %t.icf | FileCheck %s --check-prefix=ICF
-# RUN: llvm-nm -n %t.icf | sed -n 's/^\([0-9a-f]*\) T ident0$/\1/p' > %t.ident0
-# RUN: llvm-nm -n %t.icf | sed -n 's/^\([0-9a-f]*\) T ident1$/\1/p' > %t.ident1
-# RUN: not cmp %t.ident0 %t.ident1
-# RUN: ld.lld --emit-relocs --gc-sections %t.o -o %t.emit.off
+# RUN:   %t/main.o -o %t/icf
+# RUN: llvm-nm %t/icf | FileCheck %s --check-prefix=ICF
+# RUN: llvm-nm -n %t/icf | sed -n 's/^\([0-9a-f]*\) T ident0$/\1/p' > %t/ident0
+# RUN: llvm-nm -n %t/icf | sed -n 's/^\([0-9a-f]*\) T ident1$/\1/p' > %t/ident1
+# RUN: not cmp %t/ident0 %t/ident1
+# RUN: ld.lld --emit-relocs --gc-sections %t/main.o -o %t/emit.off
 # RUN: ld.lld --emit-relocs --gc-sections --riscv-function-sections-split \
-# RUN:   %t.o -o %t.emit.on
-# RUN: cmp %t.emit.off %t.emit.on
+# RUN:   %t/main.o -o %t/emit.on
+# RUN: cmp %t/emit.off %t/emit.on
 # RUN: ld.lld --emit-relocs --gc-sections --riscv-function-sections-split \
-# RUN:   --print-riscv-function-sections-split %t.o -o %t.emit.print 2>&1 \
+# RUN:   --print-riscv-function-sections-split %t/main.o -o %t/emit.print 2>&1 \
 # RUN:   | FileCheck %s --check-prefix=EMIT
-# RUN: ld.lld -shared %t.o -o %t.shared.off
-# RUN: ld.lld -shared --riscv-function-sections-split %t.o -o %t.shared.on
-# RUN: llvm-readelf -S -r %t.shared.off > %t.shared.off.readelf
-# RUN: llvm-readelf -S -r %t.shared.on > %t.shared.on.readelf
-# RUN: cmp %t.shared.off.readelf %t.shared.on.readelf
-# RUN: FileCheck %s --check-prefix=GOT-RELOC < %t.shared.on.readelf
-# RUN: llvm-objdump -dr %t.shared.off | sed '1d' > %t.shared.off.objdump
-# RUN: llvm-objdump -dr %t.shared.on | sed '1d' > %t.shared.on.objdump
-# RUN: cmp %t.shared.off.objdump %t.shared.on.objdump
+# RUN: ld.lld -shared %t/got.o -o %t/shared.off
+# RUN: ld.lld -shared --riscv-function-sections-split %t/got.o -o %t/shared.on
+# RUN: llvm-readelf -S -r %t/shared.off > %t/shared.off.readelf
+# RUN: llvm-readelf -S -r %t/shared.on > %t/shared.on.readelf
+# RUN: cmp %t/shared.off.readelf %t/shared.on.readelf
+# RUN: FileCheck %s --check-prefix=GOT-RELOC < %t/shared.on.readelf
+# RUN: llvm-objdump -dr %t/shared.off | sed '1d' > %t/shared.off.objdump
+# RUN: llvm-objdump -dr %t/shared.on | sed '1d' > %t/shared.on.objdump
+# RUN: cmp %t/shared.off.objdump %t/shared.on.objdump
 # RUN: ld.lld -shared --riscv-function-sections-split \
-# RUN:   --print-riscv-function-sections-split %t.o -o %t.shared.print 2>&1 \
+# RUN:   --print-riscv-function-sections-split %t/got.o -o %t/shared.print 2>&1 \
 # RUN:   | FileCheck %s --check-prefix=GOT
 # RUN: ld.lld --gc-sections --riscv-function-sections-split \
-# RUN:   --print-riscv-function-sections-split %t.o -o %t.print 2>&1 \
+# RUN:   --print-riscv-function-sections-split %t/main.o -o %t/print 2>&1 \
 # RUN:   | FileCheck %s
 
-# RUN: llvm-mc -filetype=obj -triple=riscv64-unknown-elf %s -o %t.rv64.o
+# RUN: llvm-mc -filetype=obj -triple=riscv64-unknown-elf %t/main.s -o %t/rv64.o
 # RUN: ld.lld --riscv-function-sections-split \
-# RUN:   --print-riscv-function-sections-split %t.rv64.o -o %t.rv64 2>&1 \
+# RUN:   --print-riscv-function-sections-split %t/rv64.o -o %t/rv64 2>&1 \
 # RUN:   | count 0
 
 # NM-DAG: T live0
@@ -55,7 +57,7 @@
 # ICF-DAG: T ident1
 
 # EMIT: riscv-function-sections-split: phase1a: split parent count: 0
-# EMIT: riscv-function-sections-split: phase1a: parent fallback count: 6
+# EMIT: riscv-function-sections-split: phase1a: parent fallback count: 5
 
 # GOT:      riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.got) size 16 children 2 relocs {{[0-9]+}}
 # GOT-NEXT: riscv-function-sections-split: phase1a: child range: [0,12)
@@ -74,9 +76,9 @@
 # CHECK:      riscv-function-sections-split: parent section: .text.debug_target
 # CHECK:      riscv-function-sections-split: block reasons: incoming-debug-relocation
 
-# CHECK: riscv-function-sections-split: phase1a: split parent count: 6
+# CHECK: riscv-function-sections-split: phase1a: split parent count: 5
 # CHECK: riscv-function-sections-split: phase1a: skipped safe single-function parent count: 2
-# CHECK: riscv-function-sections-split: phase1a: created child count: 12
+# CHECK: riscv-function-sections-split: phase1a: created child count: 10
 # CHECK: riscv-function-sections-split: phase1a: parent fallback count: 0
 
 # CHECK:      riscv-function-sections-split: phase1a: split parent: {{.*}}:(.text.live) size 12 children 2 relocs 0
@@ -97,6 +99,7 @@
 # CHECK-NEXT: riscv-function-sections-split: phase1a: child range: [12,16)
 # CHECK-NEXT: riscv-function-sections-split: phase1a: child relocation offsets: none
 
+#--- main.s
 .globl _start
 .section .text.start,"ax",@progbits
 .type _start,@function
@@ -178,20 +181,6 @@ local1:
   ret
 .size local1, .-local1
 
-.section .text.got,"ax",@progbits
-.globl got0
-.type got0,@function
-got0:
-.Lgot_hi0:
-  auipc a0, %got_pcrel_hi(extvar)
-  lw a0, %pcrel_lo(.Lgot_hi0)(a0)
-  ret
-.size got0, .-got0
-.type got1,@function
-got1:
-  ret
-.size got1, .-got1
-
 .section .text.unsafe_jalr,"ax",@progbits
 .type unsafe_jalr0,@function
 unsafe_jalr0:
@@ -222,5 +211,20 @@ debug_target1:
   ret
 .size debug_target1, .-debug_target1
 
-.section .debug_info,"",@progbits
+.section .debug_zgq_test,"",@progbits
   .word debug_target0
+
+#--- got.s
+.section .text.got,"ax",@progbits
+.globl got0
+.type got0,@function
+got0:
+.Lgot_hi0:
+  auipc a0, %got_pcrel_hi(extvar)
+  lw a0, %pcrel_lo(.Lgot_hi0)(a0)
+  ret
+.size got0, .-got0
+.type got1,@function
+got1:
+  ret
+.size got1, .-got1

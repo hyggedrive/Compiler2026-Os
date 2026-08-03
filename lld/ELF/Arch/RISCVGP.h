@@ -17,8 +17,12 @@ namespace elf {
 class Ctx;
 class InputSectionBase;
 
+// Collect the estimated code bytes saved when each writable data input
+// section is placed in the GP-addressable window.
 void collectRISCVGPSectionBenefits(Ctx &ctx);
 uint64_t getRISCVGPSectionBenefit(const InputSectionBase *sec);
+
+// Select __global_pointer$ after input-section ordering and address assignment.
 void optimizeRISCVGP(Ctx &ctx);
 
 } // namespace elf

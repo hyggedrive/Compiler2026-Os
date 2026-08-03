@@ -1432,6 +1432,7 @@ static void sortSection(OutputSection &osec,
   }
 }
 
+
 static bool isRISCVGPDataOutputSection(const OutputSection &osec) {
   return osec.name == ".sdata" || osec.name == ".data" ||
          osec.name == ".sbss" || osec.name == ".bss";
@@ -1454,6 +1455,8 @@ static bool compareRISCVGPDataSections(const InputSection *a,
   const uint64_t aBenefit = getRISCVGPSectionBenefit(a);
   const uint64_t bBenefit = getRISCVGPSectionBenefit(b);
 
+  // Keep zero-benefit sections in their original relative order, after all
+  // sections that can contribute to GP relaxation.
   if ((aBenefit != 0) != (bBenefit != 0))
     return aBenefit != 0;
   if (aBenefit == 0)
@@ -1461,6 +1464,8 @@ static bool compareRISCVGPDataSections(const InputSection *a,
 
   const uint64_t aSize = getRISCVGPSectionFootprint(a);
   const uint64_t bSize = getRISCVGPSectionFootprint(b);
+
+  // Compare benefit/size without losing precision.
   const __uint128_t lhs = static_cast<__uint128_t>(aBenefit) * bSize;
   const __uint128_t rhs = static_cast<__uint128_t>(bBenefit) * aSize;
   if (lhs != rhs)
@@ -1478,6 +1483,9 @@ static void sortRISCVGPDataInputSections(OutputSection &osec) {
     if (!isd)
       continue;
 
+    // Sort only ordinary writable-data slots. Sections that are synthetic,
+    // link-ordered, discarded, or otherwise unsafe remain at their exact
+    // positions, avoiding a comparator that violates strict weak ordering.
     SmallVector<size_t, 0> positions;
     SmallVector<InputSection *, 0> movable;
     for (size_t i = 0; i < isd->sections.size(); ++i) {
@@ -1500,15 +1508,20 @@ template <class ELFT> void Writer<ELFT>::sortInputSections() {
   // Build the order once since it is expensive.
   DenseMap<const InputSectionBase *, int> order = buildSectionOrder();
   maybeShuffle(order);
+
+  // Do not override an explicit linker script, symbol-ordering file, or
+  // shuffle request. The contest path uses the default layout, after GC/ICF.
   const bool reorderRISCVGP =
       config->emachine == EM_RISCV && config->relaxGP &&
       !config->relocatable && !script->hasSectionsCommand && order.empty();
+
   if (reorderRISCVGP)
     collectRISCVGPSectionBenefits(ctx);
 
   for (SectionCommand *cmd : script->sectionCommands)
     if (auto *osd = dyn_cast<OutputDesc>(cmd)) {
       sortSection(osd->osec, order);
+
       if (reorderRISCVGP && isRISCVGPDataOutputSection(osd->osec))
         sortRISCVGPDataInputSections(osd->osec);
     }
