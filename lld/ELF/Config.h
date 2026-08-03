@@ -275,6 +275,7 @@ struct Config {
   bool riscvFunctionSectionsSplitDebugRelocs;
   bool riscvFunctionSectionsSplit;
   bool riscvFunctionSectionsSplitGC;
+  bool riscvFunctionSectionsSplitICF;
   bool relocatable;
   bool relrGlibc = false;
   bool relrPackDynRelocs = false;

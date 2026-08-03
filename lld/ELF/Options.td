@@ -400,9 +400,24 @@ def riscv_function_sections_split_debug_relocs
       HelpText<"Allow safe RISC-V function section split for non-alloc debug relocations">,
       Flags<[HelpHidden]>;
 
+def no_riscv_function_sections_split_debug_relocs
+    : FF<"no-riscv-function-sections-split-debug-relocs">,
+      HelpText<"Disable safe RISC-V function section split for non-alloc debug relocations">,
+      Flags<[HelpHidden]>;
+
+def riscv_function_sections_split_icf
+    : FF<"riscv-function-sections-split-icf">,
+      HelpText<"Allow safe RISC-V function section split children to participate in ICF">,
+      Flags<[HelpHidden]>;
+
 def no_riscv_function_sections_split_gc
     : FF<"no-riscv-function-sections-split-gc">,
       HelpText<"Disable independent GC for split RISC-V functions">;
+
+def no_riscv_function_sections_split_icf
+    : FF<"no-riscv-function-sections-split-icf">,
+      HelpText<"Disable ICF for split RISC-V functions">,
+      Flags<[HelpHidden]>;
 
 defm remap_inputs: EEq<"remap-inputs",
   "Remap input files matching <from-glob> to <to-file>">,
