@@ -1370,6 +1370,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
+  config->printRISCVRODataSplitAudit =
+      args.hasArg(OPT_print_riscv_rodata_split_audit);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
   config->printSymbolOrder =
       args.getLastArgValue(OPT_print_symbol_order);
@@ -4281,6 +4283,359 @@ static void printRISCVFunctionSplitGCStats() {
             Twine(d.deadChildren) + " live bytes " + Twine(d.liveBytes) +
             " dead bytes " + Twine(d.deadBytes));
 }
+
+struct RISCVRODataRange {
+  Defined *sym = nullptr;
+  uint64_t start = 0;
+  uint64_t end = 0;
+  uint32_t exactAliasSymbols = 0;
+};
+
+enum class RISCVRODataSplitBlockReason {
+  UnsupportedSection,
+  ComdatOrGroup,
+  LinkOrder,
+  NoObjectRanges,
+  ObjectRangeOverflow,
+  OverlappingObjects,
+  RelWithoutAddend,
+  SectionSymbolAddend,
+  NonObjectRelocationTarget,
+  AddendOutsideObject,
+  Count,
+};
+
+static StringRef roDataBlockReasonToString(RISCVRODataSplitBlockReason r) {
+  switch (r) {
+  case RISCVRODataSplitBlockReason::UnsupportedSection:
+    return "unsupported-section";
+  case RISCVRODataSplitBlockReason::ComdatOrGroup:
+    return "comdat-or-group";
+  case RISCVRODataSplitBlockReason::LinkOrder:
+    return "link-order";
+  case RISCVRODataSplitBlockReason::NoObjectRanges:
+    return "no-object-ranges";
+  case RISCVRODataSplitBlockReason::ObjectRangeOverflow:
+    return "object-range-overflow";
+  case RISCVRODataSplitBlockReason::OverlappingObjects:
+    return "overlapping-objects";
+  case RISCVRODataSplitBlockReason::RelWithoutAddend:
+    return "rel-without-addend";
+  case RISCVRODataSplitBlockReason::SectionSymbolAddend:
+    return "section-symbol-addend";
+  case RISCVRODataSplitBlockReason::NonObjectRelocationTarget:
+    return "non-object-relocation-target";
+  case RISCVRODataSplitBlockReason::AddendOutsideObject:
+    return "addend-outside-object";
+  case RISCVRODataSplitBlockReason::Count:
+    break;
+  }
+  llvm_unreachable("invalid RISC-V rodata split block reason");
+}
+
+struct RISCVRODataSplitAuditResult {
+  InputSection *parent = nullptr;
+  SmallVector<RISCVRODataRange, 0> ranges;
+  uint64_t sectionSize = 0;
+  uint64_t coveredBytes = 0;
+  uint64_t residualBytes = 0;
+  uint64_t rawUnreferencedBytes = 0;
+  uint32_t objectSymbolCount = 0;
+  uint32_t validObjectRangeCount = 0;
+  uint32_t exactAliasSymbolCount = 0;
+  uint32_t exactAliasRangeCount = 0;
+  uint32_t incomingRelocationCount = 0;
+  uint32_t relocReferencedObjectCount = 0;
+  uint32_t noRelocationObjectCount = 0;
+  bool analyzable = true;
+  std::bitset<static_cast<size_t>(RISCVRODataSplitBlockReason::Count)>
+      reasons;
+  SmallVector<uint8_t, 0> referenced;
+};
+
+static void addRODataReason(RISCVRODataSplitAuditResult &r,
+                            RISCVRODataSplitBlockReason reason) {
+  r.analyzable = false;
+  r.reasons.set(static_cast<size_t>(reason));
+}
+
+static bool isRISCVRODataSplitCandidateName(StringRef name) {
+  return name == ".rodata" || name.starts_with(".rodata.");
+}
+
+static int roDataRangeIndex(ArrayRef<RISCVRODataRange> ranges, uint64_t off) {
+  auto it = llvm::partition_point(
+      ranges, [=](const RISCVRODataRange &r) { return r.end <= off; });
+  if (it != ranges.end() && it->start <= off && off < it->end)
+    return it - ranges.begin();
+  return -1;
+}
+
+static bool roDataRangeInOneObject(ArrayRef<RISCVRODataRange> ranges,
+                                   uint64_t begin, uint64_t end) {
+  if (begin >= end)
+    return false;
+  int i = roDataRangeIndex(ranges, begin);
+  return i != -1 && end <= ranges[i].end;
+}
+
+template <class ELFT, class RelTy>
+static void auditRISCVRODataIncomingRelocs(
+    InputSection &parent, ArrayRef<RISCVRODataRange> ranges,
+    InputSectionBase &from, ArrayRef<RelTy> rels,
+    RISCVRODataSplitAuditResult &result) {
+  for (const RelTy &rel : rels) {
+    Symbol &sym = from.getFile<ELFT>()->getRelocTargetSym(rel);
+    auto *d = dyn_cast<Defined>(&sym);
+    if (!d || d->section != &parent)
+      continue;
+
+    ++result.incomingRelocationCount;
+    if (d->isSection()) {
+      addRODataReason(result,
+                      RISCVRODataSplitBlockReason::SectionSymbolAddend);
+      continue;
+    }
+    if (d->type != STT_OBJECT || d->size == 0) {
+      addRODataReason(result,
+                      RISCVRODataSplitBlockReason::NonObjectRelocationTarget);
+      continue;
+    }
+    if constexpr (!RelTy::IsRela) {
+      addRODataReason(result, RISCVRODataSplitBlockReason::RelWithoutAddend);
+      continue;
+    } else {
+      if (d->size > std::numeric_limits<uint64_t>::max() - d->value) {
+        addRODataReason(result,
+                        RISCVRODataSplitBlockReason::AddendOutsideObject);
+        continue;
+      }
+      uint64_t target;
+      if (!checkedAddend(d->value, rel.r_addend, target)) {
+        addRODataReason(result,
+                        RISCVRODataSplitBlockReason::AddendOutsideObject);
+        continue;
+      }
+      int symbolRange = roDataRangeIndex(ranges, d->value);
+      int targetRange = roDataRangeIndex(ranges, target);
+      if (symbolRange == -1 || targetRange == -1 ||
+          symbolRange != targetRange ||
+          !roDataRangeInOneObject(ranges, d->value, d->value + d->size)) {
+        addRODataReason(result,
+                        RISCVRODataSplitBlockReason::AddendOutsideObject);
+        continue;
+      }
+      result.referenced[symbolRange] = true;
+    }
+  }
+}
+
+template <class ELFT>
+static RISCVRODataSplitAuditResult
+auditRISCVRODataSplitSection(ObjFile<ELFT> &file, InputSection &sec) {
+  RISCVRODataSplitAuditResult result;
+  result.parent = &sec;
+  result.sectionSize = sec.content().size();
+
+  if (sec.kind() != SectionBase::Regular || sec.type != SHT_PROGBITS ||
+      !(sec.flags & SHF_ALLOC) || (sec.flags & SHF_WRITE) ||
+      (sec.flags & SHF_EXECINSTR) || (sec.flags & SHF_MERGE) ||
+      (sec.flags & SHF_STRINGS) ||
+      !isRISCVRODataSplitCandidateName(sec.name)) {
+    addRODataReason(result, RISCVRODataSplitBlockReason::UnsupportedSection);
+    return result;
+  }
+  if (sec.nextInSectionGroup) {
+    addRODataReason(result, RISCVRODataSplitBlockReason::ComdatOrGroup);
+    return result;
+  }
+  if (sec.flags & SHF_LINK_ORDER) {
+    addRODataReason(result, RISCVRODataSplitBlockReason::LinkOrder);
+    return result;
+  }
+
+  for (Symbol *sym : file.getSymbols()) {
+    auto *d = dyn_cast_or_null<Defined>(sym);
+    if (!d || d->section != &sec || d->type != STT_OBJECT)
+      continue;
+    ++result.objectSymbolCount;
+    if (d->size == 0)
+      continue;
+    if (d->value > result.sectionSize ||
+        d->size > std::numeric_limits<uint64_t>::max() - d->value ||
+        d->value + d->size > result.sectionSize) {
+      addRODataReason(result,
+                      RISCVRODataSplitBlockReason::ObjectRangeOverflow);
+      continue;
+    }
+    result.ranges.push_back({d, d->value, d->value + d->size});
+  }
+
+  if (result.ranges.empty()) {
+    addRODataReason(result, RISCVRODataSplitBlockReason::NoObjectRanges);
+    return result;
+  }
+
+  llvm::sort(result.ranges, [](const RISCVRODataRange &a,
+                               const RISCVRODataRange &b) {
+    return std::make_tuple(a.start, a.end, a.sym->getName()) <
+           std::make_tuple(b.start, b.end, b.sym->getName());
+  });
+
+  SmallVector<RISCVRODataRange, 0> unique;
+  for (RISCVRODataRange r : result.ranges) {
+    if (!unique.empty() && r.start == unique.back().start &&
+        r.end == unique.back().end) {
+      ++unique.back().exactAliasSymbols;
+      ++result.exactAliasSymbolCount;
+      continue;
+    }
+    if (!unique.empty() && r.start < unique.back().end) {
+      addRODataReason(result, RISCVRODataSplitBlockReason::OverlappingObjects);
+      continue;
+    }
+    unique.push_back(r);
+    result.coveredBytes += r.end - r.start;
+  }
+  result.ranges = std::move(unique);
+  result.validObjectRangeCount = result.ranges.size();
+  result.residualBytes = result.sectionSize - result.coveredBytes;
+  for (const RISCVRODataRange &r : result.ranges)
+    if (r.exactAliasSymbols)
+      ++result.exactAliasRangeCount;
+  result.referenced.resize(result.ranges.size(), false);
+
+  for (ELFFileBase *base : ctx.objectFiles) {
+    auto *obj = dyn_cast<ObjFile<ELFT>>(base);
+    if (!obj)
+      continue;
+    for (InputSectionBase *s : obj->getSections()) {
+      if (!s || s == &InputSection::discarded)
+        continue;
+      RelsOrRelas<ELFT> rs = s->template relsOrRelas<ELFT>();
+      if (rs.areRelocsRel())
+        auditRISCVRODataIncomingRelocs<ELFT>(sec, result.ranges, *s, rs.rels,
+                                             result);
+      else
+        auditRISCVRODataIncomingRelocs<ELFT>(sec, result.ranges, *s, rs.relas,
+                                             result);
+    }
+  }
+
+  for (auto [i, r] : llvm::enumerate(result.ranges)) {
+    if (result.referenced[i]) {
+      ++result.relocReferencedObjectCount;
+    } else {
+      ++result.noRelocationObjectCount;
+      result.rawUnreferencedBytes += r.end - r.start;
+    }
+  }
+  return result;
+}
+
+template <class ELFT> static void printRISCVRODataSplitAudit() {
+  if (!config->printRISCVRODataSplitAudit || config->emachine != EM_RISCV ||
+      config->relocatable)
+    return;
+
+  SmallVector<RISCVRODataSplitAuditResult, 0> results;
+  for (ELFFileBase *base : ctx.objectFiles) {
+    auto *file = dyn_cast<ObjFile<ELFT>>(base);
+    if (!file)
+      continue;
+    for (InputSectionBase *s : file->getSections()) {
+      auto *isec = dyn_cast_or_null<InputSection>(s);
+      if (!isec || isec == &InputSection::discarded ||
+          !isRISCVRODataSplitCandidateName(isec->name))
+        continue;
+      results.push_back(auditRISCVRODataSplitSection<ELFT>(*file, *isec));
+    }
+  }
+
+  uint64_t sectionBytes = 0, coveredBytes = 0, residualBytes = 0;
+  uint64_t rawUnreferencedBytes = 0, safeCandidateBytes = 0;
+  uint32_t analyzableSections = 0, blockedSections = 0;
+  std::array<uint32_t,
+             static_cast<size_t>(RISCVRODataSplitBlockReason::Count)>
+      reasonCounts = {};
+
+  for (const RISCVRODataSplitAuditResult &r : results) {
+    message("RISCV rodata split audit:");
+    message(Twine("  file=") + toString(r.parent->file));
+    message(Twine("  section=") + r.parent->name);
+    message(Twine("  size=") + Twine(r.sectionSize));
+    SmallVector<StringRef, 0> reasons;
+    for (size_t i = 0;
+         i != static_cast<size_t>(RISCVRODataSplitBlockReason::Count); ++i)
+      if (r.reasons.test(i)) {
+        reasons.push_back(roDataBlockReasonToString(
+            static_cast<RISCVRODataSplitBlockReason>(i)));
+        ++reasonCounts[i];
+      }
+    if (!r.analyzable) {
+      ++blockedSections;
+      llvm::sort(reasons);
+      message(Twine("  blocked=") +
+              (reasons.empty() ? Twine("unknown")
+                               : Twine(llvm::join(reasons, ","))));
+    } else {
+      ++analyzableSections;
+      message(Twine("  objects=") + Twine(r.objectSymbolCount));
+      message(Twine("  valid_object_ranges=") +
+              Twine(r.validObjectRangeCount));
+      message(Twine("  exact_alias_symbols=") +
+              Twine(r.exactAliasSymbolCount));
+      message(Twine("  exact_alias_ranges=") +
+              Twine(r.exactAliasRangeCount));
+      message(Twine("  covered_bytes=") + Twine(r.coveredBytes));
+      message(Twine("  residual_bytes=") + Twine(r.residualBytes));
+      message(Twine("  incoming_relocations=") +
+              Twine(r.incomingRelocationCount));
+      message(Twine("  reloc_referenced_objects=") +
+              Twine(r.relocReferencedObjectCount));
+      message(Twine("  no_relocation_objects=") +
+              Twine(r.noRelocationObjectCount));
+      message(Twine("  raw_unreferenced_bytes=") +
+              Twine(r.rawUnreferencedBytes));
+      message(Twine("  safe_candidate_bytes=") +
+              Twine(r.analyzable ? r.rawUnreferencedBytes : 0));
+      for (const RISCVRODataRange &range : r.ranges)
+        message(Twine("  object=") + range.sym->getName() + " start=" +
+                Twine(range.start) + " end=" + Twine(range.end) + " size=" +
+                Twine(range.end - range.start) + " exact_aliases=" +
+                Twine(range.exactAliasSymbols));
+    }
+    sectionBytes += r.sectionSize;
+    coveredBytes += r.coveredBytes;
+    residualBytes += r.residualBytes;
+    rawUnreferencedBytes += r.rawUnreferencedBytes;
+    if (r.analyzable)
+      safeCandidateBytes += r.rawUnreferencedBytes;
+  }
+
+  message(Twine("RISCV rodata split audit summary: sections=") +
+          Twine(results.size()));
+  message(Twine("RISCV rodata split audit summary: analyzable_sections=") +
+          Twine(analyzableSections));
+  message(Twine("RISCV rodata split audit summary: blocked_sections=") +
+          Twine(blockedSections));
+  message(Twine("RISCV rodata split audit summary: section_bytes=") +
+          Twine(sectionBytes));
+  message(Twine("RISCV rodata split audit summary: covered_bytes=") +
+          Twine(coveredBytes));
+  message(Twine("RISCV rodata split audit summary: residual_bytes=") +
+          Twine(residualBytes));
+  message(Twine("RISCV rodata split audit summary: raw_unreferenced_bytes=") +
+          Twine(rawUnreferencedBytes));
+  message(Twine("RISCV rodata split audit summary: safe_candidate_bytes=") +
+          Twine(safeCandidateBytes));
+  for (size_t i = 0; i != reasonCounts.size(); ++i)
+    if (reasonCounts[i])
+      message(Twine("RISCV rodata split audit summary: ") +
+              roDataBlockReasonToString(
+                  static_cast<RISCVRODataSplitBlockReason>(i)) +
+              "=" + Twine(reasonCounts[i]));
+}
 } // namespace
 
 // Do actual linking. Note that when this function is called,
@@ -4533,6 +4888,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
   // candidates. It must run after ObjFile::postParse() has assigned Defined
   // symbols to sections and before original sections are aggregated.
   invokeELFT(auditRISCVFunctionSectionsSplit,);
+  invokeELFT(printRISCVRODataSplitAudit,);
 
   {
     llvm::TimeTraceScope timeScope("Aggregate sections");
