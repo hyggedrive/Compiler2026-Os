@@ -4294,9 +4294,9 @@ struct RISCVRODataRange {
 
 struct RISCVRODataPostGCObjectStats {
   uint32_t totalIncomingRelocations = 0;
-  uint32_t incomingFromLiveExternalSections = 0;
-  uint32_t incomingFromDeadExternalSections = 0;
-  uint32_t incomingFromRODataObjects = 0;
+  uint32_t incomingFromLiveSections = 0;
+  uint32_t incomingFromDeadSections = 0;
+  uint32_t incomingFromSameROData = 0;
   uint32_t internalOutEdges = 0;
   bool externalLiveRoot = false;
   bool unknownSourceRoot = false;
@@ -4630,7 +4630,7 @@ static void auditRISCVRODataPostGCIncomingRelocs(
     auto sourceSecIt = sectionIndex.find(&from);
     if (sourceSecIt != sectionIndex.end()) {
       const RISCVRODataGraphSection &sourceSec = sections[sourceSecIt->second];
-      ++stats.incomingFromRODataObjects;
+      ++stats.incomingFromSameROData;
       int sourceIndex = roDataRangeIndex(sourceSec.audit.ranges, rel.r_offset);
       if (sourceIndex == -1) {
         stats.unknownSourceRoot = true;
@@ -4644,10 +4644,10 @@ static void auditRISCVRODataPostGCIncomingRelocs(
     }
 
     if (from.isLive()) {
-      ++stats.incomingFromLiveExternalSections;
+      ++stats.incomingFromLiveSections;
       stats.externalLiveRoot = true;
     } else {
-      ++stats.incomingFromDeadExternalSections;
+      ++stats.incomingFromDeadSections;
     }
   }
 }
@@ -4778,10 +4778,12 @@ static void printRISCVRODataPostGCSplitAudit() {
   }
 
   uint64_t liveRelocReferencedObjects = 0;
+  uint64_t deadSourceOnlyObjects = 0;
+  uint64_t deadSourceOnlyBytes = 0;
   uint64_t postGCTotalIncomingRelocations = 0;
-  uint64_t postGCIncomingFromLiveExternalSections = 0;
-  uint64_t postGCIncomingFromDeadExternalSections = 0;
-  uint64_t postGCIncomingFromRODataObjects = 0;
+  uint64_t postGCIncomingFromLiveSections = 0;
+  uint64_t postGCIncomingFromDeadSections = 0;
+  uint64_t postGCIncomingFromSameROData = 0;
   uint64_t externalLiveRootObjects = 0;
   uint64_t unknownSourceRootObjects = 0;
   uint64_t rootOrSpecialReferencedObjects = 0;
@@ -4799,8 +4801,15 @@ static void printRISCVRODataPostGCSplitAudit() {
       const RISCVRODataPostGCObjectStats &stats =
           objectStats[sec.nodeBase + i];
       uint64_t size = range.end - range.start;
-      if (stats.incomingFromLiveExternalSections)
+      if (stats.incomingFromLiveSections)
         ++liveRelocReferencedObjects;
+      if (stats.totalIncomingRelocations && !stats.incomingFromLiveSections &&
+          !stats.incomingFromSameROData && stats.incomingFromDeadSections &&
+          !stats.rootOrSpecialReference && !stats.externalLiveRoot &&
+          !stats.unknownSourceRoot) {
+        ++deadSourceOnlyObjects;
+        deadSourceOnlyBytes += size;
+      }
       if (stats.externalLiveRoot)
         ++externalLiveRootObjects;
       if (stats.unknownSourceRoot)
@@ -4815,21 +4824,19 @@ static void printRISCVRODataPostGCSplitAudit() {
         objectGraphDeadCandidateBytes += size;
       }
       postGCTotalIncomingRelocations += stats.totalIncomingRelocations;
-      postGCIncomingFromLiveExternalSections +=
-          stats.incomingFromLiveExternalSections;
-      postGCIncomingFromDeadExternalSections +=
-          stats.incomingFromDeadExternalSections;
-      postGCIncomingFromRODataObjects += stats.incomingFromRODataObjects;
+      postGCIncomingFromLiveSections += stats.incomingFromLiveSections;
+      postGCIncomingFromDeadSections += stats.incomingFromDeadSections;
+      postGCIncomingFromSameROData += stats.incomingFromSameROData;
       message(Twine("  object=") + range.sym->getName() + " start=" +
               Twine(range.start) + " end=" + Twine(range.end) + " size=" +
               Twine(size) + " total_incoming_relocations=" +
               Twine(stats.totalIncomingRelocations) +
-              " incoming_from_live_external_sections=" +
-              Twine(stats.incomingFromLiveExternalSections) +
-              " incoming_from_dead_external_sections=" +
-              Twine(stats.incomingFromDeadExternalSections) +
-              " incoming_from_rodata_objects=" +
-              Twine(stats.incomingFromRODataObjects) + " external_live_root=" +
+              " incoming_from_live_sections=" +
+              Twine(stats.incomingFromLiveSections) +
+              " incoming_from_dead_sections=" +
+              Twine(stats.incomingFromDeadSections) +
+              " incoming_from_same_rodata=" +
+              Twine(stats.incomingFromSameROData) + " external_live_root=" +
               Twine(stats.externalLiveRoot ? 1 : 0) +
               " root_or_special_reference=" +
               Twine(stats.rootOrSpecialReference ? 1 : 0) +
@@ -4846,14 +4853,18 @@ static void printRISCVRODataPostGCSplitAudit() {
           Twine(nodeCount));
   message(Twine("RISCV rodata split post-GC audit summary: total_incoming_relocations=") +
           Twine(postGCTotalIncomingRelocations));
-  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_live_external_sections=") +
-          Twine(postGCIncomingFromLiveExternalSections));
-  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_dead_external_sections=") +
-          Twine(postGCIncomingFromDeadExternalSections));
-  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_rodata_objects=") +
-          Twine(postGCIncomingFromRODataObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_live_sections=") +
+          Twine(postGCIncomingFromLiveSections));
+  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_dead_sections=") +
+          Twine(postGCIncomingFromDeadSections));
+  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_same_rodata=") +
+          Twine(postGCIncomingFromSameROData));
   message(Twine("RISCV rodata split post-GC audit summary: live_reloc_referenced_objects=") +
           Twine(liveRelocReferencedObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: dead_source_only_objects=") +
+          Twine(deadSourceOnlyObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: dead_source_only_bytes=") +
+          Twine(deadSourceOnlyBytes));
   message(Twine("RISCV rodata split post-GC audit summary: external_live_root_objects=") +
           Twine(externalLiveRootObjects));
   message(Twine("RISCV rodata split post-GC audit summary: root_or_special_referenced_objects=") +
