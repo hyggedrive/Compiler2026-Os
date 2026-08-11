@@ -4289,6 +4289,25 @@ struct RISCVRODataRange {
   uint64_t start = 0;
   uint64_t end = 0;
   uint32_t exactAliasSymbols = 0;
+  SmallVector<Defined *, 0> aliases;
+};
+
+struct RISCVRODataPostGCObjectStats {
+  uint32_t totalIncomingRelocations = 0;
+  uint32_t incomingFromLiveExternalSections = 0;
+  uint32_t incomingFromDeadExternalSections = 0;
+  uint32_t incomingFromRODataObjects = 0;
+  uint32_t internalOutEdges = 0;
+  bool externalLiveRoot = false;
+  bool unknownSourceRoot = false;
+  bool rootOrSpecialReference = false;
+  bool objectGraphLive = false;
+};
+
+struct RISCVSRODataInventory {
+  uint32_t sectionCount = 0;
+  uint64_t totalBytes = 0;
+  uint64_t objectBytes = 0;
 };
 
 enum class RISCVRODataSplitBlockReason {
@@ -4353,6 +4372,12 @@ struct RISCVRODataSplitAuditResult {
   SmallVector<uint8_t, 0> referenced;
 };
 
+struct RISCVRODataGraphSection {
+  InputSection *parent = nullptr;
+  RISCVRODataSplitAuditResult audit;
+  uint32_t nodeBase = 0;
+};
+
 static void addRODataReason(RISCVRODataSplitAuditResult &r,
                             RISCVRODataSplitBlockReason reason) {
   r.analyzable = false;
@@ -4361,6 +4386,10 @@ static void addRODataReason(RISCVRODataSplitAuditResult &r,
 
 static bool isRISCVRODataSplitCandidateName(StringRef name) {
   return name == ".rodata" || name.starts_with(".rodata.");
+}
+
+static bool isRISCVSRODataInventoryName(StringRef name) {
+  return name == ".srodata" || name.starts_with(".srodata.");
 }
 
 static int roDataRangeIndex(ArrayRef<RISCVRODataRange> ranges, uint64_t off) {
@@ -4468,7 +4497,12 @@ auditRISCVRODataSplitSection(ObjFile<ELFT> &file, InputSection &sec) {
                       RISCVRODataSplitBlockReason::ObjectRangeOverflow);
       continue;
     }
-    result.ranges.push_back({d, d->value, d->value + d->size});
+    RISCVRODataRange range;
+    range.sym = d;
+    range.start = d->value;
+    range.end = d->value + d->size;
+    range.aliases.push_back(d);
+    result.ranges.push_back(std::move(range));
   }
 
   if (result.ranges.empty()) {
@@ -4488,6 +4522,7 @@ auditRISCVRODataSplitSection(ObjFile<ELFT> &file, InputSection &sec) {
         r.end == unique.back().end) {
       ++unique.back().exactAliasSymbols;
       ++result.exactAliasSymbolCount;
+      unique.back().aliases.append(r.aliases.begin(), r.aliases.end());
       continue;
     }
     if (!unique.empty() && r.start < unique.back().end) {
@@ -4531,6 +4566,316 @@ auditRISCVRODataSplitSection(ObjFile<ELFT> &file, InputSection &sec) {
     }
   }
   return result;
+}
+
+static bool isRISCVRODataRootOrSpecialReference(const RISCVRODataRange &range,
+                                                InputSection &parent) {
+  if (parent.flags & SHF_GNU_RETAIN)
+    return true;
+  if (script->shouldKeep(&parent))
+    return true;
+  for (Defined *d : range.aliases) {
+    if (d->includeInDynsym())
+      return true;
+    StringRef name = d->getName();
+    if (name == config->entry || name == config->init || name == config->fini)
+      return true;
+    if (llvm::is_contained(config->undefined, name))
+      return true;
+    if (llvm::is_contained(script->referencedSymbols, name))
+      return true;
+    for (auto &it : symtab.cmseSymMap) {
+      const ArmCmseEntryFunction &cmse = it.second;
+      if (cmse.sym == d || cmse.acleSeSym == d)
+        return true;
+    }
+  }
+  return false;
+}
+
+template <class ELFT, class RelTy>
+static void auditRISCVRODataPostGCIncomingRelocs(
+    ArrayRef<RISCVRODataGraphSection> sections,
+    const DenseMap<const InputSectionBase *, uint32_t> &sectionIndex,
+    InputSectionBase &from, ArrayRef<RelTy> rels,
+    MutableArrayRef<RISCVRODataPostGCObjectStats> objectStats,
+    MutableArrayRef<SmallVector<uint32_t, 0>> graph,
+    uint64_t &internalObjectEdges) {
+  for (const RelTy &rel : rels) {
+    Symbol &sym = from.getFile<ELFT>()->getRelocTargetSym(rel);
+    auto *d = dyn_cast<Defined>(&sym);
+    if (!d)
+      continue;
+    auto *targetInputSec = dyn_cast_or_null<InputSectionBase>(d->section);
+    auto targetSecIt = sectionIndex.find(targetInputSec);
+    if (targetSecIt == sectionIndex.end())
+      continue;
+
+    uint64_t target = d->value;
+    if constexpr (RelTy::IsRela) {
+      if (!checkedAddend(d->value, rel.r_addend, target))
+        continue;
+    } else if (d->isSection()) {
+      continue;
+    }
+
+    const RISCVRODataGraphSection &targetSec = sections[targetSecIt->second];
+    int targetIndex = roDataRangeIndex(targetSec.audit.ranges, target);
+    if (targetIndex == -1)
+      continue;
+    uint32_t targetNode = targetSec.nodeBase + targetIndex;
+
+    RISCVRODataPostGCObjectStats &stats = objectStats[targetNode];
+    ++stats.totalIncomingRelocations;
+    auto sourceSecIt = sectionIndex.find(&from);
+    if (sourceSecIt != sectionIndex.end()) {
+      const RISCVRODataGraphSection &sourceSec = sections[sourceSecIt->second];
+      ++stats.incomingFromRODataObjects;
+      int sourceIndex = roDataRangeIndex(sourceSec.audit.ranges, rel.r_offset);
+      if (sourceIndex == -1) {
+        stats.unknownSourceRoot = true;
+        continue;
+      }
+      uint32_t sourceNode = sourceSec.nodeBase + sourceIndex;
+      graph[sourceNode].push_back(targetNode);
+      ++objectStats[sourceNode].internalOutEdges;
+      ++internalObjectEdges;
+      continue;
+    }
+
+    if (from.isLive()) {
+      ++stats.incomingFromLiveExternalSections;
+      stats.externalLiveRoot = true;
+    } else {
+      ++stats.incomingFromDeadExternalSections;
+    }
+  }
+}
+
+template <class ELFT>
+static RISCVSRODataInventory computeRISCVSRODataInventory() {
+  RISCVSRODataInventory inv;
+  for (ELFFileBase *base : ctx.objectFiles) {
+    auto *file = dyn_cast<ObjFile<ELFT>>(base);
+    if (!file)
+      continue;
+    for (InputSectionBase *s : file->getSections()) {
+      auto *isec = dyn_cast_or_null<InputSection>(s);
+      if (!isec || isec == &InputSection::discarded ||
+          !isRISCVSRODataInventoryName(isec->name))
+        continue;
+      ++inv.sectionCount;
+      inv.totalBytes += isec->content().size();
+      SmallVector<std::pair<uint64_t, uint64_t>, 0> ranges;
+      for (Symbol *sym : file->getSymbols()) {
+        auto *d = dyn_cast_or_null<Defined>(sym);
+        if (!d || d->section != isec || d->type != STT_OBJECT || d->size == 0)
+          continue;
+        if (d->value <= isec->content().size() &&
+            d->size <= std::numeric_limits<uint64_t>::max() - d->value &&
+            d->value + d->size <= isec->content().size())
+          ranges.push_back({d->value, d->value + d->size});
+      }
+      llvm::sort(ranges);
+      uint64_t cursor = 0;
+      bool haveCursor = false;
+      for (auto [begin, end] : ranges) {
+        if (!haveCursor || begin > cursor) {
+          inv.objectBytes += end - begin;
+          cursor = end;
+          haveCursor = true;
+        } else if (end > cursor) {
+          inv.objectBytes += end - cursor;
+          cursor = end;
+        }
+      }
+    }
+  }
+  return inv;
+}
+
+template <class ELFT>
+static void printRISCVRODataPostGCSplitAudit() {
+  if (!config->printRISCVRODataSplitAudit || config->emachine != EM_RISCV ||
+      config->relocatable)
+    return;
+
+  SmallVector<RISCVRODataGraphSection, 0> sections;
+  DenseMap<const InputSectionBase *, uint32_t> sectionIndex;
+  uint32_t nodeCount = 0;
+  for (ELFFileBase *base : ctx.objectFiles) {
+    auto *file = dyn_cast<ObjFile<ELFT>>(base);
+    if (!file)
+      continue;
+    for (InputSectionBase *s : file->getSections()) {
+      auto *isec = dyn_cast_or_null<InputSection>(s);
+      if (!isec || isec == &InputSection::discarded ||
+          !isRISCVRODataSplitCandidateName(isec->name))
+        continue;
+
+      RISCVRODataSplitAuditResult result =
+          auditRISCVRODataSplitSection<ELFT>(*file, *isec);
+      if (!result.analyzable)
+        continue;
+
+      RISCVRODataGraphSection graphSec;
+      graphSec.parent = isec;
+      graphSec.nodeBase = nodeCount;
+      nodeCount += static_cast<uint32_t>(result.ranges.size());
+      graphSec.audit = std::move(result);
+      sectionIndex[isec] = static_cast<uint32_t>(sections.size());
+      sections.push_back(std::move(graphSec));
+    }
+  }
+
+  SmallVector<RISCVRODataPostGCObjectStats, 0> objectStats;
+  objectStats.resize(nodeCount);
+  SmallVector<SmallVector<uint32_t, 0>, 0> graph;
+  graph.resize(nodeCount);
+  uint64_t internalObjectEdges = 0;
+
+  for (const RISCVRODataGraphSection &sec : sections)
+    for (auto [i, range] : llvm::enumerate(sec.audit.ranges))
+      objectStats[sec.nodeBase + i].rootOrSpecialReference =
+          isRISCVRODataRootOrSpecialReference(range, *sec.parent);
+
+  for (ELFFileBase *base : ctx.objectFiles) {
+    auto *file = dyn_cast<ObjFile<ELFT>>(base);
+    if (!file)
+      continue;
+    for (InputSectionBase *from : file->getSections()) {
+      if (!from || from == &InputSection::discarded)
+        continue;
+      RelsOrRelas<ELFT> rs = from->template relsOrRelas<ELFT>();
+      if (rs.areRelocsRel())
+        auditRISCVRODataPostGCIncomingRelocs<ELFT>(
+            sections, sectionIndex, *from, rs.rels, objectStats, graph,
+            internalObjectEdges);
+      else
+        auditRISCVRODataPostGCIncomingRelocs<ELFT>(
+            sections, sectionIndex, *from, rs.relas, objectStats, graph,
+            internalObjectEdges);
+    }
+  }
+
+  SmallVector<uint32_t, 0> queue;
+  for (auto it : llvm::enumerate(objectStats)) {
+    size_t i = it.index();
+    RISCVRODataPostGCObjectStats &stats = it.value();
+    if (stats.externalLiveRoot || stats.rootOrSpecialReference ||
+        stats.unknownSourceRoot) {
+      stats.objectGraphLive = true;
+      queue.push_back(static_cast<uint32_t>(i));
+    }
+  }
+  while (!queue.empty()) {
+    uint32_t cur = queue.pop_back_val();
+    for (uint32_t next : graph[cur])
+      if (!objectStats[next].objectGraphLive) {
+        objectStats[next].objectGraphLive = true;
+        queue.push_back(next);
+      }
+  }
+
+  uint64_t liveRelocReferencedObjects = 0;
+  uint64_t postGCTotalIncomingRelocations = 0;
+  uint64_t postGCIncomingFromLiveExternalSections = 0;
+  uint64_t postGCIncomingFromDeadExternalSections = 0;
+  uint64_t postGCIncomingFromRODataObjects = 0;
+  uint64_t externalLiveRootObjects = 0;
+  uint64_t unknownSourceRootObjects = 0;
+  uint64_t rootOrSpecialReferencedObjects = 0;
+  uint64_t objectGraphLiveObjects = 0;
+  uint64_t objectGraphLiveBytes = 0;
+  uint64_t objectGraphDeadCandidateObjects = 0;
+  uint64_t objectGraphDeadCandidateBytes = 0;
+
+  for (const RISCVRODataGraphSection &sec : sections) {
+    message("RISCV rodata split post-GC audit:");
+    message(Twine("  file=") + toString(sec.parent->file));
+    message(Twine("  section=") + sec.parent->name);
+    message(Twine("  size=") + Twine(sec.audit.sectionSize));
+    for (auto [i, range] : llvm::enumerate(sec.audit.ranges)) {
+      const RISCVRODataPostGCObjectStats &stats =
+          objectStats[sec.nodeBase + i];
+      uint64_t size = range.end - range.start;
+      if (stats.incomingFromLiveExternalSections)
+        ++liveRelocReferencedObjects;
+      if (stats.externalLiveRoot)
+        ++externalLiveRootObjects;
+      if (stats.unknownSourceRoot)
+        ++unknownSourceRootObjects;
+      if (stats.rootOrSpecialReference)
+        ++rootOrSpecialReferencedObjects;
+      if (stats.objectGraphLive) {
+        ++objectGraphLiveObjects;
+        objectGraphLiveBytes += size;
+      } else {
+        ++objectGraphDeadCandidateObjects;
+        objectGraphDeadCandidateBytes += size;
+      }
+      postGCTotalIncomingRelocations += stats.totalIncomingRelocations;
+      postGCIncomingFromLiveExternalSections +=
+          stats.incomingFromLiveExternalSections;
+      postGCIncomingFromDeadExternalSections +=
+          stats.incomingFromDeadExternalSections;
+      postGCIncomingFromRODataObjects += stats.incomingFromRODataObjects;
+      message(Twine("  object=") + range.sym->getName() + " start=" +
+              Twine(range.start) + " end=" + Twine(range.end) + " size=" +
+              Twine(size) + " total_incoming_relocations=" +
+              Twine(stats.totalIncomingRelocations) +
+              " incoming_from_live_external_sections=" +
+              Twine(stats.incomingFromLiveExternalSections) +
+              " incoming_from_dead_external_sections=" +
+              Twine(stats.incomingFromDeadExternalSections) +
+              " incoming_from_rodata_objects=" +
+              Twine(stats.incomingFromRODataObjects) + " external_live_root=" +
+              Twine(stats.externalLiveRoot ? 1 : 0) +
+              " root_or_special_reference=" +
+              Twine(stats.rootOrSpecialReference ? 1 : 0) +
+              " unknown_source_root=" +
+              Twine(stats.unknownSourceRoot ? 1 : 0) +
+              " internal_out_edges=" + Twine(stats.internalOutEdges) +
+              " object_graph_live=" +
+              Twine(stats.objectGraphLive ? 1 : 0));
+    }
+  }
+
+  RISCVSRODataInventory srodata = computeRISCVSRODataInventory<ELFT>();
+  message(Twine("RISCV rodata split post-GC audit summary: global_object_nodes=") +
+          Twine(nodeCount));
+  message(Twine("RISCV rodata split post-GC audit summary: total_incoming_relocations=") +
+          Twine(postGCTotalIncomingRelocations));
+  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_live_external_sections=") +
+          Twine(postGCIncomingFromLiveExternalSections));
+  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_dead_external_sections=") +
+          Twine(postGCIncomingFromDeadExternalSections));
+  message(Twine("RISCV rodata split post-GC audit summary: incoming_from_rodata_objects=") +
+          Twine(postGCIncomingFromRODataObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: live_reloc_referenced_objects=") +
+          Twine(liveRelocReferencedObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: external_live_root_objects=") +
+          Twine(externalLiveRootObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: root_or_special_referenced_objects=") +
+          Twine(rootOrSpecialReferencedObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: unknown_source_root_objects=") +
+          Twine(unknownSourceRootObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: global_internal_object_edges=") +
+          Twine(internalObjectEdges));
+  message(Twine("RISCV rodata split post-GC audit summary: global_object_graph_live_objects=") +
+          Twine(objectGraphLiveObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: global_object_graph_live_bytes=") +
+          Twine(objectGraphLiveBytes));
+  message(Twine("RISCV rodata split post-GC audit summary: global_object_graph_dead_candidate_objects=") +
+          Twine(objectGraphDeadCandidateObjects));
+  message(Twine("RISCV rodata split post-GC audit summary: global_object_graph_dead_candidate_bytes=") +
+          Twine(objectGraphDeadCandidateBytes));
+  message(Twine("RISCV srodata inventory: sections=") +
+          Twine(srodata.sectionCount));
+  message(Twine("RISCV srodata inventory: total_bytes=") +
+          Twine(srodata.totalBytes));
+  message(Twine("RISCV srodata inventory: stt_object_bytes=") +
+          Twine(srodata.objectBytes));
 }
 
 template <class ELFT> static void printRISCVRODataSplitAudit() {
@@ -4985,6 +5330,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);
   printRISCVFunctionSplitGCStats();
+  invokeELFT(printRISCVRODataPostGCSplitAudit,);
   demoteSharedAndLazySymbols();
 
   // Make copies of any input sections that need to be copied into each
