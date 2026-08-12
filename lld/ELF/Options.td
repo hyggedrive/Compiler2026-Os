@@ -388,6 +388,11 @@ def riscv_libc_specialization_audit_dump_failed_calls:
   HelpText<"Dump instruction/relocation context for the first N failed RISC-V libc specialization audit printf callsites">,
   Flags<[HelpHidden]>;
 
+def riscv_libc_specialization_audit_dump_call_offsets:
+  JJ<"riscv-libc-specialization-audit-dump-call-offsets=">,
+  HelpText<"Dump instruction/relocation context for RISC-V libc specialization audit printf callsites at comma-separated offsets">,
+  Flags<[HelpHidden]>;
+
 defm relax: BB<"relax",
   "Enable target-specific relaxations if supported (default)",
   "Disable target-specific relaxations">;

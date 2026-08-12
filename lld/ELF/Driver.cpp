@@ -1374,6 +1374,8 @@ static void readConfigs(opt::InputArgList &args) {
       args.hasArg(OPT_print_riscv_libc_specialization_audit);
   config->riscvLibcSpecializationAuditDumpFailedCalls = args::getInteger(
       args, OPT_riscv_libc_specialization_audit_dump_failed_calls, 0);
+  config->riscvLibcSpecializationAuditDumpCallOffsets =
+      args.getLastArgValue(OPT_riscv_libc_specialization_audit_dump_call_offsets);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
@@ -4438,6 +4440,15 @@ struct RISCVLibcEntryCalleeSavedDiag {
   std::string candidateRejectReason = "none";
 };
 
+struct RISCVLibcAuditPerfStats {
+  uint32_t decodedSourceFunctions = 0;
+  uint64_t decodedInstructionCount = 0;
+  uint32_t decodeCacheHits = 0;
+  uint32_t decodeCacheMisses = 0;
+  uint32_t relocCacheHits = 0;
+  uint32_t relocCacheMisses = 0;
+};
+
 template <class RelTy> static int64_t getRISCVLibcAddend(const RelTy &rel) {
   if constexpr (RelTy::IsRela)
     return rel.r_addend;
@@ -4558,6 +4569,16 @@ struct RISCVLibcInsn {
   bool auipc = false;
   bool writesRd = false;
   bool supported = true;
+};
+
+struct RISCVLibcFunctionDecode {
+  InputSectionBase *section = nullptr;
+  Defined *function = nullptr;
+  uint64_t funcStart = 0;
+  uint64_t funcEnd = 0;
+  uint64_t decodedEnd = 0;
+  SmallVector<RISCVLibcInsn, 0> instructions;
+  bool decodeOk = true;
 };
 
 static bool readRISCVLibcInsn(ArrayRef<uint8_t> data, uint64_t off,
@@ -4762,6 +4783,77 @@ static bool riscvLibcInsnWritesReg(const RISCVLibcInsn &insn, int reg) {
   return insn.writesRd && insn.rd == reg;
 }
 
+static RISCVLibcFunctionDecode &
+getRISCVLibcFunctionDecodeCached(
+    InputSectionBase &sec, Defined &func,
+    std::map<std::pair<InputSectionBase *, Defined *>, RISCVLibcFunctionDecode>
+        &cache,
+    RISCVLibcAuditPerfStats &stats) {
+  std::pair<InputSectionBase *, Defined *> key{&sec, &func};
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    ++stats.decodeCacheHits;
+    return it->second;
+  }
+
+  ++stats.decodeCacheMisses;
+  RISCVLibcFunctionDecode decoded;
+  decoded.section = &sec;
+  decoded.function = &func;
+  decoded.funcStart = func.value;
+  decoded.funcEnd = sec.content().size();
+  decoded.decodedEnd = decoded.funcStart;
+  if (func.size != 0 && func.value + func.size < decoded.funcEnd)
+    decoded.funcEnd = func.value + func.size;
+  ArrayRef<uint8_t> data = sec.content();
+  for (uint64_t off = decoded.funcStart; off < decoded.funcEnd;) {
+    RISCVLibcInsn insn;
+    if (!readRISCVLibcInsn(data, off, insn) || off + insn.size > decoded.funcEnd) {
+      decoded.decodeOk = false;
+      break;
+    }
+    decoded.instructions.push_back(insn);
+    off += insn.size;
+    decoded.decodedEnd = off;
+  }
+  ++stats.decodedSourceFunctions;
+  stats.decodedInstructionCount += decoded.instructions.size();
+  auto inserted = cache.insert({key, std::move(decoded)});
+  return inserted.first->second;
+}
+
+static bool collectRISCVLibcInsnsBeforeCall(
+    const RISCVLibcFunctionDecode &decoded, uint64_t callOff,
+    SmallVectorImpl<RISCVLibcInsn> &insns, std::string &reason,
+    uint32_t maxInsns = 0) {
+  bool reachedCallBoundary = decoded.funcStart == callOff;
+  for (const RISCVLibcInsn &insn : decoded.instructions) {
+    if (insn.offset == callOff) {
+      reachedCallBoundary = true;
+      break;
+    }
+    if (insn.offset > callOff)
+      break;
+    if (insn.offset + insn.size > callOff) {
+      reason = "decode-did-not-reach-call-offset";
+      return false;
+    }
+    insns.push_back(insn);
+    if (maxInsns != 0 && insns.size() > maxInsns)
+      insns.erase(insns.begin());
+    if (insn.offset + insn.size == callOff) {
+      reachedCallBoundary = true;
+      break;
+    }
+  }
+  if (!reachedCallBoundary) {
+    reason = callOff > decoded.decodedEnd ? "decode-failed"
+                                          : "decode-did-not-reach-call-offset";
+    return false;
+  }
+  return true;
+}
+
 static bool targetRISCVLibcCString(Defined &d, int64_t addend,
                                    RISCVLibcCandidateFormat &format) {
   auto *targetSec = dyn_cast_or_null<InputSectionBase>(d.section);
@@ -4815,6 +4907,23 @@ getRISCVLibcRelocTargets(InputSectionBase &sec) {
   for (const auto &rel : rels.relas)
     recordRISCVLibcRelocTarget<ELFT>(sec, rel, targets);
   return targets;
+}
+
+template <class ELFT>
+static DenseMap<uint64_t, RISCVLibcRelocTarget> &
+getRISCVLibcRelocTargetsCached(
+    InputSectionBase &sec,
+    std::map<InputSectionBase *, DenseMap<uint64_t, RISCVLibcRelocTarget>>
+        &cache,
+    RISCVLibcAuditPerfStats &stats) {
+  auto it = cache.find(&sec);
+  if (it != cache.end()) {
+    ++stats.relocCacheHits;
+    return it->second;
+  }
+  ++stats.relocCacheMisses;
+  auto inserted = cache.insert({&sec, getRISCVLibcRelocTargets<ELFT>(sec)});
+  return inserted.first->second;
 }
 
 static std::string hexOffset(uint64_t off) {
@@ -4960,29 +5069,21 @@ static std::string summarizeRISCVLibcRelocsAt(InputSectionBase &sec,
 }
 
 template <class ELFT>
-static void dumpRISCVLibcFailedCallsiteContext(const RISCVLibcPrintfCall &call) {
+static void dumpRISCVLibcFailedCallsiteContext(
+    const RISCVLibcPrintfCall &call, const RISCVLibcFunctionDecode &decoded) {
   int formatReg = getRISCVPrintfFormatArgReg(call.target->getName());
   message("    failed_callsite_context:");
   message(Twine("      format_reg=") + riscvLibcRegName(formatReg) +
           " reason=" + call.reason);
 
-  ArrayRef<uint8_t> data = call.sourceSection->content();
   SmallVector<RISCVLibcInsn, 0> insns;
-  bool decodeOk = true;
-  for (uint64_t off = call.caller->value; off < call.callOffset;) {
-    RISCVLibcInsn insn;
-    if (!readRISCVLibcInsn(data, off, insn) ||
-        off + insn.size > call.callOffset) {
-      decodeOk = false;
-      break;
-    }
-    insns.push_back(insn);
-    if (insns.size() > 24)
-      insns.erase(insns.begin());
-    off += insn.size;
-  }
-  if (!decodeOk) {
-    message("      decode_failed=1");
+  std::string decodeReason;
+  if (!collectRISCVLibcInsnsBeforeCall(decoded, call.callOffset, insns,
+                                       decodeReason, 24)) {
+    if (decodeReason == "decode-did-not-reach-call-offset")
+      message("      decode_did_not_reach_call_offset=1");
+    else
+      message("      decode_failed=1");
     return;
   }
 
@@ -5041,7 +5142,8 @@ static void dumpRISCVLibcFailedCallsiteContext(const RISCVLibcPrintfCall &call) 
 
 template <class ELFT>
 static bool proveRISCVLibcEntryCalleeSavedFormat(
-    InputSectionBase &sec, uint64_t funcStart, uint64_t callOff, int argReg,
+    InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
+    uint64_t callOff, int argReg,
     ArrayRef<RISCVLibcInsn> insns,
     DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets,
     RISCVLibcCandidateFormat &format, std::string &proof,
@@ -5096,16 +5198,9 @@ static bool proveRISCVLibcEntryCalleeSavedFormat(
   }
 
   SmallVector<RISCVLibcInsn, 0> allInsns;
-  ArrayRef<uint8_t> data = sec.content();
-  for (uint64_t off = funcStart; off < callOff;) {
-    RISCVLibcInsn insn;
-    if (!readRISCVLibcInsn(data, off, insn) || off + insn.size > callOff) {
-      reason = "decode-failed";
-      diag.reason = reason;
-      return false;
-    }
-    allInsns.push_back(insn);
-    off += insn.size;
+  if (!collectRISCVLibcInsnsBeforeCall(decoded, callOff, allInsns, reason)) {
+    diag.reason = reason;
+    return false;
   }
 
   size_t prefixEnd = allInsns.size();
@@ -5327,43 +5422,25 @@ static bool proveRISCVLibcDirectAbsFormatArg(
 }
 
 template <class ELFT>
-static bool proveRISCVLibcCallsiteFormat(InputSectionBase &sec,
-                                         uint64_t funcStart, uint64_t callOff,
-                                         int argReg,
-                                         RISCVLibcCandidateFormat &format,
-                                         std::string &proof,
-                                         std::string &reason,
-                                         std::string &entryReason,
-                                         std::string &entryDetail) {
+static bool proveRISCVLibcCallsiteFormat(
+    InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
+    uint64_t callOff, int argReg,
+    DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets,
+    RISCVLibcCandidateFormat &format, std::string &proof, std::string &reason,
+    std::string &entryReason, std::string &entryDetail) {
   if (argReg < 0) {
     reason = "unsupported-printf-family-target";
     return false;
   }
-  ArrayRef<uint8_t> data = sec.content();
-  if (callOff > data.size()) {
+  if (callOff > sec.content().size()) {
     reason = "call-offset-out-of-range";
     return false;
   }
-
-  DenseMap<uint64_t, RISCVLibcRelocTarget> relocTargets =
-      getRISCVLibcRelocTargets<ELFT>(sec);
   constexpr uint32_t maxWindowInsns = 16;
   SmallVector<RISCVLibcInsn, 0> insns;
-  for (uint64_t off = funcStart; off < callOff;) {
-    RISCVLibcInsn insn;
-    if (!readRISCVLibcInsn(data, off, insn)) {
-      reason = "decode-failed";
-      return false;
-    }
-    if (off + insn.size > callOff) {
-      reason = "decode-did-not-reach-call-offset";
-      return false;
-    }
-    insns.push_back(insn);
-    if (insns.size() > maxWindowInsns)
-      insns.erase(insns.begin());
-    off += insn.size;
-  }
+  if (!collectRISCVLibcInsnsBeforeCall(decoded, callOff, insns, reason,
+                                       maxWindowInsns))
+    return false;
   if (insns.empty()) {
     reason = "empty-call-window";
     return false;
@@ -5375,7 +5452,7 @@ static bool proveRISCVLibcCallsiteFormat(InputSectionBase &sec,
 
   RISCVLibcEntryCalleeSavedDiag entryDiag;
   if (proveRISCVLibcEntryCalleeSavedFormat<ELFT>(
-          sec, funcStart, callOff, argReg, insns, relocTargets, format, proof,
+          sec, decoded, callOff, argReg, insns, relocTargets, format, proof,
           reason, entryDiag)) {
     entryReason = entryDiag.reason;
     entryDetail = formatRISCVLibcEntryCalleeSavedDiag(entryDiag);
@@ -5559,6 +5636,24 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       config->emachine != EM_RISCV)
     return;
 
+  DenseSet<uint64_t> requestedCallOffsetDumpSet;
+  if (!config->riscvLibcSpecializationAuditDumpCallOffsets.empty()) {
+    SmallVector<StringRef, 0> pieces;
+    config->riscvLibcSpecializationAuditDumpCallOffsets.split(pieces, ',',
+                                                              -1, false);
+    for (StringRef piece : pieces) {
+      uint64_t value = 0;
+      if (!piece.trim().getAsInteger(0, value))
+        requestedCallOffsetDumpSet.insert(value);
+    }
+  }
+
+  RISCVLibcAuditPerfStats perfStats;
+  std::map<std::pair<InputSectionBase *, Defined *>, RISCVLibcFunctionDecode>
+      decodeCache;
+  std::map<InputSectionBase *, DenseMap<uint64_t, RISCVLibcRelocTarget>>
+      relocTargetCache;
+
   SmallVector<RISCVLibcFunctionNode, 0> nodes;
   DenseMap<Defined *, unsigned> nodeIndex;
 
@@ -5640,8 +5735,14 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           call.reason = "recognized-libc-wrapper-forwarder";
         } else {
           int argReg = getRISCVPrintfFormatArgReg(target->getName());
+          RISCVLibcFunctionDecode &decoded =
+              getRISCVLibcFunctionDecodeCached(sec, *sourceFunc, decodeCache,
+                                               perfStats);
+          DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets =
+              getRISCVLibcRelocTargetsCached<ELFT>(sec, relocTargetCache,
+                                                   perfStats);
           if (proveRISCVLibcCallsiteFormat<ELFT>(
-                  sec, sourceFunc->value, rel.r_offset, argReg,
+                  sec, decoded, rel.r_offset, argReg, relocTargets,
                   call.provenFormat, call.proof, call.reason,
                   call.entryCalleeSavedReason,
                   call.entryCalleeSavedDetail)) {
@@ -5774,6 +5875,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t failedCallsiteDumpRequested =
       config->riscvLibcSpecializationAuditDumpFailedCalls;
   uint32_t failedCallsiteDumpEmitted = 0;
+  uint32_t requestedCallOffsetDumps = requestedCallOffsetDumpSet.size();
+  uint32_t matchedCallOffsetDumps = 0;
 
   message("RISCV libc specialization audit:");
   message(Twine("  printf_core_instances=") + Twine(printfCoreRoots.size()));
@@ -5830,10 +5933,16 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   }
 
   for (RISCVLibcPrintfCall &call : printfCalls) {
+    bool dumpByOffset =
+        call.formatClass != RISCVLibcFormatClass::InternalForwarder &&
+        requestedCallOffsetDumpSet.contains(call.callOffset);
+    if (dumpByOffset)
+      ++matchedCallOffsetDumps;
     bool shouldDumpFailedContext =
         call.formatClass != RISCVLibcFormatClass::ProvenConstant &&
         call.formatClass != RISCVLibcFormatClass::InternalForwarder &&
         failedCallsiteDumpEmitted < failedCallsiteDumpRequested;
+    bool shouldDumpContext = shouldDumpFailedContext || dumpByOffset;
     message(Twine("  printf_call caller=") + call.caller->getName() +
             " target=" + call.target->getName() +
             " source_section=" + call.sourceSection->name +
@@ -5861,9 +5970,12 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
               call.entryCalleeSavedReason);
     if (!call.entryCalleeSavedDetail.empty())
       message(Twine("    ") + call.entryCalleeSavedDetail);
-    if (shouldDumpFailedContext) {
-      dumpRISCVLibcFailedCallsiteContext<ELFT>(call);
-      ++failedCallsiteDumpEmitted;
+    if (shouldDumpContext) {
+      RISCVLibcFunctionDecode &decoded = getRISCVLibcFunctionDecodeCached(
+          *call.sourceSection, *call.caller, decodeCache, perfStats);
+      dumpRISCVLibcFailedCallsiteContext<ELFT>(call, decoded);
+      if (shouldDumpFailedContext)
+        ++failedCallsiteDumpEmitted;
     }
   }
 
@@ -5904,6 +6016,19 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(failedCallsiteDumpRequested));
   message(Twine("  failed_callsite_dump_emitted=") +
           Twine(failedCallsiteDumpEmitted));
+  message(Twine("  requested_call_offset_dumps=") +
+          Twine(requestedCallOffsetDumps));
+  message(Twine("  matched_call_offset_dumps=") +
+          Twine(matchedCallOffsetDumps));
+  message(Twine("  decoded_source_functions=") +
+          Twine(perfStats.decodedSourceFunctions));
+  message(Twine("  decoded_instruction_count=") +
+          Twine(perfStats.decodedInstructionCount));
+  message(Twine("  decode_cache_hits=") + Twine(perfStats.decodeCacheHits));
+  message(Twine("  decode_cache_misses=") +
+          Twine(perfStats.decodeCacheMisses));
+  message(Twine("  reloc_cache_hits=") + Twine(perfStats.relocCacheHits));
+  message(Twine("  reloc_cache_misses=") + Twine(perfStats.relocCacheMisses));
 }
 } // namespace
 

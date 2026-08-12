@@ -271,6 +271,7 @@ struct Config {
   bool printMemoryUsage;
   bool printRISCVLibcSpecializationAudit;
   uint32_t riscvLibcSpecializationAuditDumpFailedCalls;
+  llvm::StringRef riscvLibcSpecializationAuditDumpCallOffsets;
   bool printRISCVFunctionSectionsSplit;
   bool relax;
   bool relaxGP;
