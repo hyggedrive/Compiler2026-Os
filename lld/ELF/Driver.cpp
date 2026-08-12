@@ -72,6 +72,8 @@
 #include <bitset>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -1368,6 +1370,7 @@ static void readConfigs(opt::InputArgList &args) {
   config->printGcSections =
       args.hasFlag(OPT_print_gc_sections, OPT_no_print_gc_sections, false);
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
+  config->printRISCVBlockAudit = args.hasArg(OPT_print_riscv_block_audit);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
@@ -4281,6 +4284,488 @@ static void printRISCVFunctionSplitGCStats() {
             Twine(d.deadChildren) + " live bytes " + Twine(d.liveBytes) +
             " dead bytes " + Twine(d.deadBytes));
 }
+
+struct RISCVBlockAuditInsn {
+  uint64_t off = 0;
+  uint8_t size = 0;
+  uint32_t raw = 0;
+  bool supported = true;
+  bool controlFlow = false;
+  bool conditional = false;
+  bool noFallthrough = false;
+  bool directJump = false;
+  bool directBranch = false;
+  bool ret = false;
+  bool call = false;
+};
+
+struct RISCVBlockAuditReloc {
+  RelType type = R_RISCV_NONE;
+  Defined *target = nullptr;
+  InputSectionBase *targetSection = nullptr;
+  int64_t addend = 0;
+};
+
+struct RISCVBasicBlockAudit {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  SmallVector<RISCVBlockAuditInsn, 0> insns;
+};
+
+static std::string riscvBlockHex(uint64_t off) {
+  return (Twine("0x") + llvm::utohexstr(off)).str();
+}
+
+template <class RelTy> static int64_t getRISCVBlockAuditAddend(const RelTy &r) {
+  if constexpr (RelTy::IsRela)
+    return r.r_addend;
+  return 0;
+}
+
+static bool isRISCVBlockDirectCFReloc(RelType type) {
+  return type == R_RISCV_BRANCH || type == R_RISCV_JAL ||
+         type == R_RISCV_RVC_BRANCH || type == R_RISCV_RVC_JUMP;
+}
+
+template <class ELFT, class RelTy>
+static void recordRISCVBlockAuditReloc(
+    InputSectionBase &sec, const RelTy &rel,
+    DenseMap<uint64_t, SmallVector<RISCVBlockAuditReloc, 0>> &rels) {
+  RelType type = rel.getType(config->isMips64EL);
+  if (!isRISCVBlockDirectCFReloc(type))
+    return;
+  Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+  RISCVBlockAuditReloc r;
+  r.type = type;
+  r.target = dyn_cast<Defined>(&target);
+  if (r.target)
+    r.targetSection = dyn_cast_or_null<InputSectionBase>(r.target->section);
+  r.addend = getRISCVBlockAuditAddend(rel);
+  rels[rel.r_offset].push_back(r);
+}
+
+template <class ELFT>
+static DenseMap<uint64_t, SmallVector<RISCVBlockAuditReloc, 0>>
+getRISCVBlockAuditRelocs(InputSectionBase &sec) {
+  DenseMap<uint64_t, SmallVector<RISCVBlockAuditReloc, 0>> rels;
+  if (!sec.file)
+    return rels;
+  RelsOrRelas<ELFT> rs = sec.template relsOrRelas<ELFT>();
+  for (const auto &rel : rs.rels)
+    recordRISCVBlockAuditReloc<ELFT>(sec, rel, rels);
+  for (const auto &rel : rs.relas)
+    recordRISCVBlockAuditReloc<ELFT>(sec, rel, rels);
+  return rels;
+}
+
+static const RISCVBlockAuditReloc *getRISCVBlockAuditReloc(
+    const DenseMap<uint64_t, SmallVector<RISCVBlockAuditReloc, 0>> &rels,
+    uint64_t off, RelType type) {
+  auto it = rels.find(off);
+  if (it == rels.end())
+    return nullptr;
+  const RISCVBlockAuditReloc *found = nullptr;
+  for (const RISCVBlockAuditReloc &r : it->second) {
+    if (r.type != type)
+      continue;
+    if (found)
+      return nullptr;
+    found = &r;
+  }
+  return found;
+}
+
+static bool getRISCVBlockRelocTargetInFunction(
+    InputSectionBase &sec, Defined &func, const RISCVBlockAuditReloc &r,
+    uint64_t &target) {
+  if (!r.target || r.targetSection != &sec)
+    return false;
+  uint64_t off = 0;
+  if (!checkedAddend(r.target->value, r.addend, off))
+    return false;
+  if (off < func.value || off >= func.value + func.size)
+    return false;
+  target = off;
+  return true;
+}
+
+static bool decodeRISCVBlockAuditInsn(ArrayRef<uint8_t> data, uint64_t off,
+                                      RISCVBlockAuditInsn &insn) {
+  if (off + 2 > data.size())
+    return false;
+  insn.off = off;
+  uint16_t half = llvm::support::endian::read16le(data.data() + off);
+  if ((half & 3) != 3) {
+    insn.size = 2;
+    insn.raw = half;
+    uint16_t quadrant = half & 3;
+    uint16_t funct3 = (half >> 13) & 7;
+    bool bit12 = half & 0x1000;
+    int rd = (half >> 7) & 0x1f;
+    int rs2 = (half >> 2) & 0x1f;
+    if (quadrant == 1 && funct3 == 5) {
+      insn.controlFlow = true;
+      insn.directJump = true;
+      insn.noFallthrough = true;
+    } else if (quadrant == 1 && (funct3 == 6 || funct3 == 7)) {
+      insn.controlFlow = true;
+      insn.directBranch = true;
+      insn.conditional = true;
+    } else if (quadrant == 2 && funct3 == 4 && rs2 == 0) {
+      insn.controlFlow = true;
+      if (!bit12 && rd == 1) {
+        insn.ret = true;
+        insn.noFallthrough = true;
+      } else if (bit12) {
+        insn.call = true;
+      } else {
+        insn.noFallthrough = true;
+        insn.supported = false;
+      }
+    }
+    return true;
+  }
+  if (off + 4 > data.size())
+    return false;
+  uint32_t raw = llvm::support::endian::read32le(data.data() + off);
+  insn.size = 4;
+  insn.raw = raw;
+  uint32_t opcode = raw & 0x7f;
+  int rd = (raw >> 7) & 0x1f;
+  int rs1 = (raw >> 15) & 0x1f;
+  if (opcode == 0x63) {
+    insn.controlFlow = true;
+    insn.directBranch = true;
+    insn.conditional = true;
+  } else if (opcode == 0x6f) {
+    insn.controlFlow = true;
+    if (rd == 1 || rd == 5)
+      insn.call = true;
+    else {
+      insn.directJump = true;
+      insn.noFallthrough = true;
+    }
+  } else if (opcode == 0x67) {
+    insn.controlFlow = true;
+    int64_t imm = SignExtend64<12>(raw >> 20);
+    if (rd == 0 && rs1 == 1 && imm == 0) {
+      insn.ret = true;
+      insn.noFallthrough = true;
+    } else if (rd == 1 || rd == 5) {
+      insn.call = true;
+    } else {
+      insn.noFallthrough = true;
+      insn.supported = false;
+    }
+  }
+  return true;
+}
+
+static std::string makeRISCVBlockBytesKey(ArrayRef<uint8_t> data,
+                                          uint64_t begin, uint64_t end) {
+  std::string key;
+  key.reserve((end - begin) * 2);
+  for (uint64_t i = begin; i < end; ++i) {
+    uint8_t b = data[i];
+    key.push_back("0123456789abcdef"[b >> 4]);
+    key.push_back("0123456789abcdef"[b & 15]);
+  }
+  return key;
+}
+
+static std::string makeRISCVBlockNormalizedKey(
+    const RISCVBasicBlockAudit &block,
+    InputSectionBase &sec,
+    const DenseMap<uint64_t, SmallVector<RISCVBlockAuditReloc, 0>> &rels,
+    const DenseMap<uint64_t, uint32_t> &blockIndexByOffset, bool &supported) {
+  supported = true;
+  std::string key;
+  for (const RISCVBlockAuditInsn &insn : block.insns) {
+    if (!insn.supported) {
+      supported = false;
+      return "";
+    }
+    RelType rt = R_RISCV_NONE;
+    if (insn.directBranch)
+      rt = insn.size == 2 ? R_RISCV_RVC_BRANCH : R_RISCV_BRANCH;
+    else if (insn.directJump)
+      rt = insn.size == 2 ? R_RISCV_RVC_JUMP : R_RISCV_JAL;
+    uint32_t normalizedRaw = insn.raw;
+    if (rt != R_RISCV_NONE) {
+      const RISCVBlockAuditReloc *r = getRISCVBlockAuditReloc(rels, insn.off, rt);
+      if (!r || !r->target || r->targetSection != &sec) {
+        supported = false;
+        return "";
+      }
+      uint64_t target = 0;
+      if (!checkedAddend(r->target->value, r->addend, target)) {
+        supported = false;
+        return "";
+      }
+      auto it = blockIndexByOffset.find(target);
+      if (it == blockIndexByOffset.end()) {
+        supported = false;
+        return "";
+      }
+      if (insn.size == 4 && rt == R_RISCV_BRANCH)
+        normalizedRaw &= ~((uint32_t(1) << 31) | (uint32_t(0x3f) << 25) |
+                           (uint32_t(0xf) << 8) | (uint32_t(1) << 7));
+      else if (insn.size == 4 && rt == R_RISCV_JAL)
+        normalizedRaw &= ~((uint32_t(1) << 31) | (uint32_t(0xff) << 12) |
+                           (uint32_t(1) << 20) | (uint32_t(0x3ff) << 21));
+      else if (insn.size == 2 && rt == R_RISCV_RVC_BRANCH)
+        normalizedRaw &= ~((uint32_t(1) << 12) | (uint32_t(0x3) << 10) |
+                           (uint32_t(0x3) << 5) | (uint32_t(0x7) << 3) |
+                           (uint32_t(1) << 2));
+      else if (insn.size == 2 && rt == R_RISCV_RVC_JUMP)
+        normalizedRaw &= ~((uint32_t(1) << 12) | (uint32_t(1) << 11) |
+                           (uint32_t(0x3) << 9) | (uint32_t(1) << 8) |
+                           (uint32_t(1) << 7) | (uint32_t(1) << 6) |
+                           (uint32_t(1) << 5) | (uint32_t(0x7) << 3) |
+                           (uint32_t(1) << 2));
+      key += (Twine(":cf:") + Twine(static_cast<uint32_t>(rt)) + ":b" +
+              Twine(it->second))
+                 .str();
+    }
+    key += (Twine(insn.size) + ":" + llvm::utohexstr(normalizedRaw)).str();
+    key.push_back(';');
+  }
+  return key;
+}
+
+static SmallVector<RISCVBasicBlockAudit, 0> buildRISCVBasicBlocksForAudit(
+    InputSectionBase &sec, Defined &func,
+    const DenseMap<uint64_t, SmallVector<RISCVBlockAuditReloc, 0>> &rels,
+    uint32_t &unsupportedControlFlow) {
+  SmallVector<RISCVBlockAuditInsn, 0> insns;
+  ArrayRef<uint8_t> data = sec.content();
+  uint64_t end = func.value + func.size;
+  DenseSet<uint64_t> boundaries;
+  boundaries.insert(func.value);
+  for (uint64_t off = func.value; off < end;) {
+    RISCVBlockAuditInsn insn;
+    if (!decodeRISCVBlockAuditInsn(data, off, insn)) {
+      ++unsupportedControlFlow;
+      break;
+    }
+    insns.push_back(insn);
+    uint64_t next = off + insn.size;
+    if (insn.directBranch || insn.directJump) {
+      RelType rt = insn.directBranch ? (insn.size == 2 ? R_RISCV_RVC_BRANCH
+                                                       : R_RISCV_BRANCH)
+                                     : (insn.size == 2 ? R_RISCV_RVC_JUMP
+                                                       : R_RISCV_JAL);
+      const RISCVBlockAuditReloc *r = getRISCVBlockAuditReloc(rels, off, rt);
+      uint64_t target = 0;
+      if (!r || !getRISCVBlockRelocTargetInFunction(sec, func, *r, target)) {
+        ++unsupportedControlFlow;
+      } else {
+        boundaries.insert(target);
+      }
+      if (next < end)
+        boundaries.insert(next);
+    } else if (insn.ret ||
+               (!insn.call && insn.controlFlow && insn.noFallthrough)) {
+      if (next < end)
+        boundaries.insert(next);
+    } else if (insn.controlFlow && !insn.call && !insn.conditional &&
+               !insn.directJump && !insn.ret) {
+      ++unsupportedControlFlow;
+      if (next < end)
+        boundaries.insert(next);
+    }
+    off = next;
+  }
+
+  SmallVector<uint64_t, 0> sortedBoundaries(boundaries.begin(), boundaries.end());
+  llvm::sort(sortedBoundaries);
+  SmallVector<RISCVBasicBlockAudit, 0> blocks;
+  for (size_t i = 0; i < sortedBoundaries.size(); ++i) {
+    uint64_t begin = sortedBoundaries[i];
+    uint64_t blockEnd =
+        i + 1 == sortedBoundaries.size() ? end : sortedBoundaries[i + 1];
+    if (begin >= blockEnd)
+      continue;
+    RISCVBasicBlockAudit block;
+    block.begin = begin;
+    block.end = blockEnd;
+    for (const RISCVBlockAuditInsn &insn : insns)
+      if (begin <= insn.off && insn.off < blockEnd)
+        block.insns.push_back(insn);
+    blocks.push_back(std::move(block));
+  }
+  return blocks;
+}
+
+template <class ELFT> static void printRISCVBlockAudit() {
+  if (!config->printRISCVBlockAudit || config->emachine != EM_RISCV)
+    return;
+
+  for (ELFFileBase *file : ctx.objectFiles) {
+    for (Symbol *sym : file->getSymbols()) {
+      Defined *d = dyn_cast_or_null<Defined>(sym);
+      if (!d || d->type != STT_FUNC || d->size == 0)
+        continue;
+      auto *sec = dyn_cast_or_null<InputSectionBase>(d->section);
+      if (!sec || !sec->isLive() || !(sec->flags & SHF_EXECINSTR) ||
+          d->value + d->size > sec->content().size())
+        continue;
+
+      uint32_t unsupportedControlFlow = 0;
+      auto rels = getRISCVBlockAuditRelocs<ELFT>(*sec);
+      SmallVector<RISCVBasicBlockAudit, 0> blocks =
+          buildRISCVBasicBlocksForAudit(*sec, *d, rels, unsupportedControlFlow);
+      if (blocks.empty())
+        continue;
+
+      DenseMap<uint64_t, uint32_t> blockIndexByOffset;
+      std::map<std::string, SmallVector<unsigned, 0>> exactGroups;
+      for (auto [i, b] : llvm::enumerate(blocks)) {
+        blockIndexByOffset[b.begin] = i;
+        exactGroups[makeRISCVBlockBytesKey(sec->content(), b.begin, b.end)]
+            .push_back(i);
+      }
+
+      std::map<std::string, SmallVector<unsigned, 0>> normalizedGroups;
+      for (auto [i, b] : llvm::enumerate(blocks)) {
+        bool supported = false;
+        std::string key =
+            makeRISCVBlockNormalizedKey(b, *sec, rels, blockIndexByOffset,
+                                        supported);
+        if (supported)
+          normalizedGroups[key].push_back(i);
+      }
+
+      auto summarizeGroups = [&](const auto &groups, uint32_t &groupCount,
+                                 uint32_t &blockCount, uint64_t &bytes) {
+        for (const auto &it : groups) {
+          if (it.second.size() < 2)
+            continue;
+          uint64_t minSize =
+              blocks[it.second[0]].end - blocks[it.second[0]].begin;
+          for (unsigned idx : it.second)
+            minSize = std::min(minSize, blocks[idx].end - blocks[idx].begin);
+          ++groupCount;
+          blockCount += it.second.size();
+          bytes += minSize * (it.second.size() - 1);
+        }
+      };
+
+      uint32_t exactGroupCount = 0, exactBlockCount = 0;
+      uint32_t normalizedGroupCount = 0, normalizedBlockCount = 0;
+      uint64_t exactBytes = 0, normalizedBytes = 0;
+      summarizeGroups(exactGroups, exactGroupCount, exactBlockCount, exactBytes);
+      summarizeGroups(normalizedGroups, normalizedGroupCount,
+                      normalizedBlockCount, normalizedBytes);
+
+      std::map<std::string, SmallVector<unsigned, 0>> tailGroups;
+      for (auto [i, b] : llvm::enumerate(blocks)) {
+        uint64_t size = b.end - b.begin;
+        for (uint64_t tail = 4; tail <= size; tail += 2)
+          tailGroups[makeRISCVBlockBytesKey(sec->content(), b.end - tail, b.end)]
+              .push_back(i);
+      }
+      struct TailGroup {
+        SmallVector<unsigned, 0> blocks;
+        uint64_t bytes = 0;
+      };
+      struct TailCandidate {
+        SmallVector<unsigned, 0> blocks;
+        uint64_t bytes = 0;
+      };
+      SmallVector<TailCandidate, 0> tailCandidates;
+      for (const auto &it : tailGroups) {
+        SmallVector<unsigned, 0> uniqueBlocks;
+        for (unsigned idx : it.second)
+          if (!llvm::is_contained(uniqueBlocks, idx))
+            uniqueBlocks.push_back(idx);
+        if (uniqueBlocks.size() < 2)
+          continue;
+        TailCandidate candidate;
+        candidate.blocks = std::move(uniqueBlocks);
+        candidate.bytes = it.first.size() / 2;
+        tailCandidates.push_back(std::move(candidate));
+      }
+      llvm::sort(tailCandidates, [](const TailCandidate &a,
+                                    const TailCandidate &b) {
+        return a.bytes > b.bytes;
+      });
+      SmallVector<TailGroup, 0> selectedTailGroups;
+      std::set<std::set<unsigned>> seenTailBlockSets;
+      DenseSet<unsigned> usedTailBlocks;
+      uint32_t tailGroupCount = 0;
+      uint64_t tailBytes = 0;
+      for (TailCandidate &candidate : tailCandidates) {
+        std::set<unsigned> blockSet(candidate.blocks.begin(),
+                                    candidate.blocks.end());
+        if (!seenTailBlockSets.insert(blockSet).second)
+          continue;
+        if (llvm::any_of(candidate.blocks, [&](unsigned idx) {
+              return usedTailBlocks.contains(idx);
+            }))
+          continue;
+        TailGroup group;
+        group.blocks = std::move(candidate.blocks);
+        group.bytes = candidate.bytes;
+        for (unsigned idx : group.blocks)
+          usedTailBlocks.insert(idx);
+        selectedTailGroups.push_back(std::move(group));
+        ++tailGroupCount;
+        tailBytes += candidate.bytes * (blockSet.size() - 1);
+      }
+
+      message(Twine("riscv_block_audit function=") + d->getName() +
+              " section=" + sec->name + " function_size=" + Twine(d->size) +
+              " basic_blocks=" + Twine(blocks.size()) +
+              " exact_duplicate_groups=" + Twine(exactGroupCount) +
+              " exact_duplicate_blocks=" + Twine(exactBlockCount) +
+              " exact_duplicate_bytes=" + Twine(exactBytes) +
+              " normalized_duplicate_groups=" + Twine(normalizedGroupCount) +
+              " normalized_duplicate_blocks=" + Twine(normalizedBlockCount) +
+              " normalized_duplicate_bytes=" + Twine(normalizedBytes) +
+              " common_tail_groups=" + Twine(tailGroupCount) +
+              " common_tail_bytes=" + Twine(tailBytes) +
+              " unsupported_control_flow=" + Twine(unsupportedControlFlow));
+
+      auto printGroup = [&](StringRef kind, const auto &groups) {
+        for (const auto &it : groups) {
+          if (it.second.size() < 2)
+            continue;
+          SmallVector<std::string, 0> offs;
+          SmallVector<std::string, 0> sizes;
+          uint64_t minSize =
+              blocks[it.second[0]].end - blocks[it.second[0]].begin;
+          for (unsigned idx : it.second) {
+            offs.push_back(riscvBlockHex(blocks[idx].begin));
+            uint64_t size = blocks[idx].end - blocks[idx].begin;
+            sizes.push_back(Twine(size).str());
+            minSize = std::min(minSize, size);
+          }
+          message(Twine("riscv_duplicate_block_group function=") +
+                  d->getName() + " kind=" + kind +
+                  " block_offsets=" + llvm::join(offs, ",") +
+                  " block_sizes=" + llvm::join(sizes, ",") +
+                  " estimated_savable_bytes=" +
+                  Twine(minSize * (it.second.size() - 1)));
+        }
+      };
+      printGroup("exact", exactGroups);
+      printGroup("normalized", normalizedGroups);
+
+      for (const TailGroup &group : selectedTailGroups) {
+        SmallVector<std::string, 0> offs;
+        for (unsigned idx : group.blocks)
+          offs.push_back(riscvBlockHex(blocks[idx].begin));
+        message(Twine("riscv_common_tail_group function=") + d->getName() +
+                " block_offsets=" + llvm::join(offs, ",") +
+                " tail_bytes=" + Twine(group.bytes) +
+                " estimated_savable_bytes=" +
+                Twine(group.bytes * (group.blocks.size() - 1)));
+      }
+    }
+  }
+}
+
 } // namespace
 
 // Do actual linking. Note that when this function is called,
@@ -4629,6 +5114,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);
   printRISCVFunctionSplitGCStats();
+  invokeELFT(printRISCVBlockAudit,);
   demoteSharedAndLazySymbols();
 
   // Make copies of any input sections that need to be copied into each
