@@ -4642,12 +4642,12 @@ static SmallVector<RISCVBasicBlockAudit, 0> buildRISCVBasicBlocksForAudit(
 }
 
 static bool isRISCVBlockAuditPCRelativeInsn(const RISCVBlockAuditInsn &insn) {
-  if (insn.controlFlow)
-    return true;
   if (insn.size == 4) {
     uint32_t opcode = insn.raw & 0x7f;
-    return opcode == 0x17; // AUIPC.
+    return opcode == 0x17 || opcode == 0x6f || opcode == 0x63;
   }
+  if (insn.directJump || insn.directBranch)
+    return true;
   return false;
 }
 
@@ -4691,10 +4691,50 @@ static bool hasRISCVBlockIncomingToTailInterior(
   return false;
 }
 
-static uint64_t getRISCVTailMergeJumpSize(uint64_t source, uint64_t target) {
+template <class ELFT, class RelTy>
+static bool hasRISCVBlockGlobalIncomingRelocToTailInteriorRel(
+    InputSectionBase &targetSec, uint64_t tailBegin, uint64_t tailEnd,
+    InputSectionBase &from, const RelTy &rel) {
+  Symbol &sym = from.getFile<ELFT>()->getRelocTargetSym(rel);
+  Defined *d = dyn_cast<Defined>(&sym);
+  if (!d)
+    return false;
+  auto *sec = dyn_cast_or_null<InputSectionBase>(d->section);
+  if (sec != &targetSec)
+    return false;
+  uint64_t target = 0;
+  if (!checkedAddend(d->value, getRISCVBlockAuditAddend(rel), target))
+    return true;
+  return target > tailBegin && target < tailEnd;
+}
+
+template <class ELFT>
+static bool hasRISCVBlockGlobalIncomingRelocToTailInterior(
+    InputSectionBase &targetSec, uint64_t tailBegin, uint64_t tailEnd) {
+  for (ELFFileBase *file : ctx.objectFiles) {
+    for (InputSectionBase *s : file->getSections()) {
+      InputSectionBase *from = s;
+      if (!from || !from->isLive() || !from->file)
+        continue;
+      RelsOrRelas<ELFT> rels = from->template relsOrRelas<ELFT>();
+      for (const auto &rel : rels.rels)
+        if (hasRISCVBlockGlobalIncomingRelocToTailInteriorRel<ELFT>(
+                targetSec, tailBegin, tailEnd, *from, rel))
+          return true;
+      for (const auto &rel : rels.relas)
+        if (hasRISCVBlockGlobalIncomingRelocToTailInteriorRel<ELFT>(
+                targetSec, tailBegin, tailEnd, *from, rel))
+          return true;
+    }
+  }
+  return false;
+}
+
+static uint64_t getRISCVTailMergeJumpSize(uint64_t source, uint64_t target,
+                                          bool rvc) {
   int64_t delta = static_cast<int64_t>(target) - static_cast<int64_t>(source);
   // C.J has an 11-bit signed immediate scaled by 2.
-  if (delta >= -2048 && delta <= 2046 && (delta % 2) == 0)
+  if (rvc && delta >= -2048 && delta <= 2046 && (delta % 2) == 0)
     return 2;
   // JAL has a 21-bit signed immediate scaled by 2.
   if (delta >= -(int64_t(1) << 20) && delta <= ((int64_t(1) << 20) - 2) &&
@@ -4703,13 +4743,15 @@ static uint64_t getRISCVTailMergeJumpSize(uint64_t source, uint64_t target) {
   return 0;
 }
 
+template <class ELFT>
 static RISCVTailMergeCandidateAudit auditRISCVTailMergeCandidate(
     ELFFileBase &file, InputSectionBase &sec,
     ArrayRef<RISCVBasicBlockAudit> blocks,
     const SmallVector<unsigned, 0> &blockIndexes, uint64_t tailBytes,
     const DenseMap<uint64_t, SmallVector<RISCVBlockAuditReloc, 0>> &cfRelocs,
     const DenseMap<uint64_t, SmallVector<RISCVBlockAuditAnyReloc, 0>>
-        &allRelocs) {
+        &allRelocs,
+    bool rvc) {
   RISCVTailMergeCandidateAudit c;
   c.blocks = blockIndexes;
   c.tailBytes = tailBytes;
@@ -4742,7 +4784,8 @@ static RISCVTailMergeCandidateAudit auditRISCVTailMergeCandidate(
         continue;
       if (!insn.supported) {
         c.instructionSafe = false;
-        c.fallbackReason = "unsupported-instruction";
+        c.fallbackReason = insn.controlFlow ? "unsupported-indirect-control-flow"
+                                            : "unsupported-instruction";
         return c;
       }
       if (isRISCVBlockAuditPCRelativeInsn(insn)) {
@@ -4761,6 +4804,12 @@ static RISCVTailMergeCandidateAudit auditRISCVTailMergeCandidate(
       c.fallbackReason = "incoming-tail-interior";
       return c;
     }
+    if (hasRISCVBlockGlobalIncomingRelocToTailInterior<ELFT>(sec, tailStart,
+                                                             b.end)) {
+      c.incomingEdgeSafe = false;
+      c.fallbackReason = "external-relocation-to-tail-interior";
+      return c;
+    }
     if (hasRISCVBlockSymbolInInterior(file, sec, tailStart, b.end)) {
       c.symbolSafe = false;
       c.fallbackReason = "symbol-in-tail";
@@ -4772,7 +4821,8 @@ static RISCVTailMergeCandidateAudit auditRISCVTailMergeCandidate(
   for (size_t i = 1; i < blockIndexes.size(); ++i) {
     unsigned idx = blockIndexes[i];
     uint64_t donorTailStart = blocks[idx].end - tailBytes;
-    uint64_t size = getRISCVTailMergeJumpSize(donorTailStart, canonicalTailStart);
+    uint64_t size =
+        getRISCVTailMergeJumpSize(donorTailStart, canonicalTailStart, rvc);
     if (size == 0) {
       c.rangeSafe = false;
       c.fallbackReason = "jump-out-of-range";
@@ -4901,9 +4951,13 @@ template <class ELFT> static void printRISCVBlockAudit() {
                                     candidate.blocks.end());
         if (!seenTailBlockSets.insert(blockSet).second)
           continue;
-        RISCVTailMergeCandidateAudit audit = auditRISCVTailMergeCandidate(
-            *file, *sec, blocks, candidate.blocks, candidate.bytes, rels,
-            allRelocs);
+        const bool rvc =
+            sec->getFile<ELFT>()->getObj().getHeader().e_flags & EF_RISCV_RVC;
+        RISCVTailMergeCandidateAudit audit =
+            auditRISCVTailMergeCandidate<ELFT>(*file, *sec, blocks,
+                                               candidate.blocks,
+                                               candidate.bytes, rels,
+                                               allRelocs, rvc);
         allTailMergeCandidates.push_back(std::move(audit));
       }
       llvm::sort(allTailMergeCandidates,
@@ -4987,14 +5041,13 @@ template <class ELFT> static void printRISCVBlockAudit() {
                 Twine(group.bytes * (group.blocks.size() - 1)));
       }
 
-      uint32_t safeTailGroups = 0, unsafeTailGroups = 0;
+      uint32_t safeCandidateGroups = 0, unsafeTailGroups = 0;
       uint64_t safeGross = 0, safeJumpCost = 0, safeNet = 0;
       uint64_t largestSafeTail = 0;
       uint32_t cJumps = 0, jalJumps = 0;
       std::map<std::string, uint32_t> reasonCounts;
       for (const RISCVTailMergeCandidateAudit &candidate :
            selectedTailMergeCandidates) {
-        ++safeTailGroups;
         safeGross += candidate.grossSaving;
         safeJumpCost += candidate.jumpCost;
         safeNet += candidate.netSaving;
@@ -5009,7 +5062,9 @@ template <class ELFT> static void printRISCVBlockAudit() {
         SmallVector<std::string, 0> offs;
         for (unsigned idx : candidate.blocks)
           offs.push_back(riscvBlockHex(blocks[idx].end - candidate.tailBytes));
-        if (!candidate.safe) {
+        if (candidate.safe) {
+          ++safeCandidateGroups;
+        } else {
           ++unsafeTailGroups;
           ++reasonCounts[candidate.fallbackReason];
         }
@@ -5041,7 +5096,11 @@ template <class ELFT> static void printRISCVBlockAudit() {
           reasons.empty() ? std::string("none") : llvm::join(reasons, ",");
       message(Twine("riscv_tail_merge_audit function=") + d->getName() +
               " candidate_groups=" + Twine(tailMergeCandidates.size()) +
-              " safe_groups=" + Twine(safeTailGroups) +
+              " safe_candidate_groups=" + Twine(safeCandidateGroups) +
+              " selected_safe_groups=" +
+              Twine(selectedTailMergeCandidates.size()) +
+              " overlap_skipped_safe_groups=" +
+              Twine(safeCandidateGroups - selectedTailMergeCandidates.size()) +
               " unsafe_groups=" + Twine(unsafeTailGroups) +
               " gross_saving_bytes=" + Twine(safeGross) +
               " jump_cost_bytes=" + Twine(safeJumpCost) +
