@@ -5991,6 +5991,7 @@ static bool proveRISCVLibcLoopCarriedCalleeSavedConst(
   proof = (Twine("LOOP_CARRIED_CALLEE_SAVED_CONST_") +
            riscvLibcSRegName(candidate.savedReg))
               .str();
+  reason = "accepted";
   diag.reason = "accepted";
   return true;
 }
