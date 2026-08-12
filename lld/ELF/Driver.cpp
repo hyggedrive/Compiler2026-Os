@@ -4794,6 +4794,42 @@ static std::string riscvLibcXRegName(int reg) {
   return (Twine("x") + Twine(reg)).str();
 }
 
+static StringRef riscvLibcSRegName(int reg) {
+  switch (reg) {
+  case 8:
+    return "S0";
+  case 9:
+    return "S1";
+  case 18:
+    return "S2";
+  case 19:
+    return "S3";
+  case 20:
+    return "S4";
+  case 21:
+    return "S5";
+  case 22:
+    return "S6";
+  case 23:
+    return "S7";
+  case 24:
+    return "S8";
+  case 25:
+    return "S9";
+  case 26:
+    return "S10";
+  case 27:
+    return "S11";
+  default:
+    break;
+  }
+  return "UNKNOWN";
+}
+
+static bool isRISCVIntegerCalleeSavedReg(int reg) {
+  return reg == 8 || reg == 9 || (reg >= 18 && reg <= 27);
+}
+
 static StringRef riscvLibcInsnKind(const RISCVLibcInsn &insn) {
   if (!insn.supported)
     return "UNKNOWN";
@@ -4929,6 +4965,140 @@ static void dumpRISCVLibcFailedCallsiteContext(const RISCVLibcPrintfCall &call) 
 }
 
 template <class ELFT>
+static bool proveRISCVLibcEntryCalleeSavedFormat(
+    InputSectionBase &sec, uint64_t funcStart, uint64_t callOff, int argReg,
+    ArrayRef<RISCVLibcInsn> insns,
+    DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets,
+    RISCVLibcCandidateFormat &format, std::string &proof,
+    std::string &reason) {
+  if (argReg < 0)
+    return false;
+
+  const RISCVLibcInsn *copyInsn = nullptr;
+  for (size_t i = insns.size(); i > 0; --i) {
+    const RISCVLibcInsn &insn = insns[i - 1];
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (riscvLibcInsnWritesReg(insn, argReg)) {
+      copyInsn = &insn;
+      break;
+    }
+  }
+  if (!copyInsn || !copyInsn->copy ||
+      !isRISCVIntegerCalleeSavedReg(copyInsn->copySrc))
+    return false;
+
+  for (const RISCVLibcInsn &insn : insns) {
+    if (insn.offset <= copyInsn->offset)
+      continue;
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (insn.controlFlow) {
+      reason = insn.call ? "intermediate-call" : "control-flow-boundary";
+      return false;
+    }
+    if (riscvLibcInsnWritesReg(insn, argReg)) {
+      reason = "format-register-clobbered";
+      return false;
+    }
+  }
+
+  SmallVector<RISCVLibcInsn, 0> allInsns;
+  ArrayRef<uint8_t> data = sec.content();
+  for (uint64_t off = funcStart; off < callOff;) {
+    RISCVLibcInsn insn;
+    if (!readRISCVLibcInsn(data, off, insn) || off + insn.size > callOff) {
+      reason = "decode-failed";
+      return false;
+    }
+    allInsns.push_back(insn);
+    off += insn.size;
+  }
+
+  size_t prefixEnd = allInsns.size();
+  for (auto [i, insn] : llvm::enumerate(allInsns)) {
+    if (insn.controlFlow) {
+      prefixEnd = i;
+      break;
+    }
+  }
+
+  const RISCVLibcInsn *loInsn = nullptr;
+  const RISCVLibcInsn *hiInsn = nullptr;
+  for (size_t i = 0; i < prefixEnd; ++i) {
+    const RISCVLibcInsn &insn = allInsns[i];
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (!riscvLibcInsnWritesReg(insn, copyInsn->copySrc))
+      continue;
+    auto loRel = relocTargets.find(insn.offset);
+    if (!insn.addi || loRel == relocTargets.end() || !loRel->second.lo)
+      continue;
+    for (size_t h = i; h > 0; --h) {
+      const RISCVLibcInsn &prev = allInsns[h - 1];
+      if (!prev.supported) {
+        reason = "unsupported-instruction";
+        return false;
+      }
+      if (!riscvLibcInsnWritesReg(prev, insn.rs1))
+        continue;
+      auto hiRel = relocTargets.find(prev.offset);
+      if (hiRel == relocTargets.end() ||
+          hiRel->second.sym != loRel->second.sym ||
+          hiRel->second.addend != loRel->second.addend)
+        break;
+      if (prev.lui && hiRel->second.absHi) {
+        loInsn = &insn;
+        hiInsn = &prev;
+      }
+      break;
+    }
+    if (loInsn)
+      break;
+  }
+  if (!loInsn || !hiInsn) {
+    reason = "entry-callee-saved-init-not-found";
+    return false;
+  }
+
+  auto loRel = relocTargets.find(loInsn->offset);
+  if (loRel == relocTargets.end() ||
+      !targetRISCVLibcCString(*loRel->second.sym, loRel->second.addend, format)) {
+    reason = "entry-callee-saved-target-not-string";
+    return false;
+  }
+
+  bool afterInit = false;
+  for (const RISCVLibcInsn &insn : allInsns) {
+    if (insn.offset == loInsn->offset) {
+      afterInit = true;
+      continue;
+    }
+    if (!afterInit || insn.offset >= copyInsn->offset)
+      continue;
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (riscvLibcInsnWritesReg(insn, copyInsn->copySrc)) {
+      reason = "callee-saved-format-reg-clobbered";
+      return false;
+    }
+  }
+
+  proof = (Twine("ENTRY_CONST_CALLEE_SAVED_COPY_") +
+           riscvLibcSRegName(copyInsn->copySrc))
+              .str();
+  return true;
+}
+
+template <class ELFT>
 static bool proveRISCVLibcCallsiteFormat(InputSectionBase &sec,
                                          uint64_t funcStart, uint64_t callOff,
                                          int argReg,
@@ -4968,6 +5138,11 @@ static bool proveRISCVLibcCallsiteFormat(InputSectionBase &sec,
     reason = "empty-call-window";
     return false;
   }
+
+  if (proveRISCVLibcEntryCalleeSavedFormat<ELFT>(
+          sec, funcStart, callOff, argReg, insns, relocTargets, format, proof,
+          reason))
+    return true;
 
   for (size_t i = insns.size(); i > 0; --i) {
     const RISCVLibcInsn &def = insns[i - 1];
@@ -5313,6 +5488,7 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t userPrintfCalls = 0, provenUserFormats = 0, candidateUserFormats = 0,
            unknownUserFormats = 0, internalForwarderCalls = 0;
   uint32_t provenFloatFormats = 0, provenLongDoubleFormats = 0;
+  uint32_t provenEntryCalleeSavedFormats = 0;
   bool candidateFloatFormatSeen = false, candidateLongDoubleFormatSeen = false;
   for (RISCVLibcPrintfCall &call : printfCalls) {
     printfCallers.insert(call.caller);
@@ -5328,6 +5504,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
         ++provenFloatFormats;
       if (call.provenFormat.hasLongDouble)
         ++provenLongDoubleFormats;
+      if (StringRef(call.proof).startswith("ENTRY_CONST_CALLEE_SAVED_COPY"))
+        ++provenEntryCalleeSavedFormats;
     } else if (call.formatClass == RISCVLibcFormatClass::CandidateConstant) {
       ++candidateFormats;
       ++candidateUserFormats;
@@ -5462,6 +5640,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(provenFloatFormats));
   message(Twine("  proven_long_double_format_calls=") +
           Twine(provenLongDoubleFormats));
+  message(Twine("  proven_entry_callee_saved_formats=") +
+          Twine(provenEntryCalleeSavedFormats));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
   message(Twine("  candidate_float_format_seen=") +
