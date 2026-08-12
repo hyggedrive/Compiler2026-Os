@@ -1370,6 +1370,10 @@ static void readConfigs(opt::InputArgList &args) {
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
+  config->printRISCVRefinedFunctionGCAudit =
+      args.hasArg(OPT_print_riscv_refined_function_gc_audit);
+  config->riscvRefinedFunctionGCAuditGroup =
+      args.getLastArgValue(OPT_riscv_refined_function_gc_audit_group);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
   config->printSymbolOrder =
       args.getLastArgValue(OPT_print_symbol_order);
@@ -4281,6 +4285,836 @@ static void printRISCVFunctionSplitGCStats() {
             Twine(d.deadChildren) + " live bytes " + Twine(d.liveBytes) +
             " dead bytes " + Twine(d.deadBytes));
 }
+
+enum class RISCVRefinedFunctionGCRefKind {
+  DirectCall,
+  AddressReference,
+  Unknown,
+};
+
+static StringRef refinedFunctionGCRefKindToString(
+    RISCVRefinedFunctionGCRefKind kind) {
+  switch (kind) {
+  case RISCVRefinedFunctionGCRefKind::DirectCall:
+    return "direct-call";
+  case RISCVRefinedFunctionGCRefKind::AddressReference:
+    return "address-reference";
+  case RISCVRefinedFunctionGCRefKind::Unknown:
+    return "unknown-reference";
+  }
+  llvm_unreachable("invalid RISC-V refined function GC reference kind");
+}
+
+struct RISCVRefinedFunctionGCTarget {
+  StringRef group;
+  StringRef pattern;
+};
+
+static ArrayRef<RISCVRefinedFunctionGCTarget>
+getRISCVRefinedFunctionGCTargets() {
+  // Extracted from
+  // D:\T202510295205602-63\bolt\lib\Passes\RISCV\RISCVElimUnusedFuncs.cpp.
+  // The BOLT pass uses BinaryFunction name substring matching before clearing
+  // all basic blocks. These patterns are only audit metadata here.
+  static const RISCVRefinedFunctionGCTarget targets[] = {
+      {"huffbench", "__extenddftf2"},
+      {"huffbench", "__fe_getround"},
+      {"huffbench", "__fini_array_end"},
+      {"huffbench", "__fini_array_start"},
+      {"huffbench", "__fixtfsi"},
+      {"huffbench", "__fixunstfsi"},
+      {"huffbench", "__floatsitf"},
+      {"huffbench", "__floatunsitf"},
+      {"huffbench", "__fpclassifyl"},
+      {"huffbench", "__init_array_end"},
+      {"huffbench", "__init_array_start"},
+      {"huffbench", "__init_libc"},
+      {"huffbench", "__init_tls"},
+      {"huffbench", "__init_tp"},
+      {"huffbench", "__lockfile"},
+      {"huffbench", "__signbitl"},
+      {"huffbench", "__strerror_l"},
+      {"huffbench", "__unlockfile"},
+      {"huffbench", "appendrs"},
+      {"huffbench", "applymask"},
+      {"huffbench", "benchmark"},
+      {"huffbench", "calloc_beebs"},
+      {"huffbench", "check_heap_beebs"},
+      {"huffbench", "close_file"},
+      {"huffbench", "free_beebs"},
+      {"huffbench", "freeecc"},
+      {"huffbench", "freeframe"},
+      {"huffbench", "frexpl"},
+      {"huffbench", "initecc"},
+      {"huffbench", "initeccsize"},
+      {"huffbench", "initframe"},
+      {"huffbench", "initialise_benchmark"},
+      {"huffbench", "malloc_beebs"},
+      {"huffbench", "memcmp"},
+      {"huffbench", "memcpy"},
+      {"huffbench", "memmove"},
+      {"huffbench", "putalign"},
+      {"huffbench", "qrencode"},
+      {"huffbench", "static_init_tls"},
+      {"huffbench", "strcmp"},
+      {"huffbench", "strerror"},
+      {"huffbench", "strlen"},
+      {"huffbench", "verify_benchmark"},
+      {"huffbench", "warm_caches"},
+      {"huffbench", "wcrtomb"},
+      {"huffbench", "wctomb"},
+      {"sglib-combined", "__extenddftf2"},
+      {"sglib-combined", "__fe_getround"},
+      {"sglib-combined", "__fini_array_end"},
+      {"sglib-combined", "__fini_array_start"},
+      {"sglib-combined", "__fixtfsi"},
+      {"sglib-combined", "__fixunstfsi"},
+      {"sglib-combined", "__floatsitf"},
+      {"sglib-combined", "__floatunsitf"},
+      {"sglib-combined", "__fpclassifyl"},
+      {"sglib-combined", "__init_array_end"},
+      {"sglib-combined", "__init_array_start"},
+      {"sglib-combined", "__init_libc"},
+      {"sglib-combined", "__init_tls"},
+      {"sglib-combined", "__init_tp"},
+      {"sglib-combined", "__lockfile"},
+      {"sglib-combined", "__signbitl"},
+      {"sglib-combined", "__strerror_l"},
+      {"sglib-combined", "__unlockfile"},
+      {"sglib-combined", "appendrs"},
+      {"sglib-combined", "applymask"},
+      {"sglib-combined", "calloc_beebs"},
+      {"sglib-combined", "check_heap_beebs"},
+      {"sglib-combined", "close_file"},
+      {"sglib-combined", "free_beebs"},
+      {"sglib-combined", "freeecc"},
+      {"sglib-combined", "freeframe"},
+      {"sglib-combined", "frexpl"},
+      {"sglib-combined", "initecc"},
+      {"sglib-combined", "initeccsize"},
+      {"sglib-combined", "initframe"},
+      {"sglib-combined", "memcmp"},
+      {"sglib-combined", "memcpy"},
+      {"sglib-combined", "memmove"},
+      {"sglib-combined", "putalign"},
+      {"sglib-combined", "qrencode"},
+      {"sglib-combined", "static_init_tls"},
+      {"sglib-combined", "strcmp"},
+      {"sglib-combined", "strerror"},
+      {"sglib-combined", "strlen"},
+      {"sglib-combined", "verify_benchmark"},
+      {"sglib-combined", "warm_caches"},
+      {"sglib-combined", "wcrtomb"},
+      {"sglib-combined", "wctomb"},
+      {"encrypted:Q1K4ohS", "___errno_location"},
+      {"encrypted:Q1K4ohS", "__addtf3"},
+      {"encrypted:Q1K4ohS", "__cmptf2"},
+      {"encrypted:Q1K4ohS", "__divtf3"},
+      {"encrypted:Q1K4ohS", "__eqtf2"},
+      {"encrypted:Q1K4ohS", "__errno_location"},
+      {"encrypted:Q1K4ohS", "__extenddftf2"},
+      {"encrypted:Q1K4ohS", "__fe_getround"},
+      {"encrypted:Q1K4ohS", "__fe_raise_inexact"},
+      {"encrypted:Q1K4ohS", "__fini_array_end"},
+      {"encrypted:Q1K4ohS", "__fini_array_start"},
+      {"encrypted:Q1K4ohS", "__fixtfsi"},
+      {"encrypted:Q1K4ohS", "__fixunstfsi"},
+      {"encrypted:Q1K4ohS", "__floatsitf"},
+      {"encrypted:Q1K4ohS", "__floatunsitf"},
+      {"encrypted:Q1K4ohS", "__fpclassifyl"},
+      {"encrypted:Q1K4ohS", "__getf2"},
+      {"encrypted:Q1K4ohS", "__gttf2"},
+      {"encrypted:Q1K4ohS", "__init_array_end"},
+      {"encrypted:Q1K4ohS", "__init_array_start"},
+      {"encrypted:Q1K4ohS", "__init_libc"},
+      {"encrypted:Q1K4ohS", "__init_ssp"},
+      {"encrypted:Q1K4ohS", "__init_tls"},
+      {"encrypted:Q1K4ohS", "__init_tp"},
+      {"encrypted:Q1K4ohS", "__letf2"},
+      {"encrypted:Q1K4ohS", "__libc_start_main"},
+      {"encrypted:Q1K4ohS", "__lock"},
+      {"encrypted:Q1K4ohS", "__lockfile"},
+      {"encrypted:Q1K4ohS", "__lseek"},
+      {"encrypted:Q1K4ohS", "__lttf2"},
+      {"encrypted:Q1K4ohS", "__multf3"},
+      {"encrypted:Q1K4ohS", "__netf2"},
+      {"encrypted:Q1K4ohS", "__signbitl"},
+      {"encrypted:Q1K4ohS", "__stack_chk_fail"},
+      {"encrypted:Q1K4ohS", "__stack_chk_fail_local"},
+      {"encrypted:Q1K4ohS", "__stdio_close"},
+      {"encrypted:Q1K4ohS", "__stdio_exit"},
+      {"encrypted:Q1K4ohS", "__stdio_exit_needed"},
+      {"encrypted:Q1K4ohS", "__stdio_seek"},
+      {"encrypted:Q1K4ohS", "__stdout_write"},
+      {"encrypted:Q1K4ohS", "__strerror_l"},
+      {"encrypted:Q1K4ohS", "__subtf3"},
+      {"encrypted:Q1K4ohS", "__udivdi3"},
+      {"encrypted:Q1K4ohS", "__unlockfile"},
+      {"encrypted:Q1K4ohS", "__unordtf2"},
+      {"encrypted:Q1K4ohS", "close_file"},
+      {"encrypted:Q1K4ohS", "frexpl"},
+      {"encrypted:Q1K4ohS", "memchr"},
+      {"encrypted:Q1K4ohS", "memset"},
+      {"encrypted:Q1K4ohS", "static_init_tls"},
+      {"encrypted:Q1K4ohS", "strcmp"},
+      {"encrypted:Q1K4ohS", "strerror"},
+      {"encrypted:Q1K4ohS", "strnlen"},
+      {"encrypted:Q1K4ohS", "wcrtomb"},
+      {"encrypted:Q1K4ohS", "wctomb"},
+      {"encrypted:Q1L5ql[", "___errno_location"},
+      {"encrypted:Q1L5ql[", "__addtf3"},
+      {"encrypted:Q1L5ql[", "__cmptf2"},
+      {"encrypted:Q1L5ql[", "__divtf3"},
+      {"encrypted:Q1L5ql[", "__eqtf2"},
+      {"encrypted:Q1L5ql[", "__errno_location"},
+      {"encrypted:Q1L5ql[", "__extenddftf2"},
+      {"encrypted:Q1L5ql[", "__fe_getround"},
+      {"encrypted:Q1L5ql[", "__fe_raise_inexact"},
+      {"encrypted:Q1L5ql[", "__fini_array_end"},
+      {"encrypted:Q1L5ql[", "__fini_array_start"},
+      {"encrypted:Q1L5ql[", "__fixtfsi"},
+      {"encrypted:Q1L5ql[", "__fixunstfsi"},
+      {"encrypted:Q1L5ql[", "__floatsitf"},
+      {"encrypted:Q1L5ql[", "__floatunsitf"},
+      {"encrypted:Q1L5ql[", "__fpclassifyl"},
+      {"encrypted:Q1L5ql[", "__getf2"},
+      {"encrypted:Q1L5ql[", "__gttf2"},
+      {"encrypted:Q1L5ql[", "__init_array_end"},
+      {"encrypted:Q1L5ql[", "__init_array_start"},
+      {"encrypted:Q1L5ql[", "__init_libc"},
+      {"encrypted:Q1L5ql[", "__init_ssp"},
+      {"encrypted:Q1L5ql[", "__init_tls"},
+      {"encrypted:Q1L5ql[", "__init_tp"},
+      {"encrypted:Q1L5ql[", "__letf2"},
+      {"encrypted:Q1L5ql[", "__libc_start_main"},
+      {"encrypted:Q1L5ql[", "__lock"},
+      {"encrypted:Q1L5ql[", "__lockfile"},
+      {"encrypted:Q1L5ql[", "__lseek"},
+      {"encrypted:Q1L5ql[", "__lttf2"},
+      {"encrypted:Q1L5ql[", "__multf3"},
+      {"encrypted:Q1L5ql[", "__netf2"},
+      {"encrypted:Q1L5ql[", "__set_thread_area"},
+      {"encrypted:Q1L5ql[", "__signbitl"},
+      {"encrypted:Q1L5ql[", "__stack_chk_fail"},
+      {"encrypted:Q1L5ql[", "__stack_chk_fail_local"},
+      {"encrypted:Q1L5ql[", "__stdio_close"},
+      {"encrypted:Q1L5ql[", "__stdio_exit"},
+      {"encrypted:Q1L5ql[", "__stdio_seek"},
+      {"encrypted:Q1L5ql[", "__stdout_write"},
+      {"encrypted:Q1L5ql[", "__strerror_l"},
+      {"encrypted:Q1L5ql[", "__subtf3"},
+      {"encrypted:Q1L5ql[", "__udivdi3"},
+      {"encrypted:Q1L5ql[", "__unlockfile"},
+      {"encrypted:Q1L5ql[", "close_file"},
+      {"encrypted:Q1L5ql[", "exitfrexpl"},
+      {"encrypted:Q1L5ql[", "frexpl"},
+      {"encrypted:Q1L5ql[", "locking_putc"},
+      {"encrypted:Q1L5ql[", "memset"},
+      {"encrypted:Q1L5ql[", "static_init_tls"},
+      {"encrypted:Q1L5ql[", "strcmp"},
+      {"encrypted:Q1L5ql[", "strerror"},
+      {"encrypted:Q1L5ql[", "wcrtomb"},
+      {"encrypted:Q1L5ql[", "wctomb"},
+      {"encrypted:`EB6Cn~", "__copy_tls"},
+      {"encrypted:`EB6Cn~", "__extenddftf2"},
+      {"encrypted:`EB6Cn~", "__fe_getround"},
+      {"encrypted:`EB6Cn~", "__fini_array_end"},
+      {"encrypted:`EB6Cn~", "__fini_array_start"},
+      {"encrypted:`EB6Cn~", "__fixtfsi"},
+      {"encrypted:`EB6Cn~", "__fixunstfsi"},
+      {"encrypted:`EB6Cn~", "__floatsitf"},
+      {"encrypted:`EB6Cn~", "__floatunsitf"},
+      {"encrypted:`EB6Cn~", "__fpclassifyl"},
+      {"encrypted:`EB6Cn~", "__funcs_on_exit"},
+      {"encrypted:`EB6Cn~", "__init_array_end"},
+      {"encrypted:`EB6Cn~", "__init_array_start"},
+      {"encrypted:`EB6Cn~", "__init_libc"},
+      {"encrypted:`EB6Cn~", "__init_ssp"},
+      {"encrypted:`EB6Cn~", "__init_tls"},
+      {"encrypted:`EB6Cn~", "__init_tp"},
+      {"encrypted:`EB6Cn~", "__libc_start_main"},
+      {"encrypted:`EB6Cn~", "__lockfile"},
+      {"encrypted:`EB6Cn~", "__set_thread_area"},
+      {"encrypted:`EB6Cn~", "__signbitl"},
+      {"encrypted:`EB6Cn~", "__strerror_l"},
+      {"encrypted:`EB6Cn~", "__unlockfile"},
+      {"encrypted:`EB6Cn~", "appendrs"},
+      {"encrypted:`EB6Cn~", "applymask"},
+      {"encrypted:`EB6Cn~", "badruns"},
+      {"encrypted:`EB6Cn~", "benchmark"},
+      {"encrypted:`EB6Cn~", "calloc_beebs"},
+      {"encrypted:`EB6Cn~", "check_heap_beebs"},
+      {"encrypted:`EB6Cn~", "close_file"},
+      {"encrypted:`EB6Cn~", "benchmark_bodydummy"},
+      {"encrypted:`EB6Cn~", "dummy1"},
+      {"encrypted:`EB6Cn~", "exit"},
+      {"encrypted:`EB6Cn~", "free_beebs"},
+      {"encrypted:`EB6Cn~", "freeecc"},
+      {"encrypted:`EB6Cn~", "freeframe"},
+      {"encrypted:`EB6Cn~", "frexpl"},
+      {"encrypted:`EB6Cn~", "initecc"},
+      {"encrypted:`EB6Cn~", "initeccsize"},
+      {"encrypted:`EB6Cn~", "initframe"},
+      {"encrypted:`EB6Cn~", "initialise_benchmark"},
+      {"encrypted:`EB6Cn~", "initialise_board"},
+      {"encrypted:`EB6Cn~", "malloc_beebs"},
+      {"encrypted:`EB6Cn~", "memcmp"},
+      {"encrypted:`EB6Cn~", "memcpy"},
+      {"encrypted:`EB6Cn~", "memmove"},
+      {"encrypted:`EB6Cn~", "memset"},
+      {"encrypted:`EB6Cn~", "putalign"},
+      {"encrypted:`EB6Cn~", "qrencode"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930886"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930887"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930888"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930889"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930890"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930891"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930892"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930893"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930894"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930895"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930896"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930897"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930898"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930899"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930900"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930901"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930902"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930903"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930904"},
+      {"encrypted:`EB6Cn~", "qrencodepublicfunc_846930905"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930886"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930887"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930888"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930889"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930890"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930891"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930892"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930893"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930894"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930895"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930896"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930897"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930898"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930899"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930900"},
+      {"encrypted:`EB6Cn~", "qrframepublicfunc_846930901"},
+      {"encrypted:`EB6Cn~", "start_trigger"},
+      {"encrypted:`EB6Cn~", "static_init_tls"},
+      {"encrypted:`EB6Cn~", "stop_trigger"},
+      {"encrypted:`EB6Cn~", "strcmp"},
+      {"encrypted:`EB6Cn~", "strerror"},
+      {"encrypted:`EB6Cn~", "strlen"},
+      {"encrypted:`EB6Cn~", "verify_benchmark"},
+      {"encrypted:`EB6Cn~", "warm_caches"},
+      {"encrypted:`EB6Cn~", "wcrtomb"},
+      {"encrypted:`EB6Cn~", "wctomb"},
+      {"encrypted:aB@JY<=", "__addtf3"},
+      {"encrypted:aB@JY<=", "__cmptf2"},
+      {"encrypted:aB@JY<=", "__divtf3"},
+      {"encrypted:aB@JY<=", "__eqtf2"},
+      {"encrypted:aB@JY<=", "__errno_location"},
+      {"encrypted:aB@JY<=", "__extenddftf2"},
+      {"encrypted:aB@JY<=", "__fe_getround"},
+      {"encrypted:aB@JY<=", "__fe_raise_inexact___errno_location"},
+      {"encrypted:aB@JY<=", "__fini_array_end"},
+      {"encrypted:aB@JY<=", "__fini_array_start"},
+      {"encrypted:aB@JY<=", "__fixtfsi"},
+      {"encrypted:aB@JY<=", "__fixunstfsi"},
+      {"encrypted:aB@JY<=", "__floatsitf"},
+      {"encrypted:aB@JY<=", "__floatunsitf"},
+      {"encrypted:aB@JY<=", "__fpclassifyl"},
+      {"encrypted:aB@JY<=", "__getf2"},
+      {"encrypted:aB@JY<=", "__gttf2"},
+      {"encrypted:aB@JY<=", "__init_array_end"},
+      {"encrypted:aB@JY<=", "__init_array_start"},
+      {"encrypted:aB@JY<=", "__init_libc"},
+      {"encrypted:aB@JY<=", "__init_ssp"},
+      {"encrypted:aB@JY<=", "__init_tls"},
+      {"encrypted:aB@JY<=", "__init_tp"},
+      {"encrypted:aB@JY<=", "__letf2"},
+      {"encrypted:aB@JY<=", "__lock"},
+      {"encrypted:aB@JY<=", "__lockfile"},
+      {"encrypted:aB@JY<=", "__lseek"},
+      {"encrypted:aB@JY<=", "__lttf2"},
+      {"encrypted:aB@JY<=", "__moddi3"},
+      {"encrypted:aB@JY<=", "__multf3"},
+      {"encrypted:aB@JY<=", "__netf2"},
+      {"encrypted:aB@JY<=", "__set_thread_area"},
+      {"encrypted:aB@JY<=", "__signbitl"},
+      {"encrypted:aB@JY<=", "__stack_chk_fail"},
+      {"encrypted:aB@JY<=", "__stack_chk_fail_local"},
+      {"encrypted:aB@JY<=", "__stdio_close"},
+      {"encrypted:aB@JY<=", "__stdio_exit"},
+      {"encrypted:aB@JY<=", "__stdio_exit_needed"},
+      {"encrypted:aB@JY<=", "__stdio_seek"},
+      {"encrypted:aB@JY<=", "__stdout_write"},
+      {"encrypted:aB@JY<=", "__strerror_l"},
+      {"encrypted:aB@JY<=", "__subtf3"},
+      {"encrypted:aB@JY<=", "__udivmoddi4"},
+      {"encrypted:aB@JY<=", "__unlockfile"},
+      {"encrypted:aB@JY<=", "__unordtf2"},
+      {"encrypted:aB@JY<=", "close_file"},
+      {"encrypted:aB@JY<=", "frexpl"},
+      {"encrypted:aB@JY<=", "memchr"},
+      {"encrypted:aB@JY<=", "memset"},
+      {"encrypted:aB@JY<=", "platform_main_begin"},
+      {"encrypted:aB@JY<=", "strcmp"},
+      {"encrypted:aB@JY<=", "strerror"},
+      {"encrypted:aB@JY<=", "strnlen"},
+      {"encrypted:aB@JY<=", "wcrtomb"},
+      {"encrypted:aB@JY<=", "wctomb"},
+      {"default", "___errno_location"},
+      {"default", "__addtf3"},
+      {"default", "__cmptf2"},
+      {"default", "__divtf3"},
+      {"default", "__eqtf2"},
+      {"default", "__errno_location"},
+      {"default", "__extenddftf2"},
+      {"default", "__fe_getround"},
+      {"default", "__fe_raise_inexact"},
+      {"default", "__fini_array_end"},
+      {"default", "__fini_array_start"},
+      {"default", "__fixtfsi"},
+      {"default", "__fixunstfsi"},
+      {"default", "__floatsitf"},
+      {"default", "__floatunsitf"},
+      {"default", "__fpclassifyl"},
+      {"default", "__getf2"},
+      {"default", "__gttf2"},
+      {"default", "__init_array_end"},
+      {"default", "__init_array_start"},
+      {"default", "__init_libc"},
+      {"default", "__init_ssp"},
+      {"default", "__init_tls"},
+      {"default", "__init_tp"},
+      {"default", "__letf2"},
+      {"default", "__lock"},
+      {"default", "__lockfile"},
+      {"default", "__lseek"},
+      {"default", "__lttf2"},
+      {"default", "__multf3"},
+      {"default", "__netf2"},
+      {"default", "__signbitl"},
+      {"default", "__stack_chk_fail"},
+      {"default", "__stack_chk_fail_local"},
+      {"default", "__stdio_close"},
+      {"default", "__stdio_seek"},
+      {"default", "__strerror_l"},
+      {"default", "__subtf3"},
+      {"default", "__unlockfile"},
+      {"default", "close_file"},
+      {"default", "frexpl"},
+      {"default", "strcmp"},
+      {"default", "strerror"},
+      {"default", "wcrtomb"},
+      {"default", "wctomb"},
+  };
+  return targets;
+}
+
+struct RISCVRefinedFunctionGCReference {
+  std::string sourceFunction;
+  std::string sourceSection;
+  bool sourceLive = false;
+  RelType relocType = static_cast<RelType>(0);
+  RISCVRefinedFunctionGCRefKind kind =
+      RISCVRefinedFunctionGCRefKind::Unknown;
+};
+
+struct RISCVRefinedFunctionGCResult {
+  Defined *sym = nullptr;
+  std::string file;
+  std::string section;
+  std::string function;
+  SmallVector<StringRef, 0> matchedGroups;
+  SmallVector<StringRef, 0> matchedPatterns;
+  uint64_t size = 0;
+  bool gcLive = false;
+  bool rootLike = false;
+  bool possibleRootOrSpecial = false;
+  uint32_t incomingTotal = 0;
+  uint32_t incomingFromLiveText = 0;
+  uint32_t incomingFromDeadText = 0;
+  uint32_t incomingFromLiveData = 0;
+  uint32_t incomingFromDeadData = 0;
+  uint32_t directCallReferences = 0;
+  uint32_t addressReferences = 0;
+  uint32_t unknownReferences = 0;
+  bool hasLiveDirectCall = false;
+  bool hasLiveAddressReference = false;
+  bool hasUnknownReference = false;
+  SmallVector<RISCVRefinedFunctionGCReference, 0> references;
+};
+
+static RISCVRefinedFunctionGCRefKind
+classifyRISCVRefinedFunctionGCReloc(RelType type) {
+  switch (type) {
+  case R_RISCV_CALL:
+  case R_RISCV_CALL_PLT:
+  case R_RISCV_JAL:
+  case R_RISCV_RVC_JUMP:
+    return RISCVRefinedFunctionGCRefKind::DirectCall;
+  case R_RISCV_32:
+  case R_RISCV_64:
+  case R_RISCV_HI20:
+  case R_RISCV_LO12_I:
+  case R_RISCV_LO12_S:
+  case R_RISCV_PCREL_HI20:
+  case R_RISCV_PCREL_LO12_I:
+  case R_RISCV_PCREL_LO12_S:
+  case R_RISCV_GOT_HI20:
+  case R_RISCV_PLT32:
+  case R_RISCV_32_PCREL:
+    return RISCVRefinedFunctionGCRefKind::AddressReference;
+  default:
+    return RISCVRefinedFunctionGCRefKind::Unknown;
+  }
+}
+
+static bool isRISCVRefinedFunctionGCRootLike(Defined &d) {
+  if (d.includeInDynsym())
+    return true;
+  if (auto *sec = dyn_cast_or_null<InputSectionBase>(d.section)) {
+    if (sec->flags & SHF_GNU_RETAIN)
+      return true;
+    if (script->shouldKeep(sec))
+      return true;
+  }
+  StringRef name = d.getName();
+  if (name == config->entry || name == config->init || name == config->fini)
+    return true;
+  if (llvm::is_contained(config->undefined, name))
+    return true;
+  if (llvm::is_contained(script->referencedSymbols, name))
+    return true;
+  for (auto &it : symtab.cmseSymMap) {
+    const ArmCmseEntryFunction &cmse = it.second;
+    if (cmse.sym == &d || cmse.acleSeSym == &d)
+      return true;
+  }
+  return false;
+}
+
+static Defined *findRISCVRefinedFunctionGCSourceFunction(
+    InputSectionBase &source, uint64_t offset) {
+  if (!(source.flags & SHF_EXECINSTR))
+    return nullptr;
+  return source.getEnclosingFunction(offset);
+}
+
+template <class ELFT, class RelTy>
+static void scanRISCVRefinedFunctionGCRelocs(
+    InputSectionBase &source, ArrayRef<RelTy> rels,
+    DenseMap<Defined *, SmallVector<RISCVRefinedFunctionGCResult *, 0>>
+        &targetMap) {
+  for (const RelTy &rel : rels) {
+    Symbol &target = source.getFile<ELFT>()->getRelocTargetSym(rel);
+    auto *d = dyn_cast<Defined>(&target);
+    if (!d)
+      continue;
+    auto it = targetMap.find(d);
+    if (it == targetMap.end())
+      continue;
+
+    RelType type = rel.getType(config->isMips64EL);
+    RISCVRefinedFunctionGCRefKind kind =
+        classifyRISCVRefinedFunctionGCReloc(type);
+    bool sourceLive = source.isLive();
+    std::string sourceFunction = "<none>";
+    if (Defined *sf =
+            findRISCVRefinedFunctionGCSourceFunction(source, rel.r_offset))
+      sourceFunction = sf->getName().str();
+    std::string sourceSection = source.name.str();
+    for (RISCVRefinedFunctionGCResult *result : it->second) {
+      ++result->incomingTotal;
+      if (source.flags & SHF_EXECINSTR) {
+        if (sourceLive)
+          ++result->incomingFromLiveText;
+        else
+          ++result->incomingFromDeadText;
+      } else if (source.flags & SHF_ALLOC) {
+        if (sourceLive)
+          ++result->incomingFromLiveData;
+        else
+          ++result->incomingFromDeadData;
+      } else {
+        result->hasUnknownReference = true;
+      }
+      switch (kind) {
+      case RISCVRefinedFunctionGCRefKind::DirectCall:
+        ++result->directCallReferences;
+        if (sourceLive && (source.flags & SHF_EXECINSTR))
+          result->hasLiveDirectCall = true;
+        break;
+      case RISCVRefinedFunctionGCRefKind::AddressReference:
+        ++result->addressReferences;
+        if (sourceLive)
+          result->hasLiveAddressReference = true;
+        break;
+      case RISCVRefinedFunctionGCRefKind::Unknown:
+        ++result->unknownReferences;
+        result->hasUnknownReference = true;
+        break;
+      }
+
+      result->references.push_back({sourceFunction, sourceSection, sourceLive,
+                                    type, kind});
+    }
+  }
+}
+
+static bool hasRISCVRefinedFunctionGCResult(
+    ArrayRef<RISCVRefinedFunctionGCResult> results, Defined *sym) {
+  for (const RISCVRefinedFunctionGCResult &result : results)
+    if (result.sym == sym)
+      return true;
+  return false;
+}
+
+static RISCVRefinedFunctionGCResult *findRISCVRefinedFunctionGCResult(
+    MutableArrayRef<RISCVRefinedFunctionGCResult> results, Defined *sym) {
+  for (RISCVRefinedFunctionGCResult &result : results)
+    if (result.sym == sym)
+      return &result;
+  return nullptr;
+}
+
+static std::string joinRISCVRefinedFunctionGCStrings(ArrayRef<StringRef> ss) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  for (size_t i = 0; i != ss.size(); ++i) {
+    if (i)
+      os << ",";
+    os << ss[i];
+  }
+  return os.str();
+}
+
+template <class ELFT> static void printRISCVRefinedFunctionGCAudit() {
+  if (!config->printRISCVRefinedFunctionGCAudit ||
+      config->emachine != EM_RISCV || config->relocatable)
+    return;
+
+  ArrayRef<RISCVRefinedFunctionGCTarget> targets =
+      getRISCVRefinedFunctionGCTargets();
+  if (targets.empty()) {
+    message("RISCV refined function GC audit: no audit targets; "
+            "bolt/lib/Passes/RISCV/RISCVElimUnusedFuncs.cpp is absent in this "
+            "checkout");
+    return;
+  }
+
+  SmallVector<RISCVRefinedFunctionGCTarget, 0> activeTargets;
+  for (const RISCVRefinedFunctionGCTarget &target : targets)
+    if (config->riscvRefinedFunctionGCAuditGroup.empty() ||
+        target.group == config->riscvRefinedFunctionGCAuditGroup)
+      activeTargets.push_back(target);
+
+  SmallVector<StringRef, 0> groups;
+  SmallVector<StringRef, 0> uniquePatterns;
+  for (const RISCVRefinedFunctionGCTarget &target : activeTargets) {
+    if (!llvm::is_contained(groups, target.group))
+      groups.push_back(target.group);
+    if (!llvm::is_contained(uniquePatterns, target.pattern))
+      uniquePatterns.push_back(target.pattern);
+  }
+
+  SmallVector<RISCVRefinedFunctionGCResult, 0> results;
+  for (const RISCVRefinedFunctionGCTarget &target : activeTargets) {
+    for (ELFFileBase *base : ctx.objectFiles) {
+      auto *file = dyn_cast<ObjFile<ELFT>>(base);
+      if (!file)
+        continue;
+      for (Symbol *sym : file->getSymbols()) {
+        auto *d = dyn_cast_or_null<Defined>(sym);
+        if (!d || d->type != STT_FUNC || !d->getName().contains(target.pattern))
+          continue;
+        if (!hasRISCVRefinedFunctionGCResult(results, d)) {
+          auto *sec = dyn_cast_or_null<InputSectionBase>(d->section);
+          RISCVRefinedFunctionGCResult result;
+          result.sym = d;
+          result.file = toString(d->file);
+          result.section = sec ? sec->name.str() : "<none>";
+          result.function = d->getName().str();
+          result.size = d->size;
+          result.gcLive = sec && sec->isLive();
+          result.rootLike = isRISCVRefinedFunctionGCRootLike(*d);
+          results.push_back(std::move(result));
+        }
+        RISCVRefinedFunctionGCResult *result =
+            findRISCVRefinedFunctionGCResult(results, d);
+        if (!llvm::is_contained(result->matchedGroups, target.group))
+          result->matchedGroups.push_back(target.group);
+        if (!llvm::is_contained(result->matchedPatterns, target.pattern))
+          result->matchedPatterns.push_back(target.pattern);
+      }
+    }
+  }
+
+  message("RISCV refined function GC target inventory:");
+  message(Twine("  total_target_entries=") + Twine(activeTargets.size()));
+  message(Twine("  unique_function_names=") + Twine(uniquePatterns.size()));
+  message(Twine("  unique_function_patterns=") + Twine(uniquePatterns.size()));
+  message(Twine("  matched_unique_functions=") + Twine(results.size()));
+  message(Twine("  groups=") + Twine(groups.size()));
+  if (!config->riscvRefinedFunctionGCAuditGroup.empty())
+    message(Twine("  group_filter=") +
+            config->riscvRefinedFunctionGCAuditGroup);
+  for (StringRef group : groups) {
+    uint32_t groupTargets = 0, groupMatched = 0, groupLocalMatched = 0;
+    for (const RISCVRefinedFunctionGCTarget &target : activeTargets)
+      if (target.group == group)
+        ++groupTargets;
+    for (const RISCVRefinedFunctionGCResult &result : results) {
+      if (!llvm::is_contained(result.matchedGroups, group))
+        continue;
+      ++groupMatched;
+      if (result.sym->isLocal())
+        ++groupLocalMatched;
+    }
+    message(Twine("  group=") + group + " targets=" + Twine(groupTargets) +
+            " matched=" + Twine(groupMatched) +
+            " local_matched=" + Twine(groupLocalMatched));
+  }
+
+  DenseMap<Defined *, SmallVector<RISCVRefinedFunctionGCResult *, 0>>
+      targetMap;
+  for (RISCVRefinedFunctionGCResult &result : results)
+    targetMap[result.sym].push_back(&result);
+
+  for (ELFFileBase *base : ctx.objectFiles) {
+    auto *file = dyn_cast<ObjFile<ELFT>>(base);
+    if (!file)
+      continue;
+    for (InputSectionBase *source : file->getSections()) {
+      if (!source || source == &InputSection::discarded)
+        continue;
+      RelsOrRelas<ELFT> rels = source->template relsOrRelas<ELFT>();
+      if (rels.areRelocsRel())
+        scanRISCVRefinedFunctionGCRelocs<ELFT>(*source, rels.rels, targetMap);
+      else
+        scanRISCVRefinedFunctionGCRelocs<ELFT>(*source, rels.relas, targetMap);
+    }
+  }
+
+  uint64_t targetBytes = 0, alreadyGCDeadBytes = 0, stillLiveBytes = 0;
+  uint64_t liveDirectCallBytes = 0, liveAddressReferenceBytes = 0;
+  uint64_t rootLikeBytes = 0, unknownReferenceBytes = 0;
+  uint64_t liveOnlyFromDeadSourcesBytes = 0;
+  uint32_t alreadyGCDeadFunctions = 0, stillLiveFunctions = 0;
+  uint32_t liveDirectCallFunctions = 0, liveAddressReferenceFunctions = 0;
+  uint32_t rootLikeFunctions = 0, unknownReferenceFunctions = 0;
+  uint32_t liveOnlyFromDeadSourcesFunctions = 0;
+
+  for (RISCVRefinedFunctionGCResult &r : results) {
+    r.possibleRootOrSpecial = r.gcLive && r.incomingTotal == 0 && !r.rootLike;
+    bool hasLiveIncoming = r.incomingFromLiveText || r.incomingFromLiveData;
+    bool liveOnlyFromDeadSources =
+        r.gcLive && !r.rootLike && !r.possibleRootOrSpecial &&
+        !hasLiveIncoming && !r.hasUnknownReference && r.incomingTotal != 0;
+
+    targetBytes += r.size;
+    if (!r.gcLive) {
+      ++alreadyGCDeadFunctions;
+      alreadyGCDeadBytes += r.size;
+    } else {
+      ++stillLiveFunctions;
+      stillLiveBytes += r.size;
+    }
+    if (r.hasLiveDirectCall) {
+      ++liveDirectCallFunctions;
+      liveDirectCallBytes += r.size;
+    }
+    if (r.hasLiveAddressReference) {
+      ++liveAddressReferenceFunctions;
+      liveAddressReferenceBytes += r.size;
+    }
+    if (r.rootLike || r.possibleRootOrSpecial) {
+      ++rootLikeFunctions;
+      rootLikeBytes += r.size;
+    }
+    if (r.hasUnknownReference) {
+      ++unknownReferenceFunctions;
+      unknownReferenceBytes += r.size;
+    }
+    if (liveOnlyFromDeadSources) {
+      ++liveOnlyFromDeadSourcesFunctions;
+      liveOnlyFromDeadSourcesBytes += r.size;
+    }
+
+    message("RISCV refined function GC audit:");
+    message(Twine("  matched_groups=") +
+            joinRISCVRefinedFunctionGCStrings(r.matchedGroups));
+    message(Twine("  matched_patterns=") +
+            joinRISCVRefinedFunctionGCStrings(r.matchedPatterns));
+    message(Twine("  file=") + r.file);
+    message(Twine("  section=") + r.section);
+    message(Twine("  function=") + r.function);
+    message(Twine("  size=") + Twine(r.size));
+    message(Twine("  gc_live=") + Twine(r.gcLive ? 1 : 0));
+    message(Twine("  root_like=") + Twine(r.rootLike ? 1 : 0));
+    message(Twine("  possible_root_or_special=") +
+            Twine(r.possibleRootOrSpecial ? 1 : 0));
+    message(Twine("  incoming_total=") + Twine(r.incomingTotal));
+    message(Twine("  incoming_from_live_text=") +
+            Twine(r.incomingFromLiveText));
+    message(Twine("  incoming_from_dead_text=") +
+            Twine(r.incomingFromDeadText));
+    message(Twine("  incoming_from_live_data=") +
+            Twine(r.incomingFromLiveData));
+    message(Twine("  incoming_from_dead_data=") +
+            Twine(r.incomingFromDeadData));
+    message(Twine("  direct_call_references=") +
+            Twine(r.directCallReferences));
+    message(Twine("  address_references=") + Twine(r.addressReferences));
+    message(Twine("  unknown_references=") + Twine(r.unknownReferences));
+    for (const RISCVRefinedFunctionGCReference &ref : r.references)
+      message(Twine("  source=") + ref.sourceFunction +
+              " source_section=" + ref.sourceSection +
+              " source_live=" + Twine(ref.sourceLive ? 1 : 0) +
+              " reloc=" + toString(ref.relocType) + " kind=" +
+              refinedFunctionGCRefKindToString(ref.kind));
+  }
+
+  message(Twine("RISCV refined function GC audit summary: target_functions=") +
+          Twine(results.size()));
+  message(Twine("RISCV refined function GC audit summary: target_bytes=") +
+          Twine(targetBytes));
+  message(Twine("RISCV refined function GC audit summary: matched_unique_functions=") +
+          Twine(results.size()));
+  message(Twine("RISCV refined function GC audit summary: matched_unique_function_bytes=") +
+          Twine(targetBytes));
+  message(Twine("RISCV refined function GC audit summary: already_gc_dead_functions=") +
+          Twine(alreadyGCDeadFunctions));
+  message(Twine("RISCV refined function GC audit summary: already_gc_dead_bytes=") +
+          Twine(alreadyGCDeadBytes));
+  message(Twine("RISCV refined function GC audit summary: still_live_functions=") +
+          Twine(stillLiveFunctions));
+  message(Twine("RISCV refined function GC audit summary: still_live_bytes=") +
+          Twine(stillLiveBytes));
+  message(Twine("RISCV refined function GC audit summary: live_direct_call_target_functions=") +
+          Twine(liveDirectCallFunctions));
+  message(Twine("RISCV refined function GC audit summary: live_direct_call_target_bytes=") +
+          Twine(liveDirectCallBytes));
+  message(Twine("RISCV refined function GC audit summary: live_address_reference_target_functions=") +
+          Twine(liveAddressReferenceFunctions));
+  message(Twine("RISCV refined function GC audit summary: live_address_reference_target_bytes=") +
+          Twine(liveAddressReferenceBytes));
+  message(Twine("RISCV refined function GC audit summary: root_like_functions=") +
+          Twine(rootLikeFunctions));
+  message(Twine("RISCV refined function GC audit summary: root_like_bytes=") +
+          Twine(rootLikeBytes));
+  message(Twine("RISCV refined function GC audit summary: unknown_reference_functions=") +
+          Twine(unknownReferenceFunctions));
+  message(Twine("RISCV refined function GC audit summary: unknown_reference_bytes=") +
+          Twine(unknownReferenceBytes));
+  message(Twine("RISCV refined function GC audit summary: live_only_from_dead_sources_functions=") +
+          Twine(liveOnlyFromDeadSourcesFunctions));
+  message(Twine("RISCV refined function GC audit summary: live_only_from_dead_sources_bytes=") +
+          Twine(liveOnlyFromDeadSourcesBytes));
+}
 } // namespace
 
 // Do actual linking. Note that when this function is called,
@@ -4629,6 +5463,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);
   printRISCVFunctionSplitGCStats();
+  invokeELFT(printRISCVRefinedFunctionGCAudit,);
   demoteSharedAndLazySymbols();
 
   // Make copies of any input sections that need to be copied into each

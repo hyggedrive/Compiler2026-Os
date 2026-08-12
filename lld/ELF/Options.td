@@ -379,6 +379,16 @@ def print_riscv_function_sections_split: FF<"print-riscv-function-sections-split
   HelpText<"Print RISC-V function section split audit statistics">,
   Flags<[HelpHidden]>;
 
+def print_riscv_refined_function_gc_audit:
+  FF<"print-riscv-refined-function-gc-audit">,
+  HelpText<"Print RISC-V refined function GC audit statistics">,
+  Flags<[HelpHidden]>;
+
+def riscv_refined_function_gc_audit_group:
+  JJ<"riscv-refined-function-gc-audit-group=">,
+  HelpText<"Filter RISC-V refined function GC audit to a BOLT target group">,
+  Flags<[HelpHidden]>;
+
 defm relax: BB<"relax",
   "Enable target-specific relaxations if supported (default)",
   "Disable target-specific relaxations">;
