@@ -1372,6 +1372,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
   config->printRISCVLibcSpecializationAudit =
       args.hasArg(OPT_print_riscv_libc_specialization_audit);
+  config->riscvLibcSpecializationAuditDumpFailedCalls = args::getInteger(
+      args, OPT_riscv_libc_specialization_audit_dump_failed_calls, 0);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
@@ -4772,6 +4774,160 @@ static std::string hexOffset(uint64_t off) {
   return (Twine("0x") + llvm::utohexstr(off)).str();
 }
 
+static StringRef riscvLibcRegName(int reg) {
+  switch (reg) {
+  case 10:
+    return "a0";
+  case 11:
+    return "a1";
+  case 12:
+    return "a2";
+  default:
+    break;
+  }
+  return "unknown";
+}
+
+static std::string riscvLibcXRegName(int reg) {
+  if (reg < 0)
+    return "none";
+  return (Twine("x") + Twine(reg)).str();
+}
+
+static StringRef riscvLibcInsnKind(const RISCVLibcInsn &insn) {
+  if (!insn.supported)
+    return "UNKNOWN";
+  if (insn.lui)
+    return "LUI";
+  if (insn.auipc)
+    return "AUIPC";
+  if (insn.copy)
+    return insn.size == 2 ? "C_MV" : "ADDI_COPY";
+  if (insn.addi)
+    return insn.size == 2 ? "C_ADDI" : "ADDI";
+  if (insn.controlFlow && insn.call)
+    return insn.size == 2 ? "C_JALR_OR_C_JAL" : "JAL_OR_JALR";
+  if (insn.controlFlow)
+    return insn.size == 2 ? "RVC_BRANCH_OR_JUMP" : "BRANCH_OR_JUMP";
+  return "OTHER";
+}
+
+template <class ELFT, class RelTy>
+static void dumpRISCVLibcRelocAt(InputSectionBase &sec, const RelTy &rel) {
+  Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+  Defined *d = dyn_cast<Defined>(&target);
+  std::string targetSection = "none";
+  if (d)
+    if (auto *targetSec = dyn_cast_or_null<InputSectionBase>(d->section))
+      targetSection = targetSec->name.str();
+
+  std::string msg =
+      (Twine("      reloc offset=") + hexOffset(rel.r_offset) +
+       " type=" + lld::toString(rel.getType(config->isMips64EL)) +
+       " target_symbol=" + target.getName() +
+       " addend=" + Twine(getRISCVLibcAddend(rel)) +
+       " target_section=" + targetSection)
+          .str();
+  if (d)
+    msg = (Twine(msg) + " symbol_value=" + hexOffset(d->value) +
+           " symbol_size=" + Twine(d->size))
+              .str();
+  message(msg);
+}
+
+template <class ELFT>
+static void dumpRISCVLibcRelocsAt(InputSectionBase &sec, uint64_t off) {
+  if (!sec.file)
+    return;
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  for (const auto &rel : rels.rels)
+    if (rel.r_offset == off)
+      dumpRISCVLibcRelocAt<ELFT>(sec, rel);
+  for (const auto &rel : rels.relas)
+    if (rel.r_offset == off)
+      dumpRISCVLibcRelocAt<ELFT>(sec, rel);
+}
+
+template <class ELFT>
+static void dumpRISCVLibcFailedCallsiteContext(const RISCVLibcPrintfCall &call) {
+  int formatReg = getRISCVPrintfFormatArgReg(call.target->getName());
+  message("    failed_callsite_context:");
+  message(Twine("      format_reg=") + riscvLibcRegName(formatReg) +
+          " reason=" + call.reason);
+
+  ArrayRef<uint8_t> data = call.sourceSection->content();
+  SmallVector<RISCVLibcInsn, 0> insns;
+  bool decodeOk = true;
+  for (uint64_t off = call.caller->value; off < call.callOffset;) {
+    RISCVLibcInsn insn;
+    if (!readRISCVLibcInsn(data, off, insn) ||
+        off + insn.size > call.callOffset) {
+      decodeOk = false;
+      break;
+    }
+    insns.push_back(insn);
+    if (insns.size() > 24)
+      insns.erase(insns.begin());
+    off += insn.size;
+  }
+  if (!decodeOk) {
+    message("      decode_failed=1");
+    return;
+  }
+
+  const RISCVLibcInsn *lastDef = nullptr;
+  const RISCVLibcInsn *intermediateCall = nullptr;
+  for (const RISCVLibcInsn &insn : insns) {
+    if (riscvLibcInsnWritesReg(insn, formatReg))
+      lastDef = &insn;
+    if (insn.controlFlow && insn.call)
+      intermediateCall = &insn;
+  }
+
+  if (lastDef) {
+    message(Twine("      proof_state format_reg=") +
+            riscvLibcRegName(formatReg) +
+            " last_def_offset=" + hexOffset(lastDef->offset) +
+            " last_def_rd=" + riscvLibcXRegName(lastDef->rd) +
+            " last_def_rs1=" + riscvLibcXRegName(lastDef->rs1) +
+            " last_def_rs2=" + riscvLibcXRegName(lastDef->rs2) +
+            " last_def_kind=" + riscvLibcInsnKind(*lastDef) +
+            " copySrc=" + riscvLibcXRegName(lastDef->copySrc));
+  } else {
+    message(Twine("      proof_state format_reg=") +
+            riscvLibcRegName(formatReg) + " last_def_offset=none");
+  }
+
+  if (call.reason == "intermediate-call" && intermediateCall) {
+    message(Twine("      intermediate_call_offset=") +
+            hexOffset(intermediateCall->offset));
+    dumpRISCVLibcRelocsAt<ELFT>(*call.sourceSection, intermediateCall->offset);
+  }
+
+  for (const RISCVLibcInsn &insn : insns) {
+    message(Twine("      insn offset=") + hexOffset(insn.offset) +
+            " size=" + Twine(insn.size) + " raw=" + hexOffset(insn.raw) +
+            " opcode=" +
+            hexOffset(insn.size == 4 ? (insn.raw & 0x7f) : (insn.raw & 0x3)) +
+            " rd=" + riscvLibcXRegName(insn.rd) +
+            " rs1=" + riscvLibcXRegName(insn.rs1) +
+            " rs2=" + riscvLibcXRegName(insn.rs2) +
+            " supported=" + Twine(insn.supported ? 1 : 0) +
+            " control_flow=" + Twine(insn.controlFlow ? 1 : 0) +
+            " call=" + Twine(insn.call ? 1 : 0) +
+            " writesRd=" + Twine(insn.writesRd ? 1 : 0) +
+            " writes_format_reg=" +
+            Twine(riscvLibcInsnWritesReg(insn, formatReg) ? 1 : 0) +
+            " reads_format_reg_rs1=" +
+            Twine(insn.rs1 == formatReg ? 1 : 0) +
+            " reads_format_reg_rs2=" +
+            Twine(insn.rs2 == formatReg ? 1 : 0) +
+            " kind=" + riscvLibcInsnKind(insn) +
+            " copySrc=" + riscvLibcXRegName(insn.copySrc));
+    dumpRISCVLibcRelocsAt<ELFT>(*call.sourceSection, insn.offset);
+  }
+}
+
 template <class ELFT>
 static bool proveRISCVLibcCallsiteFormat(InputSectionBase &sec,
                                          uint64_t funcStart, uint64_t callOff,
@@ -5192,6 +5348,9 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       userPrintfCalls > 0 && provenUserFormats == userPrintfCalls &&
       unknownUserFormats == 0 && provenFloatFormats == 0 &&
       provenLongDoubleFormats == 0;
+  uint32_t failedCallsiteDumpRequested =
+      config->riscvLibcSpecializationAuditDumpFailedCalls;
+  uint32_t failedCallsiteDumpEmitted = 0;
 
   message("RISCV libc specialization audit:");
   message(Twine("  printf_core_instances=") + Twine(printfCoreRoots.size()));
@@ -5248,6 +5407,10 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   }
 
   for (RISCVLibcPrintfCall &call : printfCalls) {
+    bool shouldDumpFailedContext =
+        call.formatClass != RISCVLibcFormatClass::ProvenConstant &&
+        call.formatClass != RISCVLibcFormatClass::InternalForwarder &&
+        failedCallsiteDumpEmitted < failedCallsiteDumpRequested;
     message(Twine("  printf_call caller=") + call.caller->getName() +
             " target=" + call.target->getName() +
             " source_section=" + call.sourceSection->name +
@@ -5269,6 +5432,10 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
         message(Twine("    reason=") + call.reason);
     } else if (!call.reason.empty()) {
       message(Twine("    reason=") + call.reason);
+    }
+    if (shouldDumpFailedContext) {
+      dumpRISCVLibcFailedCallsiteContext<ELFT>(call);
+      ++failedCallsiteDumpEmitted;
     }
   }
 
@@ -5301,6 +5468,10 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(candidateFloatFormatSeen ? 1 : 0));
   message(Twine("  candidate_long_double_format_seen=") +
           Twine(candidateLongDoubleFormatSeen ? 1 : 0));
+  message(Twine("  failed_callsite_dump_requested=") +
+          Twine(failedCallsiteDumpRequested));
+  message(Twine("  failed_callsite_dump_emitted=") +
+          Twine(failedCallsiteDumpEmitted));
 }
 } // namespace
 
