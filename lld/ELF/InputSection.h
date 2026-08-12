@@ -277,6 +277,14 @@ struct RISCVFunctionSplitRelocStorage {
   uint64_t originalEnd = 0;
 };
 
+struct RISCVRelocOverrideStorage {
+  bool relocsAreRela = false;
+  const void *relocs = nullptr;
+  uint32_t relocCount = 0;
+};
+
+extern llvm::DenseMap<const InputSectionBase *, RISCVRelocOverrideStorage>
+    riscvRelocOverrideStorage;
 extern llvm::DenseMap<const InputSectionBase *, RISCVFunctionSplitRelocStorage>
     riscvFunctionSplitRelocStorage;
 extern llvm::DenseMap<const InputSectionBase *,
