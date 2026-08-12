@@ -5504,6 +5504,104 @@ struct RISCVLibcRegDefDiag {
   std::string reason = "not-proven";
 };
 
+struct RISCVLibcStackSlotCFGAudit {
+  bool sameSlotClobber = false;
+  bool externalEntry = false;
+  bool spModified = false;
+  bool backedgeBypass = false;
+  bool unknownControlFlow = false;
+  bool safe = false;
+  std::string reason = "none";
+};
+
+static RISCVLibcStackSlotCFGAudit auditRISCVLibcStackSlotCFG(
+    InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
+    ArrayRef<RISCVLibcInsn> allInsns, size_t storeIndex, size_t loadIndex,
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &controlFlowRelocs,
+    int64_t stackOffset) {
+  RISCVLibcStackSlotCFGAudit audit;
+  if (storeIndex >= allInsns.size() || loadIndex >= allInsns.size() ||
+      storeIndex >= loadIndex) {
+    audit.unknownControlFlow = true;
+    audit.reason = "invalid-store-load-order";
+    return audit;
+  }
+
+  uint64_t storeOffset = allInsns[storeIndex].offset;
+  uint64_t loadOffset = allInsns[loadIndex].offset;
+  for (size_t i = storeIndex + 1; i < loadIndex; ++i) {
+    const RISCVLibcInsn &insn = allInsns[i];
+    if (!insn.supported) {
+      audit.unknownControlFlow = true;
+      audit.reason = "unsupported-instruction";
+      continue;
+    }
+    if (riscvLibcInsnWritesReg(insn, 2)) {
+      audit.spModified = true;
+      audit.reason = "sp-modified";
+    }
+    if (insn.stackOffset == stackOffset &&
+        (insn.stackMemKind == RISCVLibcStackMemKind::CSWSP ||
+         insn.stackMemKind == RISCVLibcStackMemKind::SW)) {
+      audit.sameSlotClobber = true;
+      audit.reason = "same-slot-clobber";
+    }
+    if (!insn.controlFlow)
+      continue;
+    if (isRISCVLibcNormalDirectCall(controlFlowRelocs, insn))
+      continue;
+    if (isRISCVLibcReturn(insn))
+      continue;
+    const RISCVLibcControlFlowRelocInfo *target =
+        getRISCVLibcDirectBranchTarget(controlFlowRelocs, insn);
+    if (!target || !target->hasTarget) {
+      audit.unknownControlFlow = true;
+      audit.reason = "unknown-control-flow";
+      continue;
+    }
+    if (target->targetSection != &sec)
+      continue;
+    if (target->targetOffset > storeOffset && target->targetOffset <= loadOffset &&
+        target->targetOffset <= insn.offset)
+      audit.backedgeBypass = true;
+  }
+
+  for (const auto &entry : controlFlowRelocs) {
+    uint64_t sourceOffset = entry.first;
+    for (const RISCVLibcControlFlowRelocInfo &r : entry.second) {
+      if (r.type != R_RISCV_BRANCH && r.type != R_RISCV_JAL &&
+          r.type != R_RISCV_RVC_BRANCH && r.type != R_RISCV_RVC_JUMP &&
+          r.type != R_RISCV_CALL && r.type != R_RISCV_CALL_PLT)
+        continue;
+      if (!r.hasTarget || r.targetSection != &sec)
+        continue;
+      if (r.targetOffset > storeOffset && r.targetOffset <= loadOffset &&
+          (sourceOffset <= storeOffset || sourceOffset > loadOffset)) {
+        audit.externalEntry = true;
+        if (sourceOffset > loadOffset)
+          audit.backedgeBypass = true;
+      }
+    }
+  }
+
+  if (audit.sameSlotClobber)
+    audit.reason = "same-slot-clobber";
+  else if (audit.externalEntry)
+    audit.reason = "external-entry";
+  else if (audit.spModified)
+    audit.reason = "sp-modified";
+  else if (audit.backedgeBypass)
+    audit.reason = "backedge-bypass";
+  else if (audit.unknownControlFlow)
+    audit.reason = "unknown-control-flow";
+  else {
+    audit.safe = true;
+    audit.reason = "none";
+  }
+  return audit;
+}
+
 template <class ELFT>
 static RISCVLibcRegDefDiag classifyRISCVLibcRegDef(
     InputSectionBase &sec, ArrayRef<RISCVLibcInsn> allInsns,
@@ -5612,6 +5710,9 @@ static RISCVLibcRegDefDiag classifyRISCVLibcRegDef(
 template <class ELFT>
 static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
                                         const RISCVLibcFunctionDecode &decoded,
+                                        const DenseMap<uint64_t,
+                                                       SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+                                            &controlFlowRelocs,
                                         uint32_t &recognizedLoads,
                                         DenseSet<int64_t> &uniqueOffsets,
                                         uint32_t &nearestStoreFound,
@@ -5619,7 +5720,14 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
                                         uint32_t &nearestStoreSrcCopy,
                                         uint32_t &nearestStoreCopyFromCalleeSaved,
                                         uint32_t &nearestStoreConstFormatProven,
-                                        uint32_t &nearestStoreNotProven) {
+                                        uint32_t &nearestStoreNotProven,
+                                        uint32_t &cfgCandidates,
+                                        uint32_t &storeDominatesLoad,
+                                        uint32_t &noSameSlotClobber,
+                                        uint32_t &spStable,
+                                        uint32_t &noExternalEntry,
+                                        uint32_t &noUnknownControlFlow,
+                                        uint32_t &cfgSafe) {
   int formatReg = getRISCVPrintfFormatArgReg(call.target->getName());
   SmallVector<RISCVLibcInsn, 0> allInsns;
   std::string reason;
@@ -5680,6 +5788,7 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
   }
 
   ++nearestStoreFound;
+  ++cfgCandidates;
   if (nearestStore->stackMemKind == RISCVLibcStackMemKind::CSWSP)
     ++nearestStoreIsCSWSP;
   RISCVLibcRegDefDiag defDiag =
@@ -5694,6 +5803,22 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
     ++nearestStoreConstFormatProven;
   else
     ++nearestStoreNotProven;
+  RISCVLibcStackSlotCFGAudit cfgAudit = auditRISCVLibcStackSlotCFG(
+      *call.sourceSection, decoded, allInsns, nearestStoreIndex, loadIndex,
+      controlFlowRelocs, load->stackOffset);
+  if (!cfgAudit.externalEntry && !cfgAudit.backedgeBypass &&
+      !cfgAudit.unknownControlFlow)
+    ++storeDominatesLoad;
+  if (!cfgAudit.sameSlotClobber)
+    ++noSameSlotClobber;
+  if (!cfgAudit.spModified)
+    ++spStable;
+  if (!cfgAudit.externalEntry)
+    ++noExternalEntry;
+  if (!cfgAudit.unknownControlFlow)
+    ++noUnknownControlFlow;
+  if (cfgAudit.safe)
+    ++cfgSafe;
 
   message(Twine("  printf_stack_slot_nearest_store caller=") +
           call.caller->getName() +
@@ -5716,6 +5841,19 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
           " constant_format_proven=" +
           Twine(defDiag.constantFormatProven ? 1 : 0) + " format=\"" +
           defDiag.format + "\" reason=" + defDiag.reason);
+  message(Twine("  printf_stack_slot_cfg_audit call_offset=") +
+          hexOffset(call.callOffset) +
+          " store_offset=" + hexOffset(nearestStore->offset) +
+          " load_offset=" + hexOffset(load->offset) +
+          " stack_offset=" + Twine(load->stackOffset) +
+          " same_slot_clobber=" + Twine(cfgAudit.sameSlotClobber ? 1 : 0) +
+          " external_entry=" + Twine(cfgAudit.externalEntry ? 1 : 0) +
+          " sp_modified=" + Twine(cfgAudit.spModified ? 1 : 0) +
+          " backedge_bypass=" + Twine(cfgAudit.backedgeBypass ? 1 : 0) +
+          " unknown_control_flow=" +
+          Twine(cfgAudit.unknownControlFlow ? 1 : 0) +
+          " cfg_safe=" + Twine(cfgAudit.safe ? 1 : 0) +
+          " reason=" + cfgAudit.reason);
   return true;
 }
 
@@ -7489,6 +7627,13 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t stackSlotNearestStoreCopyFromCalleeSaved = 0;
   uint32_t stackSlotNearestStoreConstFormatProven = 0;
   uint32_t stackSlotNearestStoreNotProven = 0;
+  uint32_t stackSlotCFGCandidates = 0;
+  uint32_t stackSlotStoreDominatesLoad = 0;
+  uint32_t stackSlotNoSameSlotClobber = 0;
+  uint32_t stackSlotSPStable = 0;
+  uint32_t stackSlotNoExternalEntry = 0;
+  uint32_t stackSlotNoUnknownControlFlow = 0;
+  uint32_t stackSlotCFGSafe = 0;
   DenseSet<int64_t> stackSlotUniqueOffsets;
   bool candidateFloatFormatSeen = false, candidateLongDoubleFormatSeen = false;
   for (RISCVLibcPrintfCall &call : printfCalls) {
@@ -7997,13 +8142,19 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       ++stackSlotFailedCalls;
       RISCVLibcFunctionDecode &decoded = getRISCVLibcFunctionDecodeCached(
           *call.sourceSection, *call.caller, decodeCache, perfStats);
+      DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+          &controlFlowRelocs = getRISCVLibcControlFlowRelocsCached<ELFT>(
+              *call.sourceSection, controlFlowRelocCache);
       dumpRISCVLibcStackSlotAudit<ELFT>(
-          call, decoded, stackSlotLoadsRecognized, stackSlotUniqueOffsets,
-          stackSlotNearestStoreFound, stackSlotNearestStoreIsCSWSP,
-          stackSlotNearestStoreSrcCopy,
+          call, decoded, controlFlowRelocs, stackSlotLoadsRecognized,
+          stackSlotUniqueOffsets, stackSlotNearestStoreFound,
+          stackSlotNearestStoreIsCSWSP, stackSlotNearestStoreSrcCopy,
           stackSlotNearestStoreCopyFromCalleeSaved,
           stackSlotNearestStoreConstFormatProven,
-          stackSlotNearestStoreNotProven);
+          stackSlotNearestStoreNotProven, stackSlotCFGCandidates,
+          stackSlotStoreDominatesLoad, stackSlotNoSameSlotClobber,
+          stackSlotSPStable, stackSlotNoExternalEntry,
+          stackSlotNoUnknownControlFlow, stackSlotCFGSafe);
     }
   }
 
@@ -8096,6 +8247,19 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(stackSlotNearestStoreConstFormatProven));
   message(Twine("  printf_stack_slot_nearest_store_not_proven=") +
           Twine(stackSlotNearestStoreNotProven));
+  message(Twine("  printf_stack_slot_cfg_candidates=") +
+          Twine(stackSlotCFGCandidates));
+  message(Twine("  printf_stack_slot_store_dominates_load=") +
+          Twine(stackSlotStoreDominatesLoad));
+  message(Twine("  printf_stack_slot_no_same_slot_clobber=") +
+          Twine(stackSlotNoSameSlotClobber));
+  message(Twine("  printf_stack_slot_sp_stable=") +
+          Twine(stackSlotSPStable));
+  message(Twine("  printf_stack_slot_no_external_entry=") +
+          Twine(stackSlotNoExternalEntry));
+  message(Twine("  printf_stack_slot_no_unknown_control_flow=") +
+          Twine(stackSlotNoUnknownControlFlow));
+  message(Twine("  printf_stack_slot_cfg_safe=") + Twine(stackSlotCFGSafe));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
   message(Twine("  printf_specialization_gate_ready=") +
