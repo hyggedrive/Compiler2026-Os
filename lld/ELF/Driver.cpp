@@ -73,6 +73,7 @@
 #include <bitset>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -4553,6 +4554,15 @@ struct RISCVLibcRelocTarget {
   bool lo = false;
 };
 
+struct RISCVLibcControlFlowRelocInfo {
+  RelType type = R_RISCV_NONE;
+  Symbol *sym = nullptr;
+  int64_t addend = 0;
+  InputSectionBase *targetSection = nullptr;
+  uint64_t targetOffset = 0;
+  bool hasTarget = false;
+};
+
 struct RISCVLibcInsn {
   uint64_t offset = 0;
   uint32_t raw = 0;
@@ -4924,6 +4934,165 @@ getRISCVLibcRelocTargetsCached(
   ++stats.relocCacheMisses;
   auto inserted = cache.insert({&sec, getRISCVLibcRelocTargets<ELFT>(sec)});
   return inserted.first->second;
+}
+
+template <class ELFT, class RelTy>
+static void recordRISCVLibcControlFlowReloc(
+    InputSectionBase &sec, const RelTy &rel,
+    DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &targets) {
+  RelType type = rel.getType(config->isMips64EL);
+  if (type != R_RISCV_BRANCH && type != R_RISCV_JAL &&
+      type != R_RISCV_RVC_BRANCH && type != R_RISCV_RVC_JUMP &&
+      type != R_RISCV_CALL && type != R_RISCV_CALL_PLT)
+    return;
+
+  RISCVLibcControlFlowRelocInfo info;
+  info.type = type;
+  info.addend = getRISCVLibcAddend(rel);
+  Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+  info.sym = &target;
+  if (Defined *d = dyn_cast<Defined>(&target)) {
+    info.targetSection = dyn_cast_or_null<InputSectionBase>(d->section);
+    if (info.targetSection)
+      info.hasTarget = checkedAddend(d->value, info.addend, info.targetOffset);
+  }
+  targets[rel.r_offset].push_back(info);
+}
+
+template <class ELFT>
+static DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+getRISCVLibcControlFlowRelocs(InputSectionBase &sec) {
+  DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>> targets;
+  if (!sec.file)
+    return targets;
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  for (const auto &rel : rels.rels)
+    recordRISCVLibcControlFlowReloc<ELFT>(sec, rel, targets);
+  for (const auto &rel : rels.relas)
+    recordRISCVLibcControlFlowReloc<ELFT>(sec, rel, targets);
+  return targets;
+}
+
+template <class ELFT>
+static DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>> &
+getRISCVLibcControlFlowRelocsCached(
+    InputSectionBase &sec,
+    std::map<InputSectionBase *,
+             DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>>
+        &cache) {
+  auto it = cache.find(&sec);
+  if (it != cache.end())
+    return it->second;
+  auto inserted =
+      cache.insert({&sec, getRISCVLibcControlFlowRelocs<ELFT>(sec)});
+  return inserted.first->second;
+}
+
+static bool hasRISCVLibcControlFlowRelocTypeAt(
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &relocs,
+    uint64_t off, ArrayRef<RelType> types) {
+  auto it = relocs.find(off);
+  if (it == relocs.end())
+    return false;
+  return llvm::any_of(it->second, [&](const RISCVLibcControlFlowRelocInfo &r) {
+    return llvm::is_contained(types, r.type);
+  });
+}
+
+static bool isRISCVLibcRelocTargetFunc(
+    const RISCVLibcControlFlowRelocInfo &reloc) {
+  if (Defined *d = dyn_cast_or_null<Defined>(reloc.sym))
+    return d->type == STT_FUNC;
+  return false;
+}
+
+static bool isRISCVLibcNormalDirectCall(
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &relocs,
+    const RISCVLibcInsn &insn) {
+  if (!insn.controlFlow || !insn.call)
+    return false;
+  if (insn.size == 4 && (insn.raw & 0x7f) == 0x67 && insn.offset >= 4)
+    return hasRISCVLibcControlFlowRelocTypeAt(
+        relocs, insn.offset - 4, {R_RISCV_CALL, R_RISCV_CALL_PLT});
+  auto it = relocs.find(insn.offset);
+  if (it == relocs.end())
+    return false;
+  bool isRV32CJal =
+      insn.size == 2 && (((static_cast<uint16_t>(insn.raw) >> 13) & 0x7) == 1);
+  for (const RISCVLibcControlFlowRelocInfo &r : it->second) {
+    if (r.type == R_RISCV_CALL || r.type == R_RISCV_CALL_PLT)
+      return true;
+    if (r.type == R_RISCV_JAL && isRISCVLibcRelocTargetFunc(r))
+      return true;
+    if (r.type == R_RISCV_RVC_JUMP && isRV32CJal &&
+        isRISCVLibcRelocTargetFunc(r))
+      return true;
+  }
+  return false;
+}
+
+static bool isRISCVLibcReturn(const RISCVLibcInsn &insn) {
+  if (!insn.controlFlow || insn.call)
+    return false;
+  if (insn.size == 4 && (insn.raw & 0x7f) == 0x67)
+    return insn.rd == 0 && insn.rs1 == 1 &&
+           SignExtend64<12>(insn.raw >> 20) == 0;
+  if (insn.size != 2)
+    return false;
+  uint16_t half = static_cast<uint16_t>(insn.raw);
+  uint16_t quadrant = half & 0x3;
+  uint16_t funct3 = (half >> 13) & 0x7;
+  bool bit12 = half & 0x1000;
+  int rd = (half >> 7) & 0x1f;
+  int rs2 = (half >> 2) & 0x1f;
+  return quadrant == 2 && funct3 == 4 && !bit12 && rd == 1 && rs2 == 0;
+}
+
+static const RISCVLibcControlFlowRelocInfo *
+getRISCVLibcDirectBranchTarget(
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &relocs,
+    const RISCVLibcInsn &insn) {
+  if (!insn.controlFlow || insn.call)
+    return nullptr;
+  auto it = relocs.find(insn.offset);
+  if (it == relocs.end())
+    return nullptr;
+  const RISCVLibcControlFlowRelocInfo *found = nullptr;
+  for (const RISCVLibcControlFlowRelocInfo &r : it->second) {
+    if (r.type != R_RISCV_BRANCH && r.type != R_RISCV_JAL &&
+        r.type != R_RISCV_RVC_BRANCH && r.type != R_RISCV_RVC_JUMP)
+      continue;
+    if (found)
+      return nullptr;
+    found = &r;
+  }
+  return found;
+}
+
+static bool hasRISCVLibcExternalEntryToProtectedInterval(
+    InputSectionBase &sec,
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &relocs,
+    uint64_t initStart, uint64_t copyOffset) {
+  for (const auto &entry : relocs) {
+    uint64_t sourceOffset = entry.first;
+    for (const RISCVLibcControlFlowRelocInfo &r : entry.second) {
+      if (r.type != R_RISCV_BRANCH && r.type != R_RISCV_JAL &&
+          r.type != R_RISCV_RVC_BRANCH && r.type != R_RISCV_RVC_JUMP &&
+          r.type != R_RISCV_CALL && r.type != R_RISCV_CALL_PLT)
+        continue;
+      if (!r.hasTarget || r.targetSection != &sec)
+        continue;
+      if (r.targetOffset > initStart && r.targetOffset <= copyOffset &&
+          (sourceOffset <= initStart || sourceOffset > copyOffset))
+        return true;
+    }
+  }
+  return false;
 }
 
 static std::string hexOffset(uint64_t off) {
@@ -5422,10 +5591,179 @@ static bool proveRISCVLibcDirectAbsFormatArg(
 }
 
 template <class ELFT>
+static bool proveRISCVLibcLocalDominatingCalleeSavedConst(
+    InputSectionBase &sec, int argReg, ArrayRef<RISCVLibcInsn> windowInsns,
+    const RISCVLibcFunctionDecode &decoded,
+    DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets,
+    DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &controlFlowRelocs,
+    RISCVLibcCandidateFormat &format, std::string &proof,
+    std::string &reason) {
+  const RISCVLibcInsn *copyInsn = nullptr;
+  for (size_t i = windowInsns.size(); i > 0; --i) {
+    const RISCVLibcInsn &insn = windowInsns[i - 1];
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (riscvLibcInsnWritesReg(insn, argReg)) {
+      copyInsn = &insn;
+      break;
+    }
+  }
+  if (!copyInsn || !copyInsn->copy ||
+      !isRISCVIntegerCalleeSavedReg(copyInsn->copySrc)) {
+    reason = "local-callee-saved-final-copy-not-found";
+    return false;
+  }
+
+  for (const RISCVLibcInsn &insn : windowInsns) {
+    if (insn.offset <= copyInsn->offset)
+      continue;
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (insn.controlFlow) {
+      reason = insn.call ? "intermediate-call" : "control-flow-boundary";
+      return false;
+    }
+    if (riscvLibcInsnWritesReg(insn, argReg)) {
+      reason = "format-register-clobbered";
+      return false;
+    }
+  }
+
+  const RISCVLibcInsn *loInsn = nullptr;
+  const RISCVLibcInsn *hiInsn = nullptr;
+  size_t loIndex = 0;
+  for (size_t i = decoded.instructions.size(); i > 0; --i) {
+    const RISCVLibcInsn &insn = decoded.instructions[i - 1];
+    if (insn.offset >= copyInsn->offset)
+      continue;
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (!riscvLibcInsnWritesReg(insn, copyInsn->copySrc))
+      continue;
+    loInsn = &insn;
+    loIndex = i - 1;
+    break;
+  }
+  if (!loInsn) {
+    reason = "local-callee-saved-init-not-found";
+    return false;
+  }
+
+  auto loRel = relocTargets.find(loInsn->offset);
+  if (!loInsn->addi || loInsn->rd != copyInsn->copySrc ||
+      loRel == relocTargets.end() || !loRel->second.absLoI) {
+    reason = "local-callee-saved-nearest-def-not-constant";
+    return false;
+  }
+  if (loIndex == 0) {
+    reason = "local-callee-saved-nearest-def-not-constant";
+    return false;
+  }
+  hiInsn = &decoded.instructions[loIndex - 1];
+  auto hiRel = relocTargets.find(hiInsn->offset);
+  if (hiInsn->offset + hiInsn->size != loInsn->offset ||
+      !hiInsn->supported || !hiInsn->lui ||
+      !riscvLibcInsnWritesReg(*hiInsn, loInsn->rs1) ||
+      hiRel == relocTargets.end() || !hiRel->second.absHi ||
+      hiRel->second.sym != loRel->second.sym ||
+      hiRel->second.addend != loRel->second.addend) {
+    reason = "local-callee-saved-nearest-def-not-constant";
+    return false;
+  }
+  if (!targetRISCVLibcCString(*loRel->second.sym, loRel->second.addend,
+                              format)) {
+    reason = "local-callee-saved-target-not-string";
+    return false;
+  }
+
+  uint64_t initStart = hiInsn->offset;
+  uint64_t initComplete = loInsn->offset;
+  uint64_t copyOffset = copyInsn->offset;
+
+  if (hasRISCVLibcExternalEntryToProtectedInterval(
+          sec, controlFlowRelocs, initStart, copyOffset)) {
+    reason = "local-callee-saved-external-entry";
+    return false;
+  }
+
+  for (const RISCVLibcInsn &insn : decoded.instructions) {
+    if (insn.offset <= initComplete)
+      continue;
+    if (insn.offset >= copyOffset)
+      break;
+    if (!insn.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (riscvLibcInsnWritesReg(insn, copyInsn->copySrc)) {
+      reason = "local-callee-saved-clobbered";
+      return false;
+    }
+    if (!insn.controlFlow)
+      continue;
+    if (isRISCVLibcNormalDirectCall(controlFlowRelocs, insn))
+      continue;
+    if (isRISCVLibcReturn(insn))
+      continue;
+    const RISCVLibcControlFlowRelocInfo *target =
+        getRISCVLibcDirectBranchTarget(controlFlowRelocs, insn);
+    if (!target || !target->hasTarget) {
+      reason = "local-callee-saved-unknown-control-flow";
+      return false;
+    }
+  }
+
+  for (const RISCVLibcInsn &insn : decoded.instructions) {
+    if (!insn.controlFlow)
+      continue;
+    if (isRISCVLibcNormalDirectCall(controlFlowRelocs, insn))
+      continue;
+    if (isRISCVLibcReturn(insn))
+      continue;
+    const RISCVLibcControlFlowRelocInfo *target =
+        getRISCVLibcDirectBranchTarget(controlFlowRelocs, insn);
+    if (!target) {
+      if (insn.offset > initComplete && insn.offset < copyOffset) {
+        reason = "local-callee-saved-unknown-control-flow";
+        return false;
+      }
+      continue;
+    }
+    if (!target->hasTarget) {
+      if (insn.offset > initComplete && insn.offset < copyOffset) {
+        reason = "local-callee-saved-unknown-control-flow";
+        return false;
+      }
+      continue;
+    }
+    if (target->targetSection != &sec)
+      continue;
+    if (target->targetOffset > initStart && target->targetOffset <= copyOffset &&
+        (insn.offset <= initStart || insn.offset > copyOffset)) {
+      reason = "local-callee-saved-external-entry";
+      return false;
+    }
+  }
+  proof = (Twine("LOCAL_DOMINATING_CALLEE_SAVED_CONST_") +
+           riscvLibcSRegName(copyInsn->copySrc))
+              .str();
+  return true;
+}
+
+template <class ELFT>
 static bool proveRISCVLibcCallsiteFormat(
     InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
     uint64_t callOff, int argReg,
     DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets,
+    DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &controlFlowRelocs,
     RISCVLibcCandidateFormat &format, std::string &proof, std::string &reason,
     std::string &entryReason, std::string &entryDetail) {
   if (argReg < 0) {
@@ -5460,6 +5798,11 @@ static bool proveRISCVLibcCallsiteFormat(
   }
   entryReason = entryDiag.reason;
   entryDetail = formatRISCVLibcEntryCalleeSavedDiag(entryDiag);
+
+  if (proveRISCVLibcLocalDominatingCalleeSavedConst<ELFT>(
+          sec, argReg, insns, decoded, relocTargets, controlFlowRelocs, format,
+          proof, reason))
+    return true;
 
   for (size_t i = insns.size(); i > 0; --i) {
     const RISCVLibcInsn &def = insns[i - 1];
@@ -5653,6 +5996,10 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       decodeCache;
   std::map<InputSectionBase *, DenseMap<uint64_t, RISCVLibcRelocTarget>>
       relocTargetCache;
+  std::map<InputSectionBase *,
+           DenseMap<uint64_t,
+                    SmallVector<RISCVLibcControlFlowRelocInfo, 0>>>
+      controlFlowRelocCache;
 
   SmallVector<RISCVLibcFunctionNode, 0> nodes;
   DenseMap<Defined *, unsigned> nodeIndex;
@@ -5741,9 +6088,13 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets =
               getRISCVLibcRelocTargetsCached<ELFT>(sec, relocTargetCache,
                                                    perfStats);
+          DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+              &controlFlowRelocs =
+                  getRISCVLibcControlFlowRelocsCached<ELFT>(
+                      sec, controlFlowRelocCache);
           if (proveRISCVLibcCallsiteFormat<ELFT>(
                   sec, decoded, rel.r_offset, argReg, relocTargets,
-                  call.provenFormat, call.proof, call.reason,
+                  controlFlowRelocs, call.provenFormat, call.proof, call.reason,
                   call.entryCalleeSavedReason,
                   call.entryCalleeSavedDetail)) {
             call.formatClass = RISCVLibcFormatClass::ProvenConstant;
@@ -5833,6 +6184,7 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t provenFloatFormats = 0, provenLongDoubleFormats = 0;
   uint32_t provenDirectAbsFormatArgs = 0;
   uint32_t provenEntryCalleeSavedFormats = 0;
+  uint32_t provenLocalDominatingCalleeSavedFormats = 0;
   bool candidateFloatFormatSeen = false, candidateLongDoubleFormatSeen = false;
   for (RISCVLibcPrintfCall &call : printfCalls) {
     printfCallers.insert(call.caller);
@@ -5852,6 +6204,9 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
         ++provenDirectAbsFormatArgs;
       if (StringRef(call.proof).startswith("ENTRY_CONST_CALLEE_SAVED_COPY"))
         ++provenEntryCalleeSavedFormats;
+      if (StringRef(call.proof).startswith(
+              "LOCAL_DOMINATING_CALLEE_SAVED_CONST"))
+        ++provenLocalDominatingCalleeSavedFormats;
     } else if (call.formatClass == RISCVLibcFormatClass::CandidateConstant) {
       ++candidateFormats;
       ++candidateUserFormats;
@@ -6006,6 +6361,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(provenDirectAbsFormatArgs));
   message(Twine("  proven_entry_callee_saved_formats=") +
           Twine(provenEntryCalleeSavedFormats));
+  message(Twine("  proven_local_dominating_callee_saved_formats=") +
+          Twine(provenLocalDominatingCalleeSavedFormats));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
   message(Twine("  candidate_float_format_seen=") +
