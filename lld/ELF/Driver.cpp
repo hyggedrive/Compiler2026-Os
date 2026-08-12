@@ -4538,6 +4538,7 @@ struct RISCVLibcRelocTarget {
   int64_t addend = 0;
   bool pcrelHi = false;
   bool absHi = false;
+  bool absLoI = false;
   bool lo = false;
 };
 
@@ -4796,6 +4797,7 @@ static void recordRISCVLibcRelocTarget(
   t.addend = getRISCVLibcAddend(rel);
   t.pcrelHi = type == R_RISCV_PCREL_HI20;
   t.absHi = type == R_RISCV_HI20;
+  t.absLoI = type == R_RISCV_LO12_I;
   t.lo = type == R_RISCV_LO12_I || type == R_RISCV_LO12_S ||
          type == R_RISCV_PCREL_LO12_I || type == R_RISCV_PCREL_LO12_S;
   targets[rel.r_offset] = t;
@@ -5253,6 +5255,77 @@ formatRISCVLibcEntryCalleeSavedDiag(const RISCVLibcEntryCalleeSavedDiag &d) {
       .str();
 }
 
+static bool proveRISCVLibcDirectAbsFormatArg(
+    int argReg, ArrayRef<RISCVLibcInsn> insns,
+    DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets,
+    RISCVLibcCandidateFormat &format, std::string &proof,
+    std::string &reason) {
+  for (size_t i = insns.size(); i > 0; --i) {
+    const RISCVLibcInsn &lo = insns[i - 1];
+    if (!lo.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (!riscvLibcInsnWritesReg(lo, argReg))
+      continue;
+    if (!lo.addi || lo.rs1 != argReg) {
+      reason = "direct-abs-final-def-not-addi";
+      return false;
+    }
+    auto loRel = relocTargets.find(lo.offset);
+    if (loRel == relocTargets.end() || !loRel->second.absLoI) {
+      reason = "direct-abs-lo12-not-found";
+      return false;
+    }
+    if (i < 2) {
+      reason = "direct-abs-hi20-not-adjacent";
+      return false;
+    }
+    const RISCVLibcInsn &hi = insns[i - 2];
+    if (!hi.supported) {
+      reason = "unsupported-instruction";
+      return false;
+    }
+    if (!hi.lui || !riscvLibcInsnWritesReg(hi, argReg)) {
+      reason = "direct-abs-hi20-not-adjacent-lui";
+      return false;
+    }
+    auto hiRel = relocTargets.find(hi.offset);
+    if (hiRel == relocTargets.end() || !hiRel->second.absHi) {
+      reason = "direct-abs-hi20-reloc-not-found";
+      return false;
+    }
+    if (hiRel->second.sym != loRel->second.sym ||
+        hiRel->second.addend != loRel->second.addend) {
+      reason = "direct-abs-hi-lo-symbol-mismatch";
+      return false;
+    }
+    for (size_t j = i; j < insns.size(); ++j) {
+      const RISCVLibcInsn &mid = insns[j];
+      if (!mid.supported) {
+        reason = "unsupported-instruction";
+        return false;
+      }
+      if (mid.controlFlow) {
+        reason = mid.call ? "intermediate-call" : "control-flow-boundary";
+        return false;
+      }
+      if (riscvLibcInsnWritesReg(mid, argReg)) {
+        reason = "format-register-clobbered";
+        return false;
+      }
+    }
+    if (!targetRISCVLibcCString(*loRel->second.sym, loRel->second.addend,
+                                format)) {
+      reason = "direct-abs-target-not-string";
+      return false;
+    }
+    proof = "DIRECT_ABS_FORMAT_ARG";
+    return true;
+  }
+  return false;
+}
+
 template <class ELFT>
 static bool proveRISCVLibcCallsiteFormat(InputSectionBase &sec,
                                          uint64_t funcStart, uint64_t callOff,
@@ -5295,6 +5368,10 @@ static bool proveRISCVLibcCallsiteFormat(InputSectionBase &sec,
     reason = "empty-call-window";
     return false;
   }
+
+  if (proveRISCVLibcDirectAbsFormatArg(argReg, insns, relocTargets, format,
+                                       proof, reason))
+    return true;
 
   RISCVLibcEntryCalleeSavedDiag entryDiag;
   if (proveRISCVLibcEntryCalleeSavedFormat<ELFT>(
@@ -5653,6 +5730,7 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t userPrintfCalls = 0, provenUserFormats = 0, candidateUserFormats = 0,
            unknownUserFormats = 0, internalForwarderCalls = 0;
   uint32_t provenFloatFormats = 0, provenLongDoubleFormats = 0;
+  uint32_t provenDirectAbsFormatArgs = 0;
   uint32_t provenEntryCalleeSavedFormats = 0;
   bool candidateFloatFormatSeen = false, candidateLongDoubleFormatSeen = false;
   for (RISCVLibcPrintfCall &call : printfCalls) {
@@ -5669,6 +5747,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
         ++provenFloatFormats;
       if (call.provenFormat.hasLongDouble)
         ++provenLongDoubleFormats;
+      if (call.proof == "DIRECT_ABS_FORMAT_ARG")
+        ++provenDirectAbsFormatArgs;
       if (StringRef(call.proof).startswith("ENTRY_CONST_CALLEE_SAVED_COPY"))
         ++provenEntryCalleeSavedFormats;
     } else if (call.formatClass == RISCVLibcFormatClass::CandidateConstant) {
@@ -5810,6 +5890,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(provenFloatFormats));
   message(Twine("  proven_long_double_format_calls=") +
           Twine(provenLongDoubleFormats));
+  message(Twine("  proven_direct_abs_format_args=") +
+          Twine(provenDirectAbsFormatArgs));
   message(Twine("  proven_entry_callee_saved_formats=") +
           Twine(provenEntryCalleeSavedFormats));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
