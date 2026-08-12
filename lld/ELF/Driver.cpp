@@ -4470,13 +4470,6 @@ struct RISCVLibcLoopCarriedDiag {
   uint64_t unknownControlFlowOffset = std::numeric_limits<uint64_t>::max();
 };
 
-struct RISCVLibcCalleeSavedConstCandidate {
-  const RISCVLibcInsn *copyInsn = nullptr;
-  const RISCVLibcInsn *hiInsn = nullptr;
-  const RISCVLibcInsn *loInsn = nullptr;
-  int savedReg = -1;
-};
-
 struct RISCVLibcAuditPerfStats {
   uint32_t decodedSourceFunctions = 0;
   uint64_t decodedInstructionCount = 0;
@@ -4615,6 +4608,13 @@ struct RISCVLibcInsn {
   bool auipc = false;
   bool writesRd = false;
   bool supported = true;
+};
+
+struct RISCVLibcCalleeSavedConstCandidate {
+  const RISCVLibcInsn *copyInsn = nullptr;
+  const RISCVLibcInsn *hiInsn = nullptr;
+  const RISCVLibcInsn *loInsn = nullptr;
+  int savedReg = -1;
 };
 
 struct RISCVLibcFunctionDecode {
