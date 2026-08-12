@@ -47,6 +47,7 @@
 #include "lld/Common/TargetOptionsCommandFlags.h"
 #include "lld/Common/Version.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
@@ -1368,6 +1369,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printGcSections =
       args.hasFlag(OPT_print_gc_sections, OPT_no_print_gc_sections, false);
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
+  config->printRISCVLibcSpecializationAudit =
+      args.hasArg(OPT_print_riscv_libc_specialization_audit);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
@@ -4281,6 +4284,467 @@ static void printRISCVFunctionSplitGCStats() {
             Twine(d.deadChildren) + " live bytes " + Twine(d.liveBytes) +
             " dead bytes " + Twine(d.deadBytes));
 }
+
+enum class RISCVLibcRefKind {
+  DirectCall,
+  AddressReference,
+  Unknown,
+};
+
+static StringRef toString(RISCVLibcRefKind kind) {
+  switch (kind) {
+  case RISCVLibcRefKind::DirectCall:
+    return "direct-call";
+  case RISCVLibcRefKind::AddressReference:
+    return "address-reference";
+  case RISCVLibcRefKind::Unknown:
+    return "unknown-reference";
+  }
+  llvm_unreachable("unknown RISC-V libc reference kind");
+}
+
+static RISCVLibcRefKind classifyRISCVLibcRef(RelType type) {
+  switch (type) {
+  case R_RISCV_CALL:
+  case R_RISCV_CALL_PLT:
+  case R_RISCV_JAL:
+  case R_RISCV_RVC_JUMP:
+    return RISCVLibcRefKind::DirectCall;
+  case R_RISCV_32:
+  case R_RISCV_64:
+  case R_RISCV_ADD8:
+  case R_RISCV_ADD16:
+  case R_RISCV_ADD32:
+  case R_RISCV_ADD64:
+  case R_RISCV_SUB8:
+  case R_RISCV_SUB16:
+  case R_RISCV_SUB32:
+  case R_RISCV_SUB64:
+  case R_RISCV_SET6:
+  case R_RISCV_SET8:
+  case R_RISCV_SET16:
+  case R_RISCV_SET32:
+  case R_RISCV_SUB6:
+  case R_RISCV_GOT_HI20:
+  case R_RISCV_TLS_GOT_HI20:
+  case R_RISCV_TLS_GD_HI20:
+  case R_RISCV_PCREL_HI20:
+  case R_RISCV_PCREL_LO12_I:
+  case R_RISCV_PCREL_LO12_S:
+  case R_RISCV_PLT32:
+  case R_RISCV_HI20:
+  case R_RISCV_LO12_I:
+  case R_RISCV_LO12_S:
+  case R_RISCV_RELATIVE:
+    return RISCVLibcRefKind::AddressReference;
+  default:
+    return RISCVLibcRefKind::Unknown;
+  }
+}
+
+static bool isPrintfFamilyName(StringRef name) {
+  return StringSwitch<bool>(name)
+      .Cases("printf", "fprintf", "sprintf", "snprintf", true)
+      .Cases("vprintf", "vfprintf", "vsprintf", "vsnprintf", true)
+      .Default(false);
+}
+
+static bool isPrintfFloatDependencyName(StringRef name) {
+  return StringSwitch<bool>(name)
+      .Cases("__extenddftf2", "__fixtfsi", "__fixunstfsi", true)
+      .Cases("__floatsitf", "__floatunsitf", "__addtf3", true)
+      .Cases("__divtf3", "__multf3", "__eqtf2", "__netf2", true)
+      .Cases("__cmptf2", "__lttf2", "__letf2", true)
+      .Cases("frexpl", "__fpclassifyl", true)
+      .Default(false);
+}
+
+struct RISCVLibcIncomingRef {
+  Defined *sourceFunction = nullptr;
+  InputSectionBase *sourceSection = nullptr;
+  bool sourceLive = false;
+  RelType type = R_RISCV_NONE;
+  RISCVLibcRefKind kind = RISCVLibcRefKind::Unknown;
+};
+
+struct RISCVLibcFunctionNode {
+  Defined *sym = nullptr;
+  InputSectionBase *section = nullptr;
+  SmallVector<unsigned, 0> callees;
+  SmallVector<RISCVLibcIncomingRef, 0> incoming;
+  uint64_t size = 0;
+};
+
+struct RISCVLibcCandidateFormat {
+  std::string text;
+  bool hasFloat = false;
+  bool hasLongDouble = false;
+};
+
+struct RISCVLibcPrintfCall {
+  Defined *caller = nullptr;
+  InputSectionBase *sourceSection = nullptr;
+  Defined *target = nullptr;
+  RelType type = R_RISCV_NONE;
+  SmallVector<RISCVLibcCandidateFormat, 0> candidateFormats;
+};
+
+template <class RelTy> static int64_t getRISCVLibcAddend(const RelTy &rel) {
+  if constexpr (RelTy::IsRela)
+    return rel.r_addend;
+  return 0;
+}
+
+static bool isRISCVLibcReadOnlyData(InputSectionBase &sec) {
+  return (sec.flags & SHF_ALLOC) && !(sec.flags & SHF_WRITE) &&
+         !(sec.flags & SHF_EXECINSTR) && sec.type == SHT_PROGBITS;
+}
+
+static std::string symbolFileName(const Defined &d) {
+  return d.file ? toString(d.file) : std::string("<internal>");
+}
+
+static bool readCStringAt(InputSectionBase &sec, uint64_t off,
+                          std::string &out) {
+  ArrayRef<uint8_t> data = sec.content();
+  if (off >= data.size())
+    return false;
+
+  constexpr size_t maxLen = 512;
+  out.clear();
+  for (uint64_t i = off; i < data.size() && out.size() < maxLen; ++i) {
+    uint8_t c = data[i];
+    if (c == 0)
+      return !out.empty();
+    if ((c < 0x20 || c > 0x7e) && c != '\n' && c != '\t' && c != '\r')
+      return false;
+    out.push_back(static_cast<char>(c));
+  }
+  return false;
+}
+
+static void scanPrintfFormat(StringRef s, bool &hasFloat,
+                             bool &hasLongDouble) {
+  hasFloat = false;
+  hasLongDouble = false;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] != '%')
+      continue;
+    ++i;
+    if (i < s.size() && s[i] == '%')
+      continue;
+    while (i < s.size() && StringRef("-+ #0").contains(s[i]))
+      ++i;
+    if (i < s.size() && s[i] == '*')
+      ++i;
+    else
+      while (i < s.size() && isDigit(s[i]))
+        ++i;
+    if (i < s.size() && s[i] == '.') {
+      ++i;
+      if (i < s.size() && s[i] == '*')
+        ++i;
+      else
+        while (i < s.size() && isDigit(s[i]))
+          ++i;
+    }
+
+    bool longDouble = false;
+    if (i < s.size() && s[i] == 'L') {
+      longDouble = true;
+      ++i;
+    } else if (i + 1 < s.size() && s.substr(i, 2) == "hh") {
+      i += 2;
+    } else if (i + 1 < s.size() && s.substr(i, 2) == "ll") {
+      i += 2;
+    } else if (i < s.size() && StringRef("hljzt").contains(s[i])) {
+      ++i;
+    }
+
+    if (i >= s.size())
+      break;
+    if (StringRef("fFeEgGaA").contains(s[i])) {
+      hasFloat = true;
+      hasLongDouble |= longDouble;
+    }
+  }
+}
+
+template <class ELFT>
+static void collectRISCVLibcCandidateFormats(
+    InputSectionBase &sec, Defined &caller,
+    SmallVectorImpl<RISCVLibcCandidateFormat> &formats) {
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  auto scan = [&](auto rels) {
+    if (!sec.file)
+      return;
+    for (const auto &rel : rels) {
+      Defined *fromFunc = sec.getEnclosingFunction(rel.r_offset);
+      if (fromFunc != &caller)
+        continue;
+      Symbol &target = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+      Defined *d = dyn_cast<Defined>(&target);
+      if (!d)
+        continue;
+      auto *targetSec = dyn_cast_or_null<InputSectionBase>(d->section);
+      if (!targetSec || !isRISCVLibcReadOnlyData(*targetSec))
+        continue;
+      int64_t addend = getRISCVLibcAddend(rel);
+      uint64_t off = 0;
+      if (!checkedAddend(d->value, addend, off))
+        continue;
+      std::string text;
+      if (!readCStringAt(*targetSec, off, text) || text.find('%') == text.npos)
+        continue;
+      RISCVLibcCandidateFormat f;
+      f.text = std::move(text);
+      scanPrintfFormat(f.text, f.hasFloat, f.hasLongDouble);
+      if (!llvm::any_of(formats, [&](const RISCVLibcCandidateFormat &old) {
+            return old.text == f.text;
+          }))
+        formats.push_back(std::move(f));
+    }
+  };
+  scan(rels.rels);
+  scan(rels.relas);
+}
+
+template <class ELFT> static void printRISCVLibcSpecializationAudit() {
+  if (!config->printRISCVLibcSpecializationAudit ||
+      config->emachine != EM_RISCV)
+    return;
+
+  SmallVector<RISCVLibcFunctionNode, 0> nodes;
+  DenseMap<Defined *, unsigned> nodeIndex;
+
+  for (ELFFileBase *file : ctx.objectFiles) {
+    for (Symbol *sym : file->getSymbols()) {
+      Defined *d = dyn_cast_or_null<Defined>(sym);
+      if (!d || d->type != STT_FUNC)
+        continue;
+      auto *sec = dyn_cast_or_null<InputSectionBase>(d->section);
+      if (!sec || sec == &InputSection::discarded || !sec->isLive())
+        continue;
+      unsigned idx = nodes.size();
+      RISCVLibcFunctionNode node;
+      node.sym = d;
+      node.section = sec;
+      node.size = d->size;
+      nodes.push_back(std::move(node));
+      nodeIndex.try_emplace(d, idx);
+    }
+  }
+
+  SmallVector<RISCVLibcPrintfCall, 0> printfCalls;
+
+  auto recordRel = [&](InputSectionBase &sec, auto rels) {
+    if (!sec.isLive() || !sec.file)
+      return;
+    for (const auto &rel : rels) {
+      RelType type = rel.getType(config->isMips64EL);
+      Symbol &targetSym = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+      Defined *target = dyn_cast<Defined>(&targetSym);
+      if (!target || target->type != STT_FUNC)
+        continue;
+      auto targetIt = nodeIndex.find(target);
+      if (targetIt == nodeIndex.end())
+        continue;
+      Defined *sourceFunc = nullptr;
+      if (sec.flags & SHF_EXECINSTR)
+        sourceFunc = sec.getEnclosingFunction(rel.r_offset);
+      auto sourceIt = sourceFunc ? nodeIndex.find(sourceFunc) : nodeIndex.end();
+      RISCVLibcRefKind kind = classifyRISCVLibcRef(type);
+
+      RISCVLibcIncomingRef incoming;
+      incoming.sourceFunction = sourceFunc;
+      incoming.sourceSection = &sec;
+      incoming.sourceLive = sec.isLive();
+      incoming.type = type;
+      incoming.kind = kind;
+      nodes[targetIt->second].incoming.push_back(incoming);
+
+      if (sourceIt != nodeIndex.end()) {
+        SmallVector<unsigned, 0> &callees = nodes[sourceIt->second].callees;
+        if (!llvm::is_contained(callees, targetIt->second))
+          callees.push_back(targetIt->second);
+      }
+
+      if (isPrintfFamilyName(target->getName()) && sourceFunc &&
+          sourceIt != nodeIndex.end()) {
+        RISCVLibcPrintfCall call;
+        call.caller = sourceFunc;
+        call.sourceSection = &sec;
+        call.target = target;
+        call.type = type;
+        collectRISCVLibcCandidateFormats<ELFT>(sec, *sourceFunc,
+                                               call.candidateFormats);
+        printfCalls.push_back(std::move(call));
+      }
+    }
+  };
+
+  for (InputSectionBase *sec : ctx.inputSections) {
+    if (!sec || sec == &InputSection::discarded)
+      continue;
+    RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
+    recordRel(*sec, rels.rels);
+    recordRel(*sec, rels.relas);
+  }
+
+  SmallVector<unsigned, 0> printfCoreRoots;
+  for (auto [i, node] : llvm::enumerate(nodes))
+    if (node.sym->getName() == "printf_core")
+      printfCoreRoots.push_back(i);
+
+  DenseSet<unsigned> closure;
+  SmallVector<unsigned, 0> worklist;
+  for (unsigned i : printfCoreRoots) {
+    closure.insert(i);
+    worklist.push_back(i);
+  }
+  while (!worklist.empty()) {
+    unsigned i = worklist.pop_back_val();
+    for (unsigned callee : nodes[i].callees)
+      if (closure.insert(callee).second)
+        worklist.push_back(callee);
+  }
+
+  auto isPrintfCoreRoot = [&](unsigned idx) {
+    return llvm::is_contained(printfCoreRoots, idx);
+  };
+  auto outsideLiveIncoming = [&](unsigned idx) {
+    uint32_t count = 0;
+    for (const RISCVLibcIncomingRef &ref : nodes[idx].incoming) {
+      if (!ref.sourceLive)
+        continue;
+      if (!ref.sourceFunction) {
+        ++count;
+        continue;
+      }
+      auto sourceIt = nodeIndex.find(ref.sourceFunction);
+      if (sourceIt == nodeIndex.end() || !closure.contains(sourceIt->second))
+        ++count;
+    }
+    return count;
+  };
+
+  uint64_t dependencyBytes = 0, exclusiveBytes = 0, sharedBytes = 0;
+  uint32_t dependencyFunctions = 0, exclusiveFunctions = 0,
+           sharedFunctions = 0;
+  SmallVector<std::pair<uint64_t, unsigned>, 0> exclusiveBySize;
+  for (unsigned idx : closure) {
+    if (isPrintfCoreRoot(idx))
+      continue;
+    ++dependencyFunctions;
+    dependencyBytes += nodes[idx].size;
+    uint32_t outside = outsideLiveIncoming(idx);
+    if (outside == 0) {
+      ++exclusiveFunctions;
+      exclusiveBytes += nodes[idx].size;
+      exclusiveBySize.push_back({nodes[idx].size, idx});
+    } else {
+      ++sharedFunctions;
+      sharedBytes += nodes[idx].size;
+    }
+  }
+  llvm::sort(exclusiveBySize, [](const auto &a, const auto &b) {
+    return a.first > b.first;
+  });
+
+  DenseSet<Defined *> printfCallers;
+  uint32_t provenFormats = 0, candidateFormats = 0, unknownFormats = 0;
+  bool floatFormatSeen = false, longDoubleFormatSeen = false;
+  for (RISCVLibcPrintfCall &call : printfCalls) {
+    printfCallers.insert(call.caller);
+    if (call.candidateFormats.empty()) {
+      ++unknownFormats;
+    } else {
+      ++candidateFormats;
+      for (const RISCVLibcCandidateFormat &f : call.candidateFormats) {
+        floatFormatSeen |= f.hasFloat;
+        longDoubleFormatSeen |= f.hasLongDouble;
+      }
+    }
+  }
+
+  message("RISCV libc specialization audit:");
+  message(Twine("  printf_core_instances=") + Twine(printfCoreRoots.size()));
+  for (unsigned idx : printfCoreRoots) {
+    const RISCVLibcFunctionNode &node = nodes[idx];
+    message(Twine("  printf_core file=") + symbolFileName(*node.sym) +
+            " section=" + node.section->name + " size=" + Twine(node.size));
+    for (unsigned callee : node.callees) {
+      const RISCVLibcFunctionNode &dst = nodes[callee];
+      RISCVLibcRefKind kind = RISCVLibcRefKind::Unknown;
+      for (const RISCVLibcIncomingRef &ref : dst.incoming)
+        if (ref.sourceFunction == node.sym) {
+          kind = ref.kind;
+          break;
+        }
+      message(Twine("    printf_core -> ") + dst.sym->getName() +
+              " size=" + Twine(dst.size) + " kind=" + toString(kind));
+    }
+  }
+
+  message(Twine("  printf_dependency_functions=") +
+          Twine(dependencyFunctions));
+  message(Twine("  printf_dependency_bytes=") + Twine(dependencyBytes));
+  message(Twine("  printf_exclusive_dependency_functions=") +
+          Twine(exclusiveFunctions));
+  message(Twine("  printf_exclusive_dependency_bytes=") +
+          Twine(exclusiveBytes));
+  message(Twine("  printf_shared_dependency_functions=") +
+          Twine(sharedFunctions));
+  message(Twine("  printf_shared_dependency_bytes=") + Twine(sharedBytes));
+
+  uint32_t printed = 0;
+  for (auto [size, idx] : exclusiveBySize) {
+    if (printed++ == 15)
+      break;
+    const RISCVLibcFunctionNode &node = nodes[idx];
+    message(Twine("  exclusive function=") + node.sym->getName() +
+            " size=" + Twine(size) + " outside_live_incoming=0 file=" +
+            symbolFileName(*node.sym) + " section=" + node.section->name);
+  }
+
+  for (auto [i, node] : llvm::enumerate(nodes)) {
+    if (!isPrintfFloatDependencyName(node.sym->getName()))
+      continue;
+    bool inClosure = closure.contains(i);
+    bool exclusive = inClosure && !isPrintfCoreRoot(i) &&
+                     outsideLiveIncoming(i) == 0;
+    message(Twine("  float_dependency_probe function=") + node.sym->getName() +
+            " size=" + Twine(node.size) +
+            " in_printf_closure=" + Twine(inClosure ? 1 : 0) +
+            " exclusive=" + Twine(exclusive ? 1 : 0) +
+            " outside_live_incoming=" + Twine(outsideLiveIncoming(i)));
+  }
+
+  for (RISCVLibcPrintfCall &call : printfCalls) {
+    StringRef classification = call.candidateFormats.empty()
+                                   ? "DYNAMIC_OR_UNKNOWN_FORMAT"
+                                   : "CANDIDATE_CONSTANT_FORMAT";
+    message(Twine("  printf_call caller=") + call.caller->getName() +
+            " target=" + call.target->getName() +
+            " source_section=" + call.sourceSection->name +
+            " reloc=" + toString(call.type) + " source_live=1" +
+            " format_class=" + classification);
+    for (const RISCVLibcCandidateFormat &f : call.candidateFormats)
+      message(Twine("    candidate_format=\"") + f.text +
+              "\" float=" + Twine(f.hasFloat ? 1 : 0) +
+              " long_double=" + Twine(f.hasLongDouble ? 1 : 0));
+  }
+
+  message(Twine("  printf_family_live_calls=") + Twine(printfCalls.size()));
+  message(Twine("  printf_family_callers=") + Twine(printfCallers.size()));
+  message(Twine("  proven_constant_format_calls=") + Twine(provenFormats));
+  message(Twine("  candidate_constant_format_calls=") +
+          Twine(candidateFormats));
+  message(Twine("  dynamic_or_unknown_format_calls=") + Twine(unknownFormats));
+  message(Twine("  float_format_seen=") + Twine(floatFormatSeen ? 1 : 0));
+  message(Twine("  long_double_format_seen=") +
+          Twine(longDoubleFormatSeen ? 1 : 0));
+}
 } // namespace
 
 // Do actual linking. Note that when this function is called,
@@ -4629,6 +5093,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);
   printRISCVFunctionSplitGCStats();
+  invokeELFT(printRISCVLibcSpecializationAudit,);
   demoteSharedAndLazySymbols();
 
   // Make copies of any input sections that need to be copied into each
