@@ -5511,6 +5511,12 @@ struct RISCVLibcStackSlotCFGAudit {
   bool backedgeBypass = false;
   bool unknownControlFlow = false;
   bool safe = false;
+  bool loopRecognized = false;
+  bool initialEntrySafe = false;
+  uint64_t loopStart = std::numeric_limits<uint64_t>::max();
+  uint64_t loopEnd = std::numeric_limits<uint64_t>::max();
+  uint64_t backedgeSource = std::numeric_limits<uint64_t>::max();
+  uint64_t backedgeTarget = std::numeric_limits<uint64_t>::max();
   std::string reason = "none";
 };
 
@@ -5530,8 +5536,73 @@ static RISCVLibcStackSlotCFGAudit auditRISCVLibcStackSlotCFG(
 
   uint64_t storeOffset = allInsns[storeIndex].offset;
   uint64_t loadOffset = allInsns[loadIndex].offset;
-  for (size_t i = storeIndex + 1; i < loadIndex; ++i) {
+  DenseSet<uint64_t> decodedInsnOffsets;
+  decodedInsnOffsets.reserve(decoded.instructions.size());
+  for (const RISCVLibcInsn &insn : decoded.instructions)
+    decodedInsnOffsets.insert(insn.offset);
+  if (!decodedInsnOffsets.contains(storeOffset) ||
+      !decodedInsnOffsets.contains(loadOffset) ||
+      storeOffset < decoded.funcStart || storeOffset >= decoded.funcEnd ||
+      loadOffset < decoded.funcStart || loadOffset >= decoded.funcEnd ||
+      loadOffset >= decoded.decodedEnd) {
+    audit.unknownControlFlow = true;
+    audit.reason = "invalid-function-boundary";
+    return audit;
+  }
+
+  uint64_t regionStart = storeOffset;
+  uint64_t regionEnd = loadOffset;
+  bool sawBackedge = false;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &entry : controlFlowRelocs) {
+      uint64_t sourceOffset = entry.first;
+      for (const RISCVLibcControlFlowRelocInfo &r : entry.second) {
+        if (r.type != R_RISCV_BRANCH && r.type != R_RISCV_JAL &&
+            r.type != R_RISCV_RVC_BRANCH && r.type != R_RISCV_RVC_JUMP)
+          continue;
+        if (!r.hasTarget || r.targetSection != &sec)
+          continue;
+        if (sourceOffset > regionEnd && r.targetOffset > storeOffset &&
+            r.targetOffset <= regionEnd) {
+          if (sourceOffset < decoded.funcStart ||
+              sourceOffset >= decoded.funcEnd ||
+              sourceOffset >= decoded.decodedEnd ||
+              r.targetOffset < decoded.funcStart ||
+              r.targetOffset >= decoded.funcEnd ||
+              r.targetOffset >= decoded.decodedEnd ||
+              !decodedInsnOffsets.contains(sourceOffset) ||
+              !decodedInsnOffsets.contains(r.targetOffset)) {
+            audit.unknownControlFlow = true;
+            audit.reason = "unknown-control-flow";
+            return audit;
+          }
+          sawBackedge = true;
+          audit.backedgeBypass = true;
+          audit.backedgeSource = sourceOffset;
+          audit.backedgeTarget = r.targetOffset;
+          regionEnd = sourceOffset;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  audit.loopStart = regionStart;
+  audit.loopEnd = regionEnd;
+  audit.loopRecognized = sawBackedge;
+  if (regionEnd < decoded.funcStart || regionEnd >= decoded.funcEnd ||
+      regionEnd >= decoded.decodedEnd) {
+    audit.unknownControlFlow = true;
+    audit.reason = "unknown-control-flow";
+    return audit;
+  }
+
+  for (size_t i = storeIndex + 1; i < allInsns.size(); ++i) {
     const RISCVLibcInsn &insn = allInsns[i];
+    if (insn.offset > regionEnd)
+      break;
     if (!insn.supported) {
       audit.unknownControlFlow = true;
       audit.reason = "unsupported-instruction";
@@ -5562,9 +5633,11 @@ static RISCVLibcStackSlotCFGAudit auditRISCVLibcStackSlotCFG(
     }
     if (target->targetSection != &sec)
       continue;
-    if (target->targetOffset > storeOffset && target->targetOffset <= loadOffset &&
-        target->targetOffset <= insn.offset)
+    if (target->targetOffset > storeOffset && target->targetOffset <= regionEnd &&
+        target->targetOffset < insn.offset && insn.offset > loadOffset) {
+      sawBackedge = true;
       audit.backedgeBypass = true;
+    }
   }
 
   for (const auto &entry : controlFlowRelocs) {
@@ -5576,23 +5649,23 @@ static RISCVLibcStackSlotCFGAudit auditRISCVLibcStackSlotCFG(
         continue;
       if (!r.hasTarget || r.targetSection != &sec)
         continue;
-      if (r.targetOffset > storeOffset && r.targetOffset <= loadOffset &&
-          (sourceOffset <= storeOffset || sourceOffset > loadOffset)) {
+      if (r.targetOffset > storeOffset && r.targetOffset <= regionEnd &&
+          (sourceOffset <= storeOffset || sourceOffset > regionEnd)) {
         audit.externalEntry = true;
-        if (sourceOffset > loadOffset)
+        if (sourceOffset > regionEnd)
           audit.backedgeBypass = true;
       }
     }
   }
+  audit.initialEntrySafe = !audit.externalEntry;
 
+  audit.loopRecognized = sawBackedge;
   if (audit.sameSlotClobber)
     audit.reason = "same-slot-clobber";
   else if (audit.externalEntry)
     audit.reason = "external-entry";
   else if (audit.spModified)
     audit.reason = "sp-modified";
-  else if (audit.backedgeBypass)
-    audit.reason = "backedge-bypass";
   else if (audit.unknownControlFlow)
     audit.reason = "unknown-control-flow";
   else {
@@ -5727,7 +5800,13 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
                                         uint32_t &spStable,
                                         uint32_t &noExternalEntry,
                                         uint32_t &noUnknownControlFlow,
-                                        uint32_t &cfgSafe) {
+                                        uint32_t &cfgSafe,
+                                        uint32_t &loopCandidates,
+                                        uint32_t &loopRecognized,
+                                        uint32_t &loopInitialEntrySafe,
+                                        uint32_t &loopNoClobber,
+                                        uint32_t &loopSPStable,
+                                        uint32_t &loopSafe) {
   int formatReg = getRISCVPrintfFormatArgReg(call.target->getName());
   SmallVector<RISCVLibcInsn, 0> allInsns;
   std::string reason;
@@ -5806,6 +5885,17 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
   RISCVLibcStackSlotCFGAudit cfgAudit = auditRISCVLibcStackSlotCFG(
       *call.sourceSection, decoded, allInsns, nearestStoreIndex, loadIndex,
       controlFlowRelocs, load->stackOffset);
+  ++loopCandidates;
+  if (cfgAudit.loopRecognized)
+    ++loopRecognized;
+  if (cfgAudit.initialEntrySafe)
+    ++loopInitialEntrySafe;
+  if (!cfgAudit.sameSlotClobber)
+    ++loopNoClobber;
+  if (!cfgAudit.spModified)
+    ++loopSPStable;
+  if (cfgAudit.safe)
+    ++loopSafe;
   if (!cfgAudit.externalEntry && !cfgAudit.backedgeBypass &&
       !cfgAudit.unknownControlFlow)
     ++storeDominatesLoad;
@@ -5853,6 +5943,23 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
           " unknown_control_flow=" +
           Twine(cfgAudit.unknownControlFlow ? 1 : 0) +
           " cfg_safe=" + Twine(cfgAudit.safe ? 1 : 0) +
+          " reason=" + cfgAudit.reason);
+  message(Twine("  printf_stack_slot_loop_audit call_offset=") +
+          hexOffset(call.callOffset) +
+          " store_offset=" + hexOffset(nearestStore->offset) +
+          " load_offset=" + hexOffset(load->offset) +
+          " stack_offset=" + Twine(load->stackOffset) +
+          " loop_start=" + hexOffsetOrNone(cfgAudit.loopStart) +
+          " loop_end=" + hexOffsetOrNone(cfgAudit.loopEnd) +
+          " backedge_source=" + hexOffsetOrNone(cfgAudit.backedgeSource) +
+          " backedge_target=" + hexOffsetOrNone(cfgAudit.backedgeTarget) +
+          " initial_entry_safe=" +
+          Twine(cfgAudit.initialEntrySafe ? 1 : 0) +
+          " same_slot_clobber=" + Twine(cfgAudit.sameSlotClobber ? 1 : 0) +
+          " sp_stable=" + Twine(cfgAudit.spModified ? 0 : 1) +
+          " unknown_control_flow=" +
+          Twine(cfgAudit.unknownControlFlow ? 1 : 0) +
+          " loop_carried_safe=" + Twine(cfgAudit.safe ? 1 : 0) +
           " reason=" + cfgAudit.reason);
   return true;
 }
@@ -7634,6 +7741,12 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t stackSlotNoExternalEntry = 0;
   uint32_t stackSlotNoUnknownControlFlow = 0;
   uint32_t stackSlotCFGSafe = 0;
+  uint32_t stackSlotLoopCandidates = 0;
+  uint32_t stackSlotLoopRecognized = 0;
+  uint32_t stackSlotLoopInitialEntrySafe = 0;
+  uint32_t stackSlotLoopNoClobber = 0;
+  uint32_t stackSlotLoopSPStable = 0;
+  uint32_t stackSlotLoopSafe = 0;
   DenseSet<int64_t> stackSlotUniqueOffsets;
   bool candidateFloatFormatSeen = false, candidateLongDoubleFormatSeen = false;
   for (RISCVLibcPrintfCall &call : printfCalls) {
@@ -8154,7 +8267,10 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           stackSlotNearestStoreNotProven, stackSlotCFGCandidates,
           stackSlotStoreDominatesLoad, stackSlotNoSameSlotClobber,
           stackSlotSPStable, stackSlotNoExternalEntry,
-          stackSlotNoUnknownControlFlow, stackSlotCFGSafe);
+          stackSlotNoUnknownControlFlow, stackSlotCFGSafe,
+          stackSlotLoopCandidates, stackSlotLoopRecognized,
+          stackSlotLoopInitialEntrySafe, stackSlotLoopNoClobber,
+          stackSlotLoopSPStable, stackSlotLoopSafe);
     }
   }
 
@@ -8260,6 +8376,17 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   message(Twine("  printf_stack_slot_no_unknown_control_flow=") +
           Twine(stackSlotNoUnknownControlFlow));
   message(Twine("  printf_stack_slot_cfg_safe=") + Twine(stackSlotCFGSafe));
+  message(Twine("  printf_stack_slot_loop_candidates=") +
+          Twine(stackSlotLoopCandidates));
+  message(Twine("  printf_stack_slot_loop_recognized=") +
+          Twine(stackSlotLoopRecognized));
+  message(Twine("  printf_stack_slot_loop_initial_entry_safe=") +
+          Twine(stackSlotLoopInitialEntrySafe));
+  message(Twine("  printf_stack_slot_loop_no_clobber=") +
+          Twine(stackSlotLoopNoClobber));
+  message(Twine("  printf_stack_slot_loop_sp_stable=") +
+          Twine(stackSlotLoopSPStable));
+  message(Twine("  printf_stack_slot_loop_safe=") + Twine(stackSlotLoopSafe));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
   message(Twine("  printf_specialization_gate_ready=") +
