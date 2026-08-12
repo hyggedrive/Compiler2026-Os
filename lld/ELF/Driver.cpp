@@ -4420,6 +4420,8 @@ struct RISCVLibcPrintfCall {
   std::string reason;
   std::string entryCalleeSavedReason;
   std::string entryCalleeSavedDetail;
+  std::string localDominatingReason;
+  std::string localDominatingDetail;
   SmallVector<RISCVLibcCandidateFormat, 0> candidateFormats;
 };
 
@@ -4439,6 +4441,20 @@ struct RISCVLibcEntryCalleeSavedDiag {
   int candidateDst = -1;
   std::string candidateSymbol = "none";
   std::string candidateRejectReason = "none";
+};
+
+struct RISCVLibcLocalDominatingDiag {
+  std::string reason;
+  uint64_t copyOffset = std::numeric_limits<uint64_t>::max();
+  int copySrc = -1;
+  uint64_t nearestDefOffset = std::numeric_limits<uint64_t>::max();
+  uint64_t hiOffset = std::numeric_limits<uint64_t>::max();
+  uint64_t loOffset = std::numeric_limits<uint64_t>::max();
+  uint64_t initStart = std::numeric_limits<uint64_t>::max();
+  uint64_t initComplete = std::numeric_limits<uint64_t>::max();
+  uint64_t externalEntrySource = std::numeric_limits<uint64_t>::max();
+  uint64_t externalEntryTarget = std::numeric_limits<uint64_t>::max();
+  uint64_t unknownControlFlowOffset = std::numeric_limits<uint64_t>::max();
 };
 
 struct RISCVLibcAuditPerfStats {
@@ -5077,7 +5093,8 @@ static bool hasRISCVLibcExternalEntryToProtectedInterval(
     InputSectionBase &sec,
     const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
         &relocs,
-    uint64_t initStart, uint64_t copyOffset) {
+    uint64_t initStart, uint64_t copyOffset,
+    RISCVLibcLocalDominatingDiag *diag = nullptr) {
   for (const auto &entry : relocs) {
     uint64_t sourceOffset = entry.first;
     for (const RISCVLibcControlFlowRelocInfo &r : entry.second) {
@@ -5088,8 +5105,13 @@ static bool hasRISCVLibcExternalEntryToProtectedInterval(
       if (!r.hasTarget || r.targetSection != &sec)
         continue;
       if (r.targetOffset > initStart && r.targetOffset <= copyOffset &&
-          (sourceOffset <= initStart || sourceOffset > copyOffset))
+          (sourceOffset <= initStart || sourceOffset > copyOffset)) {
+        if (diag) {
+          diag->externalEntrySource = sourceOffset;
+          diag->externalEntryTarget = r.targetOffset;
+        }
         return true;
+      }
     }
   }
   return false;
@@ -5519,6 +5541,29 @@ formatRISCVLibcEntryCalleeSavedDiag(const RISCVLibcEntryCalleeSavedDiag &d) {
       .str();
 }
 
+static std::string
+formatRISCVLibcLocalDominatingDiag(const RISCVLibcLocalDominatingDiag &d) {
+  std::string out =
+      (Twine("local_copy_offset=") + hexOffsetOrNone(d.copyOffset) +
+       " local_copy_src=" + riscvLibcXRegName(d.copySrc) +
+       " local_nearest_def_offset=" + hexOffsetOrNone(d.nearestDefOffset) +
+       " local_hi_offset=" + hexOffsetOrNone(d.hiOffset) +
+       " local_lo_offset=" + hexOffsetOrNone(d.loOffset) +
+       " local_init_start=" + hexOffsetOrNone(d.initStart) +
+       " local_init_complete=" + hexOffsetOrNone(d.initComplete))
+          .str();
+  if (d.externalEntrySource != std::numeric_limits<uint64_t>::max())
+    out += " local_external_entry_source=" +
+           hexOffset(d.externalEntrySource);
+  if (d.externalEntryTarget != std::numeric_limits<uint64_t>::max())
+    out += " local_external_entry_target=" +
+           hexOffset(d.externalEntryTarget);
+  if (d.unknownControlFlowOffset != std::numeric_limits<uint64_t>::max())
+    out += " local_unknown_control_flow_offset=" +
+           hexOffset(d.unknownControlFlowOffset);
+  return out;
+}
+
 static bool proveRISCVLibcDirectAbsFormatArg(
     int argReg, ArrayRef<RISCVLibcInsn> insns,
     DenseMap<uint64_t, RISCVLibcRelocTarget> &relocTargets,
@@ -5598,40 +5643,39 @@ static bool proveRISCVLibcLocalDominatingCalleeSavedConst(
     DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
         &controlFlowRelocs,
     RISCVLibcCandidateFormat &format, std::string &proof,
-    std::string &reason) {
+    std::string &reason, RISCVLibcLocalDominatingDiag &diag) {
+  auto fail = [&](StringRef why) {
+    reason = why.str();
+    diag.reason = reason;
+    return false;
+  };
   const RISCVLibcInsn *copyInsn = nullptr;
   for (size_t i = windowInsns.size(); i > 0; --i) {
     const RISCVLibcInsn &insn = windowInsns[i - 1];
-    if (!insn.supported) {
-      reason = "unsupported-instruction";
-      return false;
-    }
+    if (!insn.supported)
+      return fail("unsupported-instruction");
     if (riscvLibcInsnWritesReg(insn, argReg)) {
       copyInsn = &insn;
       break;
     }
   }
-  if (!copyInsn || !copyInsn->copy ||
-      !isRISCVIntegerCalleeSavedReg(copyInsn->copySrc)) {
-    reason = "local-callee-saved-final-copy-not-found";
-    return false;
+  if (copyInsn) {
+    diag.copyOffset = copyInsn->offset;
+    diag.copySrc = copyInsn->copySrc;
   }
+  if (!copyInsn || !copyInsn->copy ||
+      !isRISCVIntegerCalleeSavedReg(copyInsn->copySrc))
+    return fail("local-callee-saved-final-copy-not-found");
 
   for (const RISCVLibcInsn &insn : windowInsns) {
     if (insn.offset <= copyInsn->offset)
       continue;
-    if (!insn.supported) {
-      reason = "unsupported-instruction";
-      return false;
-    }
-    if (insn.controlFlow) {
-      reason = insn.call ? "intermediate-call" : "control-flow-boundary";
-      return false;
-    }
-    if (riscvLibcInsnWritesReg(insn, argReg)) {
-      reason = "format-register-clobbered";
-      return false;
-    }
+    if (!insn.supported)
+      return fail("unsupported-instruction");
+    if (insn.controlFlow)
+      return fail(insn.call ? "intermediate-call" : "control-flow-boundary");
+    if (riscvLibcInsnWritesReg(insn, argReg))
+      return fail("format-register-clobbered");
   }
 
   const RISCVLibcInsn *loInsn = nullptr;
@@ -5641,71 +5685,58 @@ static bool proveRISCVLibcLocalDominatingCalleeSavedConst(
     const RISCVLibcInsn &insn = decoded.instructions[i - 1];
     if (insn.offset >= copyInsn->offset)
       continue;
-    if (!insn.supported) {
-      reason = "unsupported-instruction";
-      return false;
-    }
+    if (!insn.supported)
+      return fail("unsupported-instruction");
     if (!riscvLibcInsnWritesReg(insn, copyInsn->copySrc))
       continue;
     loInsn = &insn;
+    diag.nearestDefOffset = insn.offset;
     loIndex = i - 1;
     break;
   }
-  if (!loInsn) {
-    reason = "local-callee-saved-init-not-found";
-    return false;
-  }
+  if (!loInsn)
+    return fail("local-callee-saved-init-not-found");
 
   auto loRel = relocTargets.find(loInsn->offset);
   if (!loInsn->addi || loInsn->rd != copyInsn->copySrc ||
-      loRel == relocTargets.end() || !loRel->second.absLoI) {
-    reason = "local-callee-saved-nearest-def-not-constant";
-    return false;
-  }
-  if (loIndex == 0) {
-    reason = "local-callee-saved-nearest-def-not-constant";
-    return false;
-  }
+      loRel == relocTargets.end() || !loRel->second.absLoI)
+    return fail("local-callee-saved-nearest-def-not-constant");
+  if (loIndex == 0)
+    return fail("local-callee-saved-nearest-def-not-constant");
   hiInsn = &decoded.instructions[loIndex - 1];
+  diag.hiOffset = hiInsn->offset;
+  diag.loOffset = loInsn->offset;
   auto hiRel = relocTargets.find(hiInsn->offset);
   if (hiInsn->offset + hiInsn->size != loInsn->offset ||
       !hiInsn->supported || !hiInsn->lui ||
       !riscvLibcInsnWritesReg(*hiInsn, loInsn->rs1) ||
       hiRel == relocTargets.end() || !hiRel->second.absHi ||
       hiRel->second.sym != loRel->second.sym ||
-      hiRel->second.addend != loRel->second.addend) {
-    reason = "local-callee-saved-nearest-def-not-constant";
-    return false;
-  }
+      hiRel->second.addend != loRel->second.addend)
+    return fail("local-callee-saved-nearest-def-not-constant");
   if (!targetRISCVLibcCString(*loRel->second.sym, loRel->second.addend,
-                              format)) {
-    reason = "local-callee-saved-target-not-string";
-    return false;
-  }
+                              format))
+    return fail("local-callee-saved-target-not-string");
 
   uint64_t initStart = hiInsn->offset;
   uint64_t initComplete = loInsn->offset;
   uint64_t copyOffset = copyInsn->offset;
+  diag.initStart = initStart;
+  diag.initComplete = initComplete;
 
   if (hasRISCVLibcExternalEntryToProtectedInterval(
-          sec, controlFlowRelocs, initStart, copyOffset)) {
-    reason = "local-callee-saved-external-entry";
-    return false;
-  }
+          sec, controlFlowRelocs, initStart, copyOffset, &diag))
+    return fail("local-callee-saved-external-entry");
 
   for (const RISCVLibcInsn &insn : decoded.instructions) {
     if (insn.offset <= initComplete)
       continue;
     if (insn.offset >= copyOffset)
       break;
-    if (!insn.supported) {
-      reason = "unsupported-instruction";
-      return false;
-    }
-    if (riscvLibcInsnWritesReg(insn, copyInsn->copySrc)) {
-      reason = "local-callee-saved-clobbered";
-      return false;
-    }
+    if (!insn.supported)
+      return fail("unsupported-instruction");
+    if (riscvLibcInsnWritesReg(insn, copyInsn->copySrc))
+      return fail("local-callee-saved-clobbered");
     if (!insn.controlFlow)
       continue;
     if (isRISCVLibcNormalDirectCall(controlFlowRelocs, insn))
@@ -5715,8 +5746,8 @@ static bool proveRISCVLibcLocalDominatingCalleeSavedConst(
     const RISCVLibcControlFlowRelocInfo *target =
         getRISCVLibcDirectBranchTarget(controlFlowRelocs, insn);
     if (!target || !target->hasTarget) {
-      reason = "local-callee-saved-unknown-control-flow";
-      return false;
+      diag.unknownControlFlowOffset = insn.offset;
+      return fail("local-callee-saved-unknown-control-flow");
     }
   }
 
@@ -5731,15 +5762,15 @@ static bool proveRISCVLibcLocalDominatingCalleeSavedConst(
         getRISCVLibcDirectBranchTarget(controlFlowRelocs, insn);
     if (!target) {
       if (insn.offset > initComplete && insn.offset < copyOffset) {
-        reason = "local-callee-saved-unknown-control-flow";
-        return false;
+        diag.unknownControlFlowOffset = insn.offset;
+        return fail("local-callee-saved-unknown-control-flow");
       }
       continue;
     }
     if (!target->hasTarget) {
       if (insn.offset > initComplete && insn.offset < copyOffset) {
-        reason = "local-callee-saved-unknown-control-flow";
-        return false;
+        diag.unknownControlFlowOffset = insn.offset;
+        return fail("local-callee-saved-unknown-control-flow");
       }
       continue;
     }
@@ -5747,13 +5778,15 @@ static bool proveRISCVLibcLocalDominatingCalleeSavedConst(
       continue;
     if (target->targetOffset > initStart && target->targetOffset <= copyOffset &&
         (insn.offset <= initStart || insn.offset > copyOffset)) {
-      reason = "local-callee-saved-external-entry";
-      return false;
+      diag.externalEntrySource = insn.offset;
+      diag.externalEntryTarget = target->targetOffset;
+      return fail("local-callee-saved-external-entry");
     }
   }
   proof = (Twine("LOCAL_DOMINATING_CALLEE_SAVED_CONST_") +
            riscvLibcSRegName(copyInsn->copySrc))
               .str();
+  diag.reason = "accepted";
   return true;
 }
 
@@ -5765,7 +5798,9 @@ static bool proveRISCVLibcCallsiteFormat(
     DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
         &controlFlowRelocs,
     RISCVLibcCandidateFormat &format, std::string &proof, std::string &reason,
-    std::string &entryReason, std::string &entryDetail) {
+    std::string &entryReason, std::string &entryDetail,
+    std::string &localDominatingReason,
+    std::string &localDominatingDetail) {
   if (argReg < 0) {
     reason = "unsupported-printf-family-target";
     return false;
@@ -5799,10 +5834,15 @@ static bool proveRISCVLibcCallsiteFormat(
   entryReason = entryDiag.reason;
   entryDetail = formatRISCVLibcEntryCalleeSavedDiag(entryDiag);
 
+  RISCVLibcLocalDominatingDiag localDiag;
   if (proveRISCVLibcLocalDominatingCalleeSavedConst<ELFT>(
           sec, argReg, insns, decoded, relocTargets, controlFlowRelocs, format,
-          proof, reason))
+          proof, localDominatingReason, localDiag)) {
+    localDominatingDetail = formatRISCVLibcLocalDominatingDiag(localDiag);
     return true;
+  }
+  localDominatingReason = localDiag.reason;
+  localDominatingDetail = formatRISCVLibcLocalDominatingDiag(localDiag);
 
   for (size_t i = insns.size(); i > 0; --i) {
     const RISCVLibcInsn &def = insns[i - 1];
@@ -6096,7 +6136,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
                   sec, decoded, rel.r_offset, argReg, relocTargets,
                   controlFlowRelocs, call.provenFormat, call.proof, call.reason,
                   call.entryCalleeSavedReason,
-                  call.entryCalleeSavedDetail)) {
+                  call.entryCalleeSavedDetail, call.localDominatingReason,
+                  call.localDominatingDetail)) {
             call.formatClass = RISCVLibcFormatClass::ProvenConstant;
           } else if (!call.candidateFormats.empty()) {
             call.formatClass = RISCVLibcFormatClass::CandidateConstant;
@@ -6185,6 +6226,19 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t provenDirectAbsFormatArgs = 0;
   uint32_t provenEntryCalleeSavedFormats = 0;
   uint32_t provenLocalDominatingCalleeSavedFormats = 0;
+  uint32_t localDominatingAttempts = 0;
+  uint32_t localDominatingFailFinalCopy = 0;
+  uint32_t localDominatingFailInitNotFound = 0;
+  uint32_t localDominatingFailIntermediateCall = 0;
+  uint32_t localDominatingFailControlFlowBoundary = 0;
+  uint32_t localDominatingFailFormatRegisterClobbered = 0;
+  uint32_t localDominatingFailNearestDef = 0;
+  uint32_t localDominatingFailTargetNotString = 0;
+  uint32_t localDominatingFailClobbered = 0;
+  uint32_t localDominatingFailExternalEntry = 0;
+  uint32_t localDominatingFailUnknownControlFlow = 0;
+  uint32_t localDominatingFailUnsupported = 0;
+  uint32_t localDominatingFailOther = 0;
   bool candidateFloatFormatSeen = false, candidateLongDoubleFormatSeen = false;
   for (RISCVLibcPrintfCall &call : printfCalls) {
     printfCallers.insert(call.caller);
@@ -6193,6 +6247,42 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       continue;
     }
     ++userPrintfCalls;
+    if (!call.localDominatingReason.empty())
+      ++localDominatingAttempts;
+    if (!call.localDominatingReason.empty() &&
+        call.localDominatingReason != "accepted") {
+      if (call.localDominatingReason ==
+          "local-callee-saved-final-copy-not-found")
+        ++localDominatingFailFinalCopy;
+      else if (call.localDominatingReason ==
+               "local-callee-saved-init-not-found")
+        ++localDominatingFailInitNotFound;
+      else if (call.localDominatingReason == "intermediate-call")
+        ++localDominatingFailIntermediateCall;
+      else if (call.localDominatingReason == "control-flow-boundary")
+        ++localDominatingFailControlFlowBoundary;
+      else if (call.localDominatingReason == "format-register-clobbered")
+        ++localDominatingFailFormatRegisterClobbered;
+      else if (call.localDominatingReason ==
+               "local-callee-saved-nearest-def-not-constant")
+        ++localDominatingFailNearestDef;
+      else if (call.localDominatingReason ==
+               "local-callee-saved-target-not-string")
+        ++localDominatingFailTargetNotString;
+      else if (call.localDominatingReason ==
+               "local-callee-saved-clobbered")
+        ++localDominatingFailClobbered;
+      else if (call.localDominatingReason ==
+               "local-callee-saved-external-entry")
+        ++localDominatingFailExternalEntry;
+      else if (call.localDominatingReason ==
+               "local-callee-saved-unknown-control-flow")
+        ++localDominatingFailUnknownControlFlow;
+      else if (call.localDominatingReason == "unsupported-instruction")
+        ++localDominatingFailUnsupported;
+      else
+        ++localDominatingFailOther;
+    }
     if (call.formatClass == RISCVLibcFormatClass::ProvenConstant) {
       ++provenFormats;
       ++provenUserFormats;
@@ -6325,6 +6415,11 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
               call.entryCalleeSavedReason);
     if (!call.entryCalleeSavedDetail.empty())
       message(Twine("    ") + call.entryCalleeSavedDetail);
+    if (!call.localDominatingReason.empty())
+      message(Twine("    local_dominating_reason=") +
+              call.localDominatingReason);
+    if (!call.localDominatingDetail.empty())
+      message(Twine("    ") + call.localDominatingDetail);
     if (shouldDumpContext) {
       RISCVLibcFunctionDecode &decoded = getRISCVLibcFunctionDecodeCached(
           *call.sourceSection, *call.caller, decodeCache, perfStats);
@@ -6363,6 +6458,34 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(provenEntryCalleeSavedFormats));
   message(Twine("  proven_local_dominating_callee_saved_formats=") +
           Twine(provenLocalDominatingCalleeSavedFormats));
+  message(Twine("  local_dominating_attempts=") +
+          Twine(localDominatingAttempts));
+  message(Twine("  local_dominating_successes=") +
+          Twine(provenLocalDominatingCalleeSavedFormats));
+  message(Twine("  local_dominating_fail_final_copy=") +
+          Twine(localDominatingFailFinalCopy));
+  message(Twine("  local_dominating_fail_init_not_found=") +
+          Twine(localDominatingFailInitNotFound));
+  message(Twine("  local_dominating_fail_intermediate_call=") +
+          Twine(localDominatingFailIntermediateCall));
+  message(Twine("  local_dominating_fail_control_flow_boundary=") +
+          Twine(localDominatingFailControlFlowBoundary));
+  message(Twine("  local_dominating_fail_format_register_clobbered=") +
+          Twine(localDominatingFailFormatRegisterClobbered));
+  message(Twine("  local_dominating_fail_nearest_def=") +
+          Twine(localDominatingFailNearestDef));
+  message(Twine("  local_dominating_fail_target_not_string=") +
+          Twine(localDominatingFailTargetNotString));
+  message(Twine("  local_dominating_fail_clobbered=") +
+          Twine(localDominatingFailClobbered));
+  message(Twine("  local_dominating_fail_external_entry=") +
+          Twine(localDominatingFailExternalEntry));
+  message(Twine("  local_dominating_fail_unknown_control_flow=") +
+          Twine(localDominatingFailUnknownControlFlow));
+  message(Twine("  local_dominating_fail_unsupported=") +
+          Twine(localDominatingFailUnsupported));
+  message(Twine("  local_dominating_fail_other=") +
+          Twine(localDominatingFailOther));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
   message(Twine("  candidate_float_format_seen=") +
