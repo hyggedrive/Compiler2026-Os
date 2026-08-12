@@ -4428,6 +4428,9 @@ struct RISCVLibcEntryCalleeSavedDiag {
   uint64_t firstControlFlowOffset = std::numeric_limits<uint64_t>::max();
   std::string firstControlFlowKind = "none";
   std::string firstControlFlowRelocs = "none";
+  uint32_t firstControlFlowRaw = 0;
+  int firstControlFlowQuadrant = -1;
+  int firstControlFlowFunct3 = -1;
   uint64_t candidateHi = std::numeric_limits<uint64_t>::max();
   uint64_t candidateLo = std::numeric_limits<uint64_t>::max();
   int candidateDst = -1;
@@ -4567,63 +4570,57 @@ static bool readRISCVLibcInsn(ArrayRef<uint8_t> data, uint64_t off,
   if ((half & 3) != 3) {
     insn.size = 2;
     insn.supported = false;
-    uint16_t op = half & 3;
+    uint16_t quadrant = half & 3;
     uint16_t funct3 = (half >> 13) & 7;
-    switch (funct3) {
+    switch (quadrant) {
     case 0:
-      if (op == 0) { // C.ADDI4SPN.
+      switch (funct3) {
+      case 0: // C.ADDI4SPN.
         insn.rd = 8 + ((half >> 2) & 7);
         insn.writesRd = true;
         insn.supported = true;
-      } else if (op == 1) { // C.ADDI.
+        break;
+      case 2: // C.LW.
+        insn.rd = 8 + ((half >> 2) & 7);
+        insn.writesRd = true;
+        insn.supported = true;
+        break;
+      case 6: // C.SW.
+        insn.rs1 = 8 + ((half >> 7) & 7);
+        insn.rs2 = 8 + ((half >> 2) & 7);
+        insn.supported = true;
+        break;
+      default:
+        break;
+      }
+      break;
+    case 1:
+      switch (funct3) {
+      case 0: // C.ADDI.
         insn.rd = (half >> 7) & 0x1f;
         insn.rs1 = insn.rd;
         insn.addi = true;
         insn.writesRd = insn.rd != 0;
         insn.supported = true;
-      } else if (op == 2) { // C.SLLI.
-        insn.rd = (half >> 7) & 0x1f;
-        insn.rs1 = insn.rd;
-        insn.writesRd = insn.rd != 0;
+        break;
+      case 1: // C.JAL on RV32.
+      case 5: // C.J.
+        insn.controlFlow = true;
+        insn.call = funct3 == 1;
         insn.supported = true;
-      }
-      break;
-    case 1: // C.JAL on RV32.
-    case 5: // C.J.
-      insn.controlFlow = true;
-      insn.call = funct3 == 1;
-      insn.supported = true;
-      break;
-    case 6: // C.BEQZ.
-    case 7: // C.BNEZ.
-      insn.controlFlow = true;
-      insn.supported = true;
-      break;
-    case 2: // C.LI.
-      if (op == 0) { // C.LW.
-        insn.rd = 8 + ((half >> 2) & 7);
-        insn.writesRd = true;
-        insn.supported = true;
-      } else if (op == 1) {
+        break;
+      case 2: // C.LI.
         insn.rd = (half >> 7) & 0x1f;
         insn.writesRd = insn.rd != 0;
         insn.supported = true;
-      } else if (op == 2) { // C.LWSP.
-        insn.rd = (half >> 7) & 0x1f;
-        insn.writesRd = insn.rd != 0;
-        insn.supported = true;
-      }
-      break;
-    case 3: // C.LUI / C.ADDI16SP.
-      if (op == 1) {
+        break;
+      case 3: // C.LUI / C.ADDI16SP.
         insn.rd = (half >> 7) & 0x1f;
         insn.lui = insn.rd != 0 && insn.rd != 2;
         insn.writesRd = insn.rd != 0;
         insn.supported = true;
-      }
-      break;
-    case 4:
-      if (op == 1) {
+        break;
+      case 4:
         if (((half >> 10) & 3) == 0) { // C.SRLI.
           insn.rd = 8 + ((half >> 7) & 7);
           insn.rs1 = insn.rd;
@@ -4646,7 +4643,34 @@ static bool readRISCVLibcInsn(ArrayRef<uint8_t> data, uint64_t off,
           insn.writesRd = true;
           insn.supported = true;
         }
-      } else if (op == 2) {
+        break;
+      case 6: // C.BEQZ.
+      case 7: // C.BNEZ.
+        insn.controlFlow = true;
+        insn.supported = true;
+        break;
+      default:
+        break;
+      }
+      break;
+    case 2:
+      switch (funct3) {
+      case 0: // C.SLLI.
+        insn.rd = (half >> 7) & 0x1f;
+        insn.rs1 = insn.rd;
+        insn.writesRd = insn.rd != 0;
+        insn.supported = true;
+        break;
+      case 2: // C.LWSP.
+        insn.rd = (half >> 7) & 0x1f;
+        insn.writesRd = insn.rd != 0;
+        insn.supported = true;
+        break;
+      case 6: // C.SWSP.
+        insn.rs2 = (half >> 2) & 0x1f;
+        insn.supported = true;
+        break;
+      case 4: {
         insn.rd = (half >> 7) & 0x1f;
         insn.rs2 = (half >> 2) & 0x1f;
         bool bit12 = half & 0x1000;
@@ -4665,6 +4689,10 @@ static bool readRISCVLibcInsn(ArrayRef<uint8_t> data, uint64_t off,
           insn.copySrc = insn.copy ? insn.rs2 : -1;
           insn.supported = true;
         }
+        break;
+      }
+      default:
+        break;
       }
       break;
     default:
@@ -5086,6 +5114,11 @@ static bool proveRISCVLibcEntryCalleeSavedFormat(
       diag.firstControlFlowKind = riscvLibcInsnKind(insn).str();
       diag.firstControlFlowRelocs =
           summarizeRISCVLibcRelocsAt<ELFT>(sec, insn.offset);
+      diag.firstControlFlowRaw = insn.raw;
+      if (insn.size == 2) {
+        diag.firstControlFlowQuadrant = insn.raw & 0x3;
+        diag.firstControlFlowFunct3 = (insn.raw >> 13) & 0x7;
+      }
       break;
     }
   }
@@ -5196,6 +5229,17 @@ formatRISCVLibcEntryCalleeSavedDiag(const RISCVLibcEntryCalleeSavedDiag &d) {
           " entry_first_control_flow_offset=" +
           hexOffsetOrNone(d.firstControlFlowOffset) +
           " entry_first_control_flow_kind=" + d.firstControlFlowKind +
+          " entry_first_control_flow_raw=" +
+          (d.firstControlFlowOffset == std::numeric_limits<uint64_t>::max()
+               ? std::string("none")
+               : hexOffset(d.firstControlFlowRaw)) +
+          " entry_first_control_flow_quadrant=" +
+          (d.firstControlFlowQuadrant < 0
+               ? std::string("none")
+               : Twine(d.firstControlFlowQuadrant).str()) +
+          " entry_first_control_flow_funct3=" +
+          (d.firstControlFlowFunct3 < 0 ? std::string("none")
+                                        : Twine(d.firstControlFlowFunct3).str()) +
           " entry_first_control_flow_relocs=" + d.firstControlFlowRelocs +
           " entry_copy_offset=" + hexOffsetOrNone(d.copyOffset) +
           " entry_copy_src=" + riscvLibcXRegName(d.copySrc) +
