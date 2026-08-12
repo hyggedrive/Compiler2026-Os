@@ -5520,6 +5520,20 @@ struct RISCVLibcStackSlotCFGAudit {
   std::string reason = "none";
 };
 
+struct RISCVLibcStackSlotConstCandidate {
+  const RISCVLibcInsn *load = nullptr;
+  const RISCVLibcInsn *store = nullptr;
+  size_t loadIndex = 0;
+  size_t storeIndex = 0;
+  RISCVLibcRegDefDiag defDiag;
+  RISCVLibcStackSlotCFGAudit cfgAudit;
+};
+
+template <class ELFT>
+static RISCVLibcRegDefDiag classifyRISCVLibcRegDef(
+    InputSectionBase &sec, ArrayRef<RISCVLibcInsn> allInsns,
+    size_t beforeIndex, int reg);
+
 static RISCVLibcStackSlotCFGAudit auditRISCVLibcStackSlotCFG(
     InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
     ArrayRef<RISCVLibcInsn> allInsns, size_t storeIndex, size_t loadIndex,
@@ -5676,6 +5690,62 @@ static RISCVLibcStackSlotCFGAudit auditRISCVLibcStackSlotCFG(
 }
 
 template <class ELFT>
+static bool findRISCVLibcStackSlotConstCandidate(
+    InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
+    ArrayRef<RISCVLibcInsn> allInsns, int formatReg,
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &controlFlowRelocs,
+    RISCVLibcStackSlotConstCandidate &candidate, std::string &reason) {
+  const RISCVLibcInsn *load = nullptr;
+  size_t loadIndex = 0;
+  for (size_t i = allInsns.size(); i > 0; --i) {
+    const RISCVLibcInsn &insn = allInsns[i - 1];
+    if (!riscvLibcInsnWritesReg(insn, formatReg))
+      continue;
+    if ((insn.stackMemKind == RISCVLibcStackMemKind::CLWSP ||
+         insn.stackMemKind == RISCVLibcStackMemKind::LW) &&
+        insn.rs1 == 2) {
+      load = &insn;
+      loadIndex = i - 1;
+    }
+    break;
+  }
+  if (!load) {
+    reason = "stack-slot-load-not-found";
+    return false;
+  }
+
+  const RISCVLibcInsn *nearestStore = nullptr;
+  size_t nearestStoreIndex = 0;
+  for (size_t i = loadIndex; i > 0; --i) {
+    const RISCVLibcInsn &store = allInsns[i - 1];
+    if (store.stackOffset != load->stackOffset ||
+        (store.stackMemKind != RISCVLibcStackMemKind::CSWSP &&
+         store.stackMemKind != RISCVLibcStackMemKind::SW))
+      continue;
+    nearestStore = &store;
+    nearestStoreIndex = i - 1;
+    break;
+  }
+  if (!nearestStore) {
+    reason = "nearest-store-not-found";
+    return false;
+  }
+
+  candidate.load = load;
+  candidate.store = nearestStore;
+  candidate.loadIndex = loadIndex;
+  candidate.storeIndex = nearestStoreIndex;
+  candidate.defDiag = classifyRISCVLibcRegDef<ELFT>(
+      sec, allInsns, nearestStoreIndex, nearestStore->stackStoreSrc);
+  candidate.cfgAudit = auditRISCVLibcStackSlotCFG(
+      sec, decoded, allInsns, nearestStoreIndex, loadIndex, controlFlowRelocs,
+      load->stackOffset);
+  reason = "accepted";
+  return true;
+}
+
+template <class ELFT>
 static RISCVLibcRegDefDiag classifyRISCVLibcRegDef(
     InputSectionBase &sec, ArrayRef<RISCVLibcInsn> allInsns,
     size_t beforeIndex, int reg) {
@@ -5814,24 +5884,15 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
                                        reason, UINT32_MAX))
     return false;
 
-  const RISCVLibcInsn *load = nullptr;
-  size_t loadIndex = 0;
-  for (size_t i = allInsns.size(); i > 0; --i) {
-    const RISCVLibcInsn &insn = allInsns[i - 1];
-    if (!riscvLibcInsnWritesReg(insn, formatReg))
-      continue;
-    if ((insn.stackMemKind == RISCVLibcStackMemKind::CLWSP ||
-         insn.stackMemKind == RISCVLibcStackMemKind::LW) &&
-        insn.rs1 == 2) {
-      load = &insn;
-      loadIndex = i - 1;
-    }
-    break;
-  }
-  if (!load)
+  RISCVLibcStackSlotConstCandidate candidate;
+  if (!findRISCVLibcStackSlotConstCandidate<ELFT>(
+          *call.sourceSection, decoded, allInsns, formatReg, controlFlowRelocs,
+          candidate, reason))
     return false;
 
   ++recognizedLoads;
+  const RISCVLibcInsn *load = candidate.load;
+  const RISCVLibcInsn *nearestStore = candidate.store;
   uniqueOffsets.insert(load->stackOffset);
   message(Twine("  printf_stack_slot_audit caller=") +
           call.caller->getName() + " target=" + call.target->getName() +
@@ -5840,40 +5901,11 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
           " stack_offset=" + Twine(load->stackOffset) +
           " load_kind=" + riscvLibcStackMemKindToString(load->stackMemKind));
 
-  const RISCVLibcInsn *nearestStore = nullptr;
-  size_t nearestStoreIndex = 0;
-  for (size_t i = loadIndex; i > 0; --i) {
-    const RISCVLibcInsn &store = allInsns[i - 1];
-    if (store.stackOffset != load->stackOffset ||
-        (store.stackMemKind != RISCVLibcStackMemKind::CSWSP &&
-         store.stackMemKind != RISCVLibcStackMemKind::SW))
-      continue;
-    nearestStore = &store;
-    nearestStoreIndex = i - 1;
-    break;
-  }
-  if (!nearestStore) {
-    ++nearestStoreNotProven;
-    message(Twine("  printf_stack_slot_nearest_store caller=") +
-            call.caller->getName() +
-            " call_offset=" + hexOffset(call.callOffset) +
-            " load_offset=" + hexOffset(load->offset) +
-            " stack_offset=" + Twine(load->stackOffset) +
-            " store_offset=none store_kind=none store_src=none"
-            " store_src_def_kind=none copy_src=none"
-            " copy_src_is_callee_saved=0 constant_format_proven=0"
-            " format=\"none\" reason=nearest-store-not-found");
-    return true;
-  }
-
   ++nearestStoreFound;
   ++cfgCandidates;
   if (nearestStore->stackMemKind == RISCVLibcStackMemKind::CSWSP)
     ++nearestStoreIsCSWSP;
-  RISCVLibcRegDefDiag defDiag =
-      classifyRISCVLibcRegDef<ELFT>(*call.sourceSection, allInsns,
-                                    nearestStoreIndex,
-                                    nearestStore->stackStoreSrc);
+  RISCVLibcRegDefDiag defDiag = candidate.defDiag;
   if (defDiag.kind == "copy" || defDiag.kind == "copy-from-callee-saved")
     ++nearestStoreSrcCopy;
   if (defDiag.copySrcIsCalleeSaved)
@@ -5882,9 +5914,7 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
     ++nearestStoreConstFormatProven;
   else
     ++nearestStoreNotProven;
-  RISCVLibcStackSlotCFGAudit cfgAudit = auditRISCVLibcStackSlotCFG(
-      *call.sourceSection, decoded, allInsns, nearestStoreIndex, loadIndex,
-      controlFlowRelocs, load->stackOffset);
+  RISCVLibcStackSlotCFGAudit cfgAudit = candidate.cfgAudit;
   ++loopCandidates;
   if (cfgAudit.loopRecognized)
     ++loopRecognized;
@@ -6741,6 +6771,62 @@ static bool proveRISCVLibcLoopCarriedCalleeSavedConst(
 }
 
 template <class ELFT>
+static bool proveRISCVLibcLoopCarriedStackSlotConst(
+    InputSectionBase &sec, int argReg, ArrayRef<RISCVLibcInsn> windowInsns,
+    const RISCVLibcFunctionDecode &decoded,
+    DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &controlFlowRelocs,
+    RISCVLibcCandidateFormat &format, std::string &proof,
+    std::string &reason) {
+  RISCVLibcStackSlotConstCandidate candidate;
+  if (!findRISCVLibcStackSlotConstCandidate<ELFT>(
+          sec, decoded, windowInsns, argReg, controlFlowRelocs, candidate,
+          reason))
+    return false;
+  if (!candidate.defDiag.constantFormatProven) {
+    reason = candidate.defDiag.reason.empty() ? "stack-slot-source-not-constant"
+                                              : candidate.defDiag.reason;
+    return false;
+  }
+  RISCVLibcCandidateFormat proven;
+  proven.text = candidate.defDiag.format;
+  scanPrintfFormat(proven.text, proven.hasFloat, proven.hasLongDouble);
+  if (proven.hasFloat || proven.hasLongDouble) {
+    reason = "stack-slot-format-has-float";
+    return false;
+  }
+  const RISCVLibcStackSlotCFGAudit &cfg = candidate.cfgAudit;
+  if (!cfg.loopRecognized) {
+    reason = "stack-slot-loop-not-recognized";
+    return false;
+  }
+  if (!cfg.initialEntrySafe) {
+    reason = "stack-slot-initial-entry-unsafe";
+    return false;
+  }
+  if (cfg.sameSlotClobber) {
+    reason = "stack-slot-clobbered";
+    return false;
+  }
+  if (cfg.spModified) {
+    reason = "stack-pointer-modified";
+    return false;
+  }
+  if (cfg.unknownControlFlow) {
+    reason = "stack-slot-unknown-control-flow";
+    return false;
+  }
+  if (!cfg.safe) {
+    reason = cfg.reason.empty() ? "stack-slot-cfg-unsafe" : cfg.reason;
+    return false;
+  }
+  format = std::move(proven);
+  proof = "LOOP_CARRIED_STACK_SLOT_CONST";
+  reason = "accepted";
+  return true;
+}
+
+template <class ELFT>
 static bool proveRISCVLibcCallsiteFormat(
     InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
     uint64_t callOff, int argReg,
@@ -6806,6 +6892,15 @@ static bool proveRISCVLibcCallsiteFormat(
     loopCarriedReason = loopDiag.reason;
     loopCarriedDetail = formatRISCVLibcLoopCarriedDiag(loopDiag);
   }
+
+  SmallVector<RISCVLibcInsn, 0> stackSlotInsns;
+  std::string stackSlotReason;
+  if (collectRISCVLibcInsnsBeforeCall(decoded, callOff, stackSlotInsns,
+                                      stackSlotReason, UINT32_MAX) &&
+      proveRISCVLibcLoopCarriedStackSlotConst<ELFT>(
+          sec, argReg, stackSlotInsns, decoded, controlFlowRelocs, format,
+          proof, reason))
+    return true;
 
   for (size_t i = insns.size(); i > 0; --i) {
     const RISCVLibcInsn &def = insns[i - 1];
@@ -7708,6 +7803,7 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t provenEntryCalleeSavedFormats = 0;
   uint32_t provenLocalDominatingCalleeSavedFormats = 0;
   uint32_t provenLoopCarriedCalleeSavedFormats = 0;
+  uint32_t provenLoopCarriedStackSlotFormats = 0;
   uint32_t localDominatingAttempts = 0;
   uint32_t localDominatingFailFinalCopy = 0;
   uint32_t localDominatingFailInitNotFound = 0;
@@ -7823,6 +7919,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       if (StringRef(call.proof).startswith(
               "LOOP_CARRIED_CALLEE_SAVED_CONST"))
         ++provenLoopCarriedCalleeSavedFormats;
+      if (call.proof == "LOOP_CARRIED_STACK_SLOT_CONST")
+        ++provenLoopCarriedStackSlotFormats;
     } else if (call.formatClass == RISCVLibcFormatClass::CandidateConstant) {
       ++candidateFormats;
       ++candidateUserFormats;
@@ -8305,6 +8403,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(provenLocalDominatingCalleeSavedFormats));
   message(Twine("  proven_loop_carried_callee_saved_formats=") +
           Twine(provenLoopCarriedCalleeSavedFormats));
+  message(Twine("  proven_loop_carried_stack_slot_formats=") +
+          Twine(provenLoopCarriedStackSlotFormats));
   message(Twine("  local_dominating_attempts=") +
           Twine(localDominatingAttempts));
   message(Twine("  local_dominating_successes=") +
