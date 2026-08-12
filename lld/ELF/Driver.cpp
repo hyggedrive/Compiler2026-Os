@@ -1373,6 +1373,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
   config->printRISCVLibcSpecializationAudit =
       args.hasArg(OPT_print_riscv_libc_specialization_audit);
+  config->riscvPrintfSpecialization =
+      args.hasArg(OPT_riscv_printf_specialization);
   config->riscvLibcSpecializationAuditDumpFailedCalls = args::getInteger(
       args, OPT_riscv_libc_specialization_audit_dump_failed_calls, 0);
   config->riscvLibcSpecializationAuditDumpCallOffsets =
@@ -4094,6 +4096,7 @@ static void printRISCVFunctionSplitDebugRelocStats(
 template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
   riscvFunctionSplitChildren.clear();
   riscvFunctionSplitRelocStorage.clear();
+  riscvRelocOverrideStorage.clear();
   if (!config->riscvFunctionSectionsSplit || config->emachine != EM_RISCV ||
       config->is64 || config->relocatable)
     return;
@@ -4558,6 +4561,14 @@ struct RISCVLibcGlobalRouteAuditStats {
   uint32_t missingProofRoutes = 0;
   uint32_t aliasRoutes = 0;
   bool gateReady = false;
+};
+
+struct RISCVPrintfSpecializationStats {
+  bool applied = false;
+  uint32_t floatCallsNopped = 0;
+  uint32_t callRelocsRemoved = 0;
+  uint32_t relaxRelocsRemoved = 0;
+  std::string fallbackReason = "none";
 };
 
 template <class RelTy> static int64_t getRISCVLibcAddend(const RelTy &rel) {
@@ -6844,8 +6855,135 @@ static RISCVLibcGlobalRouteAuditStats auditRISCVLibcGlobalRoutes(
   return stats;
 }
 
-template <class ELFT> static void printRISCVLibcPreGCSpecializationAudit() {
-  if (!config->printRISCVLibcSpecializationAudit ||
+static bool isRISCVPrintfSpecializationCallPair(ArrayRef<uint8_t> content,
+                                                uint64_t off) {
+  if (off > content.size() || content.size() - off < 8)
+    return false;
+  uint32_t auipc = llvm::support::endian::read32le(content.data() + off);
+  uint32_t jalr = llvm::support::endian::read32le(content.data() + off + 4);
+  if ((auipc & 0x7f) != 0x17)
+    return false;
+  if ((jalr & 0x7f) != 0x67)
+    return false;
+  int rd = (auipc >> 7) & 0x1f;
+  int jalrRd = (jalr >> 7) & 0x1f;
+  int rs1 = (jalr >> 15) & 0x1f;
+  int funct3 = (jalr >> 12) & 0x7;
+  int imm = static_cast<int32_t>(jalr) >> 20;
+  return rd == rs1 && isRISCVLibcLinkReg(jalrRd) && funct3 == 0 && imm == 0;
+}
+
+template <class ELFT>
+static RISCVPrintfSpecializationStats
+specializeRISCVPrintfCoreFloatCalls(InputSectionBase &sec, Defined &printfCore,
+                                    RelsOrRelas<ELFT> rels) {
+  RISCVPrintfSpecializationStats stats;
+  if (sec.kind() != SectionBase::Regular) {
+    stats.fallbackReason = "printf-core-not-regular-input-section";
+    return stats;
+  }
+  if (sec.name != ".text.printf_core") {
+    stats.fallbackReason = "printf-core-section-name-unsupported";
+    return stats;
+  }
+  if (riscvRelocOverrideStorage.contains(&sec)) {
+    stats.fallbackReason = "relocation-override-already-present";
+    return stats;
+  }
+  if (rels.areRelocsRel()) {
+    stats.fallbackReason = "rel-relocations-unsupported";
+    return stats;
+  }
+
+  using Elf_Rela = typename ELFT::Rela;
+  SmallVector<uint64_t, 0> callOffsets;
+  DenseSet<uint64_t> callOffsetSet;
+  DenseSet<uint64_t> removableRelocIndexes;
+  ArrayRef<uint8_t> content = sec.content();
+  uint64_t funcEnd = printfCore.value + printfCore.size;
+  if (printfCore.value > content.size() || funcEnd > content.size()) {
+    stats.fallbackReason = "printf-core-range-out-of-section";
+    return stats;
+  }
+
+  for (auto [i, rel] : llvm::enumerate(rels.relas)) {
+    RelType type = rel.getType(config->isMips64EL);
+    if (type != R_RISCV_CALL && type != R_RISCV_CALL_PLT)
+      continue;
+    if (rel.r_offset < printfCore.value || rel.r_offset >= funcEnd)
+      continue;
+    Symbol &targetSym = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+    Defined *target = dyn_cast<Defined>(&targetSym);
+    if (!target || !isRISCVPrintfCoreFloatHelperName(target->getName()))
+      continue;
+    if (!isRISCVPrintfSpecializationCallPair(content, rel.r_offset)) {
+      stats.fallbackReason = "unexpected-call-encoding";
+      return stats;
+    }
+    if (callOffsetSet.insert(rel.r_offset).second)
+      callOffsets.push_back(rel.r_offset);
+    removableRelocIndexes.insert(i);
+  }
+
+  if (callOffsets.empty()) {
+    stats.fallbackReason = "no-float-helper-calls";
+    return stats;
+  }
+
+  for (auto [i, rel] : llvm::enumerate(rels.relas)) {
+    bool inCallPair = false;
+    for (uint64_t off : callOffsets)
+      if (rel.r_offset >= off && rel.r_offset < off + 8) {
+        inCallPair = true;
+        break;
+      }
+    if (!inCallPair)
+      continue;
+    RelType type = rel.getType(config->isMips64EL);
+    if (callOffsetSet.contains(rel.r_offset) &&
+        (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT ||
+         type == R_RISCV_RELAX)) {
+      removableRelocIndexes.insert(i);
+      continue;
+    }
+    stats.fallbackReason = "overlapping-relocation-at-call-offset";
+    return stats;
+  }
+
+  uint8_t *newContent = makeThreadLocalN<uint8_t>(content.size());
+  llvm::copy(content, newContent);
+  for (uint64_t off : callOffsets) {
+    llvm::support::endian::write32le(newContent + off, 0x00000013);
+    llvm::support::endian::write32le(newContent + off + 4, 0x00000013);
+  }
+
+  SmallVector<Elf_Rela, 0> keptRelas;
+  keptRelas.reserve(rels.relas.size() - removableRelocIndexes.size());
+  for (auto [i, rel] : llvm::enumerate(rels.relas))
+    if (!removableRelocIndexes.contains(i))
+      keptRelas.push_back(rel);
+
+  auto *kept = makeThreadLocalN<Elf_Rela>(keptRelas.size());
+  llvm::copy(keptRelas, kept);
+  RISCVRelocOverrideStorage storage;
+  storage.relocsAreRela = true;
+  storage.relocs = kept;
+  storage.relocCount = static_cast<uint32_t>(keptRelas.size());
+  riscvRelocOverrideStorage[&sec] = storage;
+
+  sec.content_ = newContent;
+  stats.applied = true;
+  stats.floatCallsNopped = static_cast<uint32_t>(callOffsets.size());
+  stats.callRelocsRemoved = stats.floatCallsNopped;
+  stats.relaxRelocsRemoved =
+      static_cast<uint32_t>(removableRelocIndexes.size() - callOffsets.size());
+  return stats;
+}
+
+template <class ELFT>
+static void runRISCVPrintfSpecializationPreGC() {
+  if ((!config->printRISCVLibcSpecializationAudit &&
+       !config->riscvPrintfSpecialization) ||
       config->emachine != EM_RISCV)
     return;
 
@@ -6873,40 +7011,66 @@ template <class ELFT> static void printRISCVLibcPreGCSpecializationAudit() {
     if (node.sym->getName() == "printf_core")
       printfCoreRoots.push_back(i);
 
-  RISCVLibcGlobalRouteAuditStats stats =
+  RISCVLibcGlobalRouteAuditStats gate =
       auditRISCVLibcGlobalRoutes<ELFT>(
           RISCVLibcAuditReachabilityMode::PreGCConservative, nodes,
           printfCalls, printfCoreRoots, decodeCache, perfStats, false,
           "printf_pre_gc_route");
 
-  message("RISCV libc printf pre-GC specialization audit:");
-  message(Twine("  printf_pre_gc_entry_calls=") + Twine(stats.entryCalls));
-  message(Twine("  printf_pre_gc_proven_non_float_entry_calls=") +
-          Twine(stats.provenNonFloatEntryCalls));
-  message(Twine("  printf_pre_gc_unknown_entry_calls=") +
-          Twine(stats.unknownEntryCalls));
-  message(Twine("  printf_pre_gc_internal_forwarders=") +
-          Twine(stats.internalForwarders));
-  message(Twine("  printf_pre_gc_noncall_refs=") +
-          Twine(stats.nonCallRefs));
-  message(Twine("  printf_pre_gc_address_taken_refs=") +
-          Twine(stats.addressTakenRefs));
-  message(Twine("  printf_pre_gc_direct_entry_routes=") +
-          Twine(stats.directEntryRoutes));
-  message(Twine("  printf_pre_gc_matched_proof_routes=") +
-          Twine(stats.matchedProofRoutes));
-  message(Twine("  printf_pre_gc_missing_proof_routes=") +
-          Twine(stats.missingProofRoutes));
-  message(Twine("  printf_pre_gc_direct_printf_core_routes=") +
-          Twine(stats.directPrintfCoreRoutes));
-  message(Twine("  printf_pre_gc_unrecognized_printf_core_routes=") +
-          Twine(stats.unrecognizedPrintfCoreRoutes));
-  message(Twine("  printf_pre_gc_unresolved_routes=") +
-          Twine(stats.unresolvedRoutes));
-  message(Twine("  printf_pre_gc_alias_routes=") +
-          Twine(stats.aliasRoutes));
-  message(Twine("  printf_pre_gc_specialization_gate_ready=") +
-          Twine(stats.gateReady ? 1 : 0));
+  RISCVPrintfSpecializationStats transformStats;
+  if (!config->riscvPrintfSpecialization) {
+    transformStats.fallbackReason = "option-disabled";
+  } else if (!gate.gateReady) {
+    transformStats.fallbackReason = "pre-gc-gate-not-ready";
+  } else if (printfCoreRoots.size() != 1) {
+    transformStats.fallbackReason = "printf-core-not-unique";
+  } else {
+    RISCVLibcFunctionNode &node = nodes[printfCoreRoots[0]];
+    RelsOrRelas<ELFT> rels = node.section->template relsOrRelas<ELFT>();
+    transformStats =
+        specializeRISCVPrintfCoreFloatCalls<ELFT>(*node.section, *node.sym,
+                                                  rels);
+  }
+
+  if (config->printRISCVLibcSpecializationAudit ||
+      config->riscvPrintfSpecialization) {
+    message("RISCV libc printf pre-GC specialization audit:");
+    message(Twine("  printf_pre_gc_entry_calls=") + Twine(gate.entryCalls));
+    message(Twine("  printf_pre_gc_proven_non_float_entry_calls=") +
+            Twine(gate.provenNonFloatEntryCalls));
+    message(Twine("  printf_pre_gc_unknown_entry_calls=") +
+            Twine(gate.unknownEntryCalls));
+    message(Twine("  printf_pre_gc_internal_forwarders=") +
+            Twine(gate.internalForwarders));
+    message(Twine("  printf_pre_gc_noncall_refs=") + Twine(gate.nonCallRefs));
+    message(Twine("  printf_pre_gc_address_taken_refs=") +
+            Twine(gate.addressTakenRefs));
+    message(Twine("  printf_pre_gc_direct_entry_routes=") +
+            Twine(gate.directEntryRoutes));
+    message(Twine("  printf_pre_gc_matched_proof_routes=") +
+            Twine(gate.matchedProofRoutes));
+    message(Twine("  printf_pre_gc_missing_proof_routes=") +
+            Twine(gate.missingProofRoutes));
+    message(Twine("  printf_pre_gc_direct_printf_core_routes=") +
+            Twine(gate.directPrintfCoreRoutes));
+    message(Twine("  printf_pre_gc_unrecognized_printf_core_routes=") +
+            Twine(gate.unrecognizedPrintfCoreRoutes));
+    message(Twine("  printf_pre_gc_unresolved_routes=") +
+            Twine(gate.unresolvedRoutes));
+    message(Twine("  printf_pre_gc_alias_routes=") + Twine(gate.aliasRoutes));
+    message(Twine("  printf_pre_gc_specialization_gate_ready=") +
+            Twine(gate.gateReady ? 1 : 0));
+    message(Twine("  printf_specialization_applied=") +
+            Twine(transformStats.applied ? 1 : 0));
+    message(Twine("  printf_specialization_float_calls_nopped=") +
+            Twine(transformStats.floatCallsNopped));
+    message(Twine("  printf_specialization_call_relocs_removed=") +
+            Twine(transformStats.callRelocsRemoved));
+    message(Twine("  printf_specialization_relax_relocs_removed=") +
+            Twine(transformStats.relaxRelocsRemoved));
+    message(Twine("  printf_specialization_fallback_reason=") +
+            transformStats.fallbackReason);
+  }
 }
 
 template <class ELFT> static void printRISCVLibcSpecializationAudit() {
@@ -8034,7 +8198,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
 
   // Split SHF_MERGE and .eh_frame sections into pieces in preparation for garbage collection.
   invokeELFT(splitSections,);
-  invokeELFT(printRISCVLibcPreGCSpecializationAudit,);
+  invokeELFT(runRISCVPrintfSpecializationPreGC,);
 
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);

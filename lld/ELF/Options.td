@@ -383,6 +383,10 @@ def print_riscv_libc_specialization_audit: FF<"print-riscv-libc-specialization-a
   HelpText<"Print RISC-V libc/printf specialization feasibility audit">,
   Flags<[HelpHidden]>;
 
+def riscv_printf_specialization: FF<"riscv-printf-specialization">,
+  HelpText<"Enable experimental RISC-V printf specialization">,
+  Flags<[HelpHidden]>;
+
 def riscv_libc_specialization_audit_dump_failed_calls:
   JJ<"riscv-libc-specialization-audit-dump-failed-calls=">,
   HelpText<"Dump instruction/relocation context for the first N failed RISC-V libc specialization audit printf callsites">,

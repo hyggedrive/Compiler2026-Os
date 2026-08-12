@@ -35,6 +35,8 @@ using namespace lld::elf;
 
 DenseMap<const InputSectionBase *, RISCVFunctionSplitRelocStorage>
     elf::riscvFunctionSplitRelocStorage;
+DenseMap<const InputSectionBase *, RISCVRelocOverrideStorage>
+    elf::riscvRelocOverrideStorage;
 DenseMap<const InputSectionBase *, SmallVector<InputSectionBase *, 0>>
     elf::riscvFunctionSplitChildren;
 DenseSet<std::pair<const Symbol *, uint64_t>> elf::ppc64noTocRelax;
@@ -137,6 +139,20 @@ void InputSectionBase::decompress() const {
 }
 
 template <class ELFT> RelsOrRelas<ELFT> InputSectionBase::relsOrRelas() const {
+  auto overrideIt = riscvRelocOverrideStorage.find(this);
+  if (overrideIt != riscvRelocOverrideStorage.end()) {
+    const RISCVRelocOverrideStorage &storage = overrideIt->second;
+    RelsOrRelas<ELFT> ret;
+    if (storage.relocsAreRela)
+      ret.relas = ArrayRef(
+          reinterpret_cast<const typename ELFT::Rela *>(storage.relocs),
+          storage.relocCount);
+    else
+      ret.rels = ArrayRef(
+          reinterpret_cast<const typename ELFT::Rel *>(storage.relocs),
+          storage.relocCount);
+    return ret;
+  }
   auto splitIt = riscvFunctionSplitRelocStorage.find(this);
   if (splitIt != riscvFunctionSplitRelocStorage.end()) {
     const RISCVFunctionSplitRelocStorage &storage = splitIt->second;
