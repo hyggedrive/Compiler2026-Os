@@ -4498,6 +4498,31 @@ struct RISCVLibcPrintfCoreFloatRegion {
   uint32_t helperCallCount = 0;
 };
 
+enum class RISCVLibcGlobalRouteKind {
+  DirectCall,
+  InternalForwarder,
+  NonCallReference,
+  DirectPrintfCoreRoute,
+  Unresolved,
+};
+
+static StringRef
+riscvLibcGlobalRouteKindToString(RISCVLibcGlobalRouteKind kind) {
+  switch (kind) {
+  case RISCVLibcGlobalRouteKind::DirectCall:
+    return "direct-call";
+  case RISCVLibcGlobalRouteKind::InternalForwarder:
+    return "recognized-internal-forwarder";
+  case RISCVLibcGlobalRouteKind::NonCallReference:
+    return "address-taken";
+  case RISCVLibcGlobalRouteKind::DirectPrintfCoreRoute:
+    return "direct-printf-core";
+  case RISCVLibcGlobalRouteKind::Unresolved:
+    return "unresolved";
+  }
+  llvm_unreachable("unknown RISC-V libc global route kind");
+}
+
 struct RISCVLibcAuditPerfStats {
   uint32_t decodedSourceFunctions = 0;
   uint64_t decodedInstructionCount = 0;
@@ -6710,6 +6735,271 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       userPrintfCalls > 0 && provenUserFormats == userPrintfCalls &&
       unknownUserFormats == 0 && provenFloatFormats == 0 &&
       provenLongDoubleFormats == 0;
+  uint32_t printfGlobalLiveEntryCalls = 0;
+  uint32_t printfGlobalProvenNonFloatEntryCalls = 0;
+  uint32_t printfGlobalFloatEntryCalls = 0;
+  uint32_t printfGlobalUnknownEntryCalls = 0;
+  uint32_t printfGlobalInternalForwarders = 0;
+  uint32_t printfGlobalNonCallRefs = 0;
+  uint32_t printfGlobalAddressTakenRefs = 0;
+  uint32_t printfGlobalDirectPrintfCoreRoutes = 0;
+  uint32_t printfGlobalUnrecognizedPrintfCoreRoutes = 0;
+  uint32_t printfGlobalUnresolvedRoutes = 0;
+  uint32_t printfGlobalDirectEntryRoutes = 0;
+  uint32_t printfGlobalMatchedProofRoutes = 0;
+  uint32_t printfGlobalMissingProofRoutes = 0;
+  uint32_t printfGlobalAliasRoutes = 0;
+  bool allLivePrintfCoreEntriesProvenNonFloat = printfCoreRoots.size() == 1;
+  bool sawRelevantLiveRoute = false;
+
+  auto printGlobalRoute = [&](StringRef source, StringRef target,
+                              RISCVLibcGlobalRouteKind kind, StringRef format,
+                              bool safe) {
+    message(Twine("  printf_global_route source=") + source +
+            " target=" + target +
+            " kind=" + riscvLibcGlobalRouteKindToString(kind) +
+            " format=" + format + " safe=" + Twine(safe ? 1 : 0));
+  };
+
+  for (const RISCVLibcPrintfCall &call : printfCalls) {
+    sawRelevantLiveRoute = true;
+    if (call.formatClass == RISCVLibcFormatClass::InternalForwarder) {
+      ++printfGlobalInternalForwarders;
+      printGlobalRoute(call.caller->getName(), call.target->getName(),
+                       RISCVLibcGlobalRouteKind::InternalForwarder,
+                       "forwarded", true);
+      continue;
+    }
+
+    ++printfGlobalLiveEntryCalls;
+    bool provenNonFloat =
+        call.formatClass == RISCVLibcFormatClass::ProvenConstant &&
+        !call.provenFormat.hasFloat && !call.provenFormat.hasLongDouble;
+    bool provenFloat =
+        call.formatClass == RISCVLibcFormatClass::ProvenConstant &&
+        (call.provenFormat.hasFloat || call.provenFormat.hasLongDouble);
+    if (provenNonFloat) {
+      ++printfGlobalProvenNonFloatEntryCalls;
+      printGlobalRoute(call.caller->getName(), call.target->getName(),
+                       RISCVLibcGlobalRouteKind::DirectCall,
+                       "proven-non-float", true);
+    } else {
+      allLivePrintfCoreEntriesProvenNonFloat = false;
+      if (provenFloat) {
+        ++printfGlobalFloatEntryCalls;
+        printGlobalRoute(call.caller->getName(), call.target->getName(),
+                         RISCVLibcGlobalRouteKind::DirectCall,
+                         call.provenFormat.hasLongDouble
+                             ? StringRef("proven-long-double")
+                             : StringRef("proven-float"),
+                         false);
+      } else {
+        ++printfGlobalUnknownEntryCalls;
+        printGlobalRoute(call.caller->getName(), call.target->getName(),
+                         RISCVLibcGlobalRouteKind::DirectCall, "unknown",
+                         false);
+      }
+    }
+  }
+
+  DenseSet<Defined *> printfCoreSyms;
+  for (unsigned idx : printfCoreRoots)
+    printfCoreSyms.insert(nodes[idx].sym);
+
+  std::map<std::tuple<InputSectionBase *, Defined *, uint64_t, Defined *>,
+           const RISCVLibcPrintfCall *>
+      printfCallProofs;
+  for (const RISCVLibcPrintfCall &call : printfCalls)
+    printfCallProofs[{call.sourceSection, call.caller, call.callOffset,
+                      call.target}] = &call;
+
+  auto sameFunctionEntry = [](Defined *a, Defined *b) {
+    if (!a || !b || a->type != STT_FUNC || b->type != STT_FUNC)
+      return false;
+    return a->section == b->section && a->value == b->value;
+  };
+
+  auto canonicalPrintfFamilyTarget = [&](Defined *target) -> Defined * {
+    if (!target || target->type != STT_FUNC)
+      return nullptr;
+    if (isPrintfFamilyName(target->getName()))
+      return target;
+    for (const RISCVLibcPrintfCall &call : printfCalls)
+      if (sameFunctionEntry(target, call.target))
+        return call.target;
+    return nullptr;
+  };
+
+  auto canonicalPrintfCoreTarget = [&](Defined *target) -> Defined * {
+    if (!target || target->type != STT_FUNC)
+      return nullptr;
+    for (Defined *core : printfCoreSyms)
+      if (sameFunctionEntry(target, core))
+        return core;
+    return nullptr;
+  };
+
+  auto isRecognizedPrintfCoreInternalRoute = [&](Defined *source,
+                                                Defined *target) {
+    if (!source || !target)
+      return false;
+    if (!canonicalPrintfCoreTarget(target))
+      return false;
+    return llvm::any_of(printfCalls, [&](const RISCVLibcPrintfCall &call) {
+      return call.formatClass == RISCVLibcFormatClass::InternalForwarder &&
+             sameFunctionEntry(source, call.target);
+    });
+  };
+
+  auto findProof = [&](InputSectionBase *sec, Defined *sourceFunc,
+                       uint64_t offset, Defined *target) {
+    auto it = printfCallProofs.find({sec, sourceFunc, offset, target});
+    if (it != printfCallProofs.end())
+      return it->second;
+    for (const auto &entry : printfCallProofs)
+      if (std::get<0>(entry.first) == sec &&
+          std::get<1>(entry.first) == sourceFunc &&
+          std::get<2>(entry.first) == offset &&
+          sameFunctionEntry(std::get<3>(entry.first), target))
+        return entry.second;
+    return static_cast<const RISCVLibcPrintfCall *>(nullptr);
+  };
+
+  auto isDirectControlTransfer = [&](InputSectionBase &sec, Defined *sourceFunc,
+                                     uint64_t offset, RelType type) {
+    if (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT)
+      return true;
+    if (type != R_RISCV_JAL && type != R_RISCV_RVC_JUMP)
+      return false;
+    if (!sourceFunc)
+      return false;
+    RISCVLibcFunctionDecode &decoded =
+        getRISCVLibcFunctionDecodeCached(sec, *sourceFunc, decodeCache,
+                                         perfStats);
+    const RISCVLibcInsn *insn = getRISCVLibcInsnAt(decoded, offset);
+    return insn && insn->controlFlow;
+  };
+
+  for (InputSectionBase *sec : ctx.inputSections) {
+    if (!sec || sec == &InputSection::discarded || !sec->isLive() || !sec->file)
+      continue;
+    if (!(sec->flags & SHF_ALLOC))
+      continue;
+    RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
+    auto scanGlobalRoutes = [&](auto rels) {
+      for (const auto &rel : rels) {
+        Symbol &targetSym = sec->getFile<ELFT>()->getRelocTargetSym(rel);
+        StringRef targetName = targetSym.getName();
+        Defined *target = dyn_cast<Defined>(&targetSym);
+        bool nameIsPrintfFamily = isPrintfFamilyName(targetName);
+        bool nameIsPrintfCore = targetName == "printf_core";
+        if (!target) {
+          if (!nameIsPrintfFamily && !nameIsPrintfCore)
+            continue;
+          sawRelevantLiveRoute = true;
+          ++printfGlobalUnresolvedRoutes;
+          allLivePrintfCoreEntriesProvenNonFloat = false;
+          Defined *sourceFunc = nullptr;
+          if (sec->flags & SHF_EXECINSTR)
+            sourceFunc = sec->getEnclosingFunction(rel.r_offset);
+          std::string sourceName =
+              sourceFunc ? sourceFunc->getName().str() : sec->name.str();
+          printGlobalRoute(sourceName, targetName,
+                           RISCVLibcGlobalRouteKind::Unresolved,
+                           "unresolved-symbol", false);
+          continue;
+        }
+        Defined *printfFamilyTarget = canonicalPrintfFamilyTarget(target);
+        Defined *printfCoreTarget = canonicalPrintfCoreTarget(target);
+        bool targetIsPrintfFamily = printfFamilyTarget != nullptr;
+        bool targetIsPrintfCore = printfCoreTarget != nullptr;
+        if (!targetIsPrintfFamily && !targetIsPrintfCore)
+          continue;
+        if ((targetIsPrintfFamily && printfFamilyTarget != target) ||
+            (targetIsPrintfCore && printfCoreTarget != target))
+          ++printfGlobalAliasRoutes;
+
+        RelType type = rel.getType(config->isMips64EL);
+        Defined *sourceFunc = nullptr;
+        if (sec->flags & SHF_EXECINSTR)
+          sourceFunc = sec->getEnclosingFunction(rel.r_offset);
+        std::string sourceName =
+            sourceFunc ? sourceFunc->getName().str() : sec->name.str();
+        bool isDirectTransfer =
+            isDirectControlTransfer(*sec, sourceFunc, rel.r_offset, type);
+        bool isPotentialDirectTransfer =
+            type == R_RISCV_CALL || type == R_RISCV_CALL_PLT ||
+            type == R_RISCV_JAL || type == R_RISCV_RVC_JUMP;
+
+        if (targetIsPrintfCore) {
+          sawRelevantLiveRoute = true;
+          ++printfGlobalDirectPrintfCoreRoutes;
+          if (isDirectTransfer &&
+              isRecognizedPrintfCoreInternalRoute(sourceFunc, printfCoreTarget)) {
+            printGlobalRoute(sourceName, printfCoreTarget->getName(),
+                             RISCVLibcGlobalRouteKind::DirectPrintfCoreRoute,
+                             "recognized-internal", true);
+          } else {
+            ++printfGlobalUnrecognizedPrintfCoreRoutes;
+            allLivePrintfCoreEntriesProvenNonFloat = false;
+            printGlobalRoute(sourceName, printfCoreTarget->getName(),
+                             isPotentialDirectTransfer
+                                 ? RISCVLibcGlobalRouteKind::DirectPrintfCoreRoute
+                                 : RISCVLibcGlobalRouteKind::NonCallReference,
+                             isPotentialDirectTransfer
+                                 ? StringRef("unrecognized")
+                                 : StringRef("address-taken"),
+                             false);
+          }
+          continue;
+        }
+
+        if (isPotentialDirectTransfer) {
+          sawRelevantLiveRoute = true;
+          ++printfGlobalDirectEntryRoutes;
+          if (!isDirectTransfer) {
+            ++printfGlobalUnresolvedRoutes;
+            ++printfGlobalMissingProofRoutes;
+            allLivePrintfCoreEntriesProvenNonFloat = false;
+            printGlobalRoute(sourceName, printfFamilyTarget->getName(),
+                             RISCVLibcGlobalRouteKind::Unresolved,
+                             "unresolved-control-transfer", false);
+            continue;
+          }
+          const RISCVLibcPrintfCall *proof =
+              findProof(sec, sourceFunc, rel.r_offset, printfFamilyTarget);
+          if (!proof) {
+            ++printfGlobalMissingProofRoutes;
+            allLivePrintfCoreEntriesProvenNonFloat = false;
+            printGlobalRoute(sourceName, printfFamilyTarget->getName(),
+                             RISCVLibcGlobalRouteKind::DirectCall,
+                             "missing-proof-record", false);
+          } else {
+            ++printfGlobalMatchedProofRoutes;
+          }
+          continue;
+        }
+
+        if (!isDirectTransfer) {
+          sawRelevantLiveRoute = true;
+          ++printfGlobalNonCallRefs;
+          ++printfGlobalAddressTakenRefs;
+          allLivePrintfCoreEntriesProvenNonFloat = false;
+          printGlobalRoute(sourceName, printfFamilyTarget->getName(),
+                           RISCVLibcGlobalRouteKind::NonCallReference,
+                           "address-taken", false);
+        }
+      }
+    };
+    scanGlobalRoutes(rels.rels);
+    scanGlobalRoutes(rels.relas);
+  }
+
+  if (!sawRelevantLiveRoute) {
+    ++printfGlobalUnresolvedRoutes;
+    allLivePrintfCoreEntriesProvenNonFloat = false;
+  }
+
   SmallVector<RISCVLibcPrintfCoreFloatCall, 0> printfCoreFloatCalls;
   DenseSet<Defined *> printfCoreFloatHelpers;
   SmallVector<RISCVLibcPrintfCoreFloatRegion, 0> printfCoreFloatRegions;
@@ -7189,6 +7479,36 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
   message(Twine("  printf_specialization_gate_ready=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
+  message(Twine("  printf_global_live_entry_calls=") +
+          Twine(printfGlobalLiveEntryCalls));
+  message(Twine("  printf_global_proven_non_float_entry_calls=") +
+          Twine(printfGlobalProvenNonFloatEntryCalls));
+  message(Twine("  printf_global_float_entry_calls=") +
+          Twine(printfGlobalFloatEntryCalls));
+  message(Twine("  printf_global_unknown_entry_calls=") +
+          Twine(printfGlobalUnknownEntryCalls));
+  message(Twine("  printf_global_internal_forwarders=") +
+          Twine(printfGlobalInternalForwarders));
+  message(Twine("  printf_global_noncall_refs=") +
+          Twine(printfGlobalNonCallRefs));
+  message(Twine("  printf_global_address_taken_refs=") +
+          Twine(printfGlobalAddressTakenRefs));
+  message(Twine("  printf_global_direct_printf_core_routes=") +
+          Twine(printfGlobalDirectPrintfCoreRoutes));
+  message(Twine("  printf_global_unrecognized_printf_core_routes=") +
+          Twine(printfGlobalUnrecognizedPrintfCoreRoutes));
+  message(Twine("  printf_global_unresolved_routes=") +
+          Twine(printfGlobalUnresolvedRoutes));
+  message(Twine("  printf_global_direct_entry_routes=") +
+          Twine(printfGlobalDirectEntryRoutes));
+  message(Twine("  printf_global_matched_proof_routes=") +
+          Twine(printfGlobalMatchedProofRoutes));
+  message(Twine("  printf_global_missing_proof_routes=") +
+          Twine(printfGlobalMissingProofRoutes));
+  message(Twine("  printf_global_alias_routes=") +
+          Twine(printfGlobalAliasRoutes));
+  message(Twine("  all_live_printf_core_entries_proven_non_float=") +
+          Twine(allLivePrintfCoreEntriesProvenNonFloat ? 1 : 0));
   message(Twine("  printf_core_float_helper_calls=") +
           Twine(printfCoreFloatCalls.size()));
   message(Twine("  printf_core_float_helper_unique_functions=") +
