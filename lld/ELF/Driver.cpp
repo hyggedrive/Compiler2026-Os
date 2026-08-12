@@ -5494,18 +5494,51 @@ static StringRef riscvLibcStackMemKindToString(RISCVLibcStackMemKind kind) {
   llvm_unreachable("unknown RISC-V libc stack memory kind");
 }
 
+struct RISCVLibcRegDefDiag {
+  std::string kind = "unknown";
+  uint64_t offset = std::numeric_limits<uint64_t>::max();
+  int copySrc = -1;
+  bool copySrcIsCalleeSaved = false;
+  bool constantFormatProven = false;
+  std::string format = "none";
+  std::string reason = "not-proven";
+};
+
 template <class ELFT>
-static std::string classifyRISCVLibcRegDef(
-    InputSectionBase &sec, const RISCVLibcFunctionDecode &decoded,
-    ArrayRef<RISCVLibcInsn> allInsns, size_t beforeIndex, int reg,
-    std::string &symbolName, int64_t &addend, std::string &text) {
-  symbolName = "none";
-  addend = 0;
-  text = "none";
+static RISCVLibcRegDefDiag classifyRISCVLibcRegDef(
+    InputSectionBase &sec, ArrayRef<RISCVLibcInsn> allInsns,
+    size_t beforeIndex, int reg) {
+  RISCVLibcRegDefDiag diag;
   for (size_t i = beforeIndex; i > 0; --i) {
     const RISCVLibcInsn &def = allInsns[i - 1];
     if (!riscvLibcInsnWritesReg(def, reg))
       continue;
+    diag.offset = def.offset;
+    if (def.addi) {
+      DenseMap<uint64_t, RISCVLibcRelocTarget> relocTargets =
+          getRISCVLibcRelocTargets<ELFT>(sec);
+      auto loRel = relocTargets.find(def.offset);
+      if (loRel != relocTargets.end() && loRel->second.absLoI && i >= 2) {
+        const RISCVLibcInsn &hi = allInsns[i - 2];
+        auto hiRel = relocTargets.find(hi.offset);
+        if (hi.lui && hi.rd == def.rs1 && hiRel != relocTargets.end() &&
+            hiRel->second.absHi && hiRel->second.sym == loRel->second.sym &&
+            hiRel->second.addend == loRel->second.addend) {
+          diag.kind = "constant-string";
+          RISCVLibcCandidateFormat f;
+          if (loRel->second.sym &&
+              targetRISCVLibcCString(*loRel->second.sym,
+                                     loRel->second.addend, f)) {
+            diag.constantFormatProven = true;
+            diag.format = f.text;
+            diag.reason = "none";
+          } else {
+            diag.reason = "target-not-string";
+          }
+          return diag;
+        }
+      }
+    }
     if (def.lui && i < allInsns.size()) {
       const RISCVLibcInsn &lo = allInsns[i];
       if (lo.addi && lo.rs1 == reg) {
@@ -5517,34 +5550,63 @@ static std::string classifyRISCVLibcRegDef(
             hiRel->second.absHi && loRel->second.lo &&
             hiRel->second.sym == loRel->second.sym &&
             hiRel->second.addend == loRel->second.addend) {
-          symbolName = loRel->second.sym
-                           ? loRel->second.sym->getName().str()
-                           : std::string("none");
-          addend = loRel->second.addend;
+          diag.kind = "constant-string";
           RISCVLibcCandidateFormat f;
           if (loRel->second.sym &&
-              targetRISCVLibcCString(*loRel->second.sym, addend, f))
-            text = f.text;
-          return "constant-string";
+              targetRISCVLibcCString(*loRel->second.sym,
+                                     loRel->second.addend, f)) {
+            diag.constantFormatProven = true;
+            diag.format = f.text;
+            diag.reason = "none";
+          } else {
+            diag.reason = "target-not-string";
+          }
+          return diag;
         }
       }
     }
-    if (def.copy && def.copySrc >= 0)
-      return isRISCVIntegerCalleeSavedReg(def.copySrc)
-                 ? "copy-from-callee-saved"
-                 : "copy";
-    if (isRISCVIntegerCalleeSavedReg(reg))
-      return "callee-saved-register";
+    if (def.copy && def.copySrc >= 0) {
+      diag.kind = isRISCVIntegerCalleeSavedReg(def.copySrc)
+                      ? "copy-from-callee-saved"
+                      : "copy";
+      diag.copySrc = def.copySrc;
+      diag.copySrcIsCalleeSaved = isRISCVIntegerCalleeSavedReg(def.copySrc);
+      if (!diag.copySrcIsCalleeSaved)
+        return diag;
+
+      RISCVLibcRegDefDiag srcDiag =
+          classifyRISCVLibcRegDef<ELFT>(sec, allInsns, i - 1, def.copySrc);
+      if (srcDiag.constantFormatProven) {
+        diag.constantFormatProven = true;
+        diag.format = srcDiag.format;
+        diag.reason = "none";
+      } else {
+        diag.reason = srcDiag.reason.empty() ? srcDiag.kind : srcDiag.reason;
+      }
+      return diag;
+    }
+    if (isRISCVIntegerCalleeSavedReg(reg)) {
+      diag.kind = "callee-saved-register";
+      diag.reason = "callee-saved-source-not-locally-proven";
+      return diag;
+    }
     if (def.stackMemKind == RISCVLibcStackMemKind::CLWSP ||
-        def.stackMemKind == RISCVLibcStackMemKind::LW)
-      return "load";
-    if (def.controlFlow && def.call)
-      return "call-result";
-    return riscvLibcInsnKind(def).str();
+        def.stackMemKind == RISCVLibcStackMemKind::LW) {
+      diag.kind = "load";
+      return diag;
+    }
+    if (def.controlFlow && def.call) {
+      diag.kind = "call-result";
+      return diag;
+    }
+    diag.kind = riscvLibcInsnKind(def).str();
+    return diag;
   }
-  if (isRISCVIntegerCalleeSavedReg(reg))
-    return "callee-saved-register";
-  return "unknown";
+  if (isRISCVIntegerCalleeSavedReg(reg)) {
+    diag.kind = "callee-saved-register";
+    diag.reason = "callee-saved-source-not-locally-proven";
+  }
+  return diag;
 }
 
 template <class ELFT>
@@ -5552,18 +5614,18 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
                                         const RISCVLibcFunctionDecode &decoded,
                                         uint32_t &recognizedLoads,
                                         DenseSet<int64_t> &uniqueOffsets,
-                                        uint32_t &storeCount,
-                                        std::map<std::string, uint32_t>
-                                            &storePatterns,
-                                        uint32_t &unknownPatterns) {
+                                        uint32_t &nearestStoreFound,
+                                        uint32_t &nearestStoreIsCSWSP,
+                                        uint32_t &nearestStoreSrcCopy,
+                                        uint32_t &nearestStoreCopyFromCalleeSaved,
+                                        uint32_t &nearestStoreConstFormatProven,
+                                        uint32_t &nearestStoreNotProven) {
   int formatReg = getRISCVPrintfFormatArgReg(call.target->getName());
   SmallVector<RISCVLibcInsn, 0> allInsns;
   std::string reason;
   if (!collectRISCVLibcInsnsBeforeCall(decoded, call.callOffset, allInsns,
-                                       reason, UINT32_MAX)) {
-    ++unknownPatterns;
+                                       reason, UINT32_MAX))
     return false;
-  }
 
   const RISCVLibcInsn *load = nullptr;
   size_t loadIndex = 0;
@@ -5579,10 +5641,8 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
     }
     break;
   }
-  if (!load) {
-    ++unknownPatterns;
+  if (!load)
     return false;
-  }
 
   ++recognizedLoads;
   uniqueOffsets.insert(load->stackOffset);
@@ -5593,33 +5653,69 @@ static bool dumpRISCVLibcStackSlotAudit(const RISCVLibcPrintfCall &call,
           " stack_offset=" + Twine(load->stackOffset) +
           " load_kind=" + riscvLibcStackMemKindToString(load->stackMemKind));
 
-  bool sawStore = false;
+  const RISCVLibcInsn *nearestStore = nullptr;
+  size_t nearestStoreIndex = 0;
   for (size_t i = loadIndex; i > 0; --i) {
     const RISCVLibcInsn &store = allInsns[i - 1];
     if (store.stackOffset != load->stackOffset ||
         (store.stackMemKind != RISCVLibcStackMemKind::CSWSP &&
          store.stackMemKind != RISCVLibcStackMemKind::SW))
       continue;
-    sawStore = true;
-    ++storeCount;
-    std::string sym;
-    int64_t addend = 0;
-    std::string text;
-    std::string defKind = classifyRISCVLibcRegDef<ELFT>(
-        *call.sourceSection, decoded, allInsns, i - 1, store.stackStoreSrc, sym,
-        addend, text);
-    ++storePatterns[defKind];
-    message(Twine("  printf_stack_slot_store call_offset=") +
-            hexOffset(call.callOffset) +
-            " store_offset=" + hexOffset(store.offset) +
-            " stack_offset=" + Twine(store.stackOffset) +
-            " store_kind=" + riscvLibcStackMemKindToString(store.stackMemKind) +
-            " src_reg=" + riscvLibcXRegName(store.stackStoreSrc) +
-            " src_def_kind=" + defKind + " symbol=" + sym +
-            " addend=" + Twine(addend) + " string=\"" + text + "\"");
+    nearestStore = &store;
+    nearestStoreIndex = i - 1;
+    break;
   }
-  if (!sawStore)
-    ++unknownPatterns;
+  if (!nearestStore) {
+    ++nearestStoreNotProven;
+    message(Twine("  printf_stack_slot_nearest_store caller=") +
+            call.caller->getName() +
+            " call_offset=" + hexOffset(call.callOffset) +
+            " load_offset=" + hexOffset(load->offset) +
+            " stack_offset=" + Twine(load->stackOffset) +
+            " store_offset=none store_kind=none store_src=none"
+            " store_src_def_kind=none copy_src=none"
+            " copy_src_is_callee_saved=0 constant_format_proven=0"
+            " format=\"none\" reason=nearest-store-not-found");
+    return true;
+  }
+
+  ++nearestStoreFound;
+  if (nearestStore->stackMemKind == RISCVLibcStackMemKind::CSWSP)
+    ++nearestStoreIsCSWSP;
+  RISCVLibcRegDefDiag defDiag =
+      classifyRISCVLibcRegDef<ELFT>(*call.sourceSection, allInsns,
+                                    nearestStoreIndex,
+                                    nearestStore->stackStoreSrc);
+  if (defDiag.kind == "copy" || defDiag.kind == "copy-from-callee-saved")
+    ++nearestStoreSrcCopy;
+  if (defDiag.copySrcIsCalleeSaved)
+    ++nearestStoreCopyFromCalleeSaved;
+  if (defDiag.constantFormatProven)
+    ++nearestStoreConstFormatProven;
+  else
+    ++nearestStoreNotProven;
+
+  message(Twine("  printf_stack_slot_nearest_store caller=") +
+          call.caller->getName() +
+          " call_offset=" + hexOffset(call.callOffset) +
+          " load_offset=" + hexOffset(load->offset) +
+          " stack_offset=" + Twine(load->stackOffset) +
+          " store_offset=" + hexOffset(nearestStore->offset) +
+          " store_kind=" +
+          riscvLibcStackMemKindToString(nearestStore->stackMemKind) +
+          " store_src=" + riscvLibcXRegName(nearestStore->stackStoreSrc) +
+          " store_src_def_kind=" + defDiag.kind +
+          " store_src_def_offset=" + hexOffsetOrNone(defDiag.offset) +
+          " copy_src=" + riscvLibcXRegName(defDiag.copySrc) +
+          " copy_src_is_callee_saved=" +
+          Twine(defDiag.copySrcIsCalleeSaved ? 1 : 0) +
+          " copy_offset=" +
+          hexOffsetOrNone(defDiag.copySrc >= 0
+                              ? defDiag.offset
+                              : std::numeric_limits<uint64_t>::max()) +
+          " constant_format_proven=" +
+          Twine(defDiag.constantFormatProven ? 1 : 0) + " format=\"" +
+          defDiag.format + "\" reason=" + defDiag.reason);
   return true;
 }
 
@@ -7387,10 +7483,13 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
   uint32_t loopCarriedFailOther = 0;
   uint32_t stackSlotFailedCalls = 0;
   uint32_t stackSlotLoadsRecognized = 0;
-  uint32_t stackSlotStores = 0;
-  uint32_t stackSlotUnknownPatterns = 0;
+  uint32_t stackSlotNearestStoreFound = 0;
+  uint32_t stackSlotNearestStoreIsCSWSP = 0;
+  uint32_t stackSlotNearestStoreSrcCopy = 0;
+  uint32_t stackSlotNearestStoreCopyFromCalleeSaved = 0;
+  uint32_t stackSlotNearestStoreConstFormatProven = 0;
+  uint32_t stackSlotNearestStoreNotProven = 0;
   DenseSet<int64_t> stackSlotUniqueOffsets;
-  std::map<std::string, uint32_t> stackSlotStorePatterns;
   bool candidateFloatFormatSeen = false, candidateLongDoubleFormatSeen = false;
   for (RISCVLibcPrintfCall &call : printfCalls) {
     printfCallers.insert(call.caller);
@@ -7900,7 +7999,11 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           *call.sourceSection, *call.caller, decodeCache, perfStats);
       dumpRISCVLibcStackSlotAudit<ELFT>(
           call, decoded, stackSlotLoadsRecognized, stackSlotUniqueOffsets,
-          stackSlotStores, stackSlotStorePatterns, stackSlotUnknownPatterns);
+          stackSlotNearestStoreFound, stackSlotNearestStoreIsCSWSP,
+          stackSlotNearestStoreSrcCopy,
+          stackSlotNearestStoreCopyFromCalleeSaved,
+          stackSlotNearestStoreConstFormatProven,
+          stackSlotNearestStoreNotProven);
     }
   }
 
@@ -7981,12 +8084,18 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(stackSlotLoadsRecognized));
   message(Twine("  printf_stack_slot_unique_offsets=") +
           Twine(stackSlotUniqueOffsets.size()));
-  message(Twine("  printf_stack_slot_stores=") + Twine(stackSlotStores));
-  message(Twine("  printf_stack_slot_unknown_patterns=") +
-          Twine(stackSlotUnknownPatterns));
-  for (const auto &it : stackSlotStorePatterns)
-    message(Twine("  printf_stack_slot_store_pattern kind=") + it.first +
-            " count=" + Twine(it.second));
+  message(Twine("  printf_stack_slot_nearest_store_found=") +
+          Twine(stackSlotNearestStoreFound));
+  message(Twine("  printf_stack_slot_nearest_store_is_cswsp=") +
+          Twine(stackSlotNearestStoreIsCSWSP));
+  message(Twine("  printf_stack_slot_nearest_store_src_copy=") +
+          Twine(stackSlotNearestStoreSrcCopy));
+  message(Twine("  printf_stack_slot_nearest_store_copy_from_callee_saved=") +
+          Twine(stackSlotNearestStoreCopyFromCalleeSaved));
+  message(Twine("  printf_stack_slot_nearest_store_const_format_proven=") +
+          Twine(stackSlotNearestStoreConstFormatProven));
+  message(Twine("  printf_stack_slot_nearest_store_not_proven=") +
+          Twine(stackSlotNearestStoreNotProven));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
   message(Twine("  printf_specialization_gate_ready=") +
