@@ -4291,7 +4291,7 @@ enum class RISCVLibcRefKind {
   Unknown,
 };
 
-static StringRef toString(RISCVLibcRefKind kind) {
+static StringRef riscvLibcRefKindToString(RISCVLibcRefKind kind) {
   switch (kind) {
   case RISCVLibcRefKind::DirectCall:
     return "direct-call";
@@ -4401,7 +4401,7 @@ static bool isRISCVLibcReadOnlyData(InputSectionBase &sec) {
 }
 
 static std::string symbolFileName(const Defined &d) {
-  return d.file ? toString(d.file) : std::string("<internal>");
+  return d.file ? lld::toString(d.file) : std::string("<internal>");
 }
 
 static bool readCStringAt(InputSectionBase &sec, uint64_t off,
@@ -4682,7 +4682,8 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           break;
         }
       message(Twine("    printf_core -> ") + dst.sym->getName() +
-              " size=" + Twine(dst.size) + " kind=" + toString(kind));
+              " size=" + Twine(dst.size) +
+              " kind=" + riscvLibcRefKindToString(kind));
     }
   }
 
@@ -4727,7 +4728,7 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
     message(Twine("  printf_call caller=") + call.caller->getName() +
             " target=" + call.target->getName() +
             " source_section=" + call.sourceSection->name +
-            " reloc=" + toString(call.type) + " source_live=1" +
+            " reloc=" + lld::toString(call.type) + " source_live=1" +
             " format_class=" + classification);
     for (const RISCVLibcCandidateFormat &f : call.candidateFormats)
       message(Twine("    candidate_format=\"") + f.text +
