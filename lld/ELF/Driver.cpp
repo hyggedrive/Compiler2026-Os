@@ -72,6 +72,7 @@
 #include <bitset>
 #include <cstdlib>
 #include <limits>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -1370,6 +1371,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
+  config->riscvPrintfSpecialization =
+      args.hasArg(OPT_riscv_printf_specialization);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
   config->printSymbolOrder =
       args.getLastArgValue(OPT_print_symbol_order);
@@ -4085,6 +4088,7 @@ static void printRISCVFunctionSplitDebugRelocStats(
 template <class ELFT> static void auditRISCVFunctionSectionsSplit() {
   riscvFunctionSplitChildren.clear();
   riscvFunctionSplitRelocStorage.clear();
+  riscvRelocOverrideStorage.clear();
   if (!config->riscvFunctionSectionsSplit || config->emachine != EM_RISCV ||
       config->is64 || config->relocatable)
     return;
@@ -4280,6 +4284,487 @@ static void printRISCVFunctionSplitGCStats() {
             ") live children " + Twine(d.liveChildren) + " dead children " +
             Twine(d.deadChildren) + " live bytes " + Twine(d.liveBytes) +
             " dead bytes " + Twine(d.deadBytes));
+}
+
+static bool isRISCVPrintfFamilyName(StringRef name) {
+  return StringSwitch<bool>(name)
+      .Cases("printf", "fprintf", "sprintf", "snprintf", true)
+      .Cases("vprintf", "vfprintf", "vsprintf", "vsnprintf", true)
+      .Default(false);
+}
+
+static int getRISCVPrintfFormatArgReg(StringRef name) {
+  return StringSwitch<int>(name)
+      .Cases("printf", "vprintf", 10)
+      .Cases("fprintf", "vfprintf", 11)
+      .Cases("sprintf", "vsprintf", 11)
+      .Cases("snprintf", "vsnprintf", 12)
+      .Default(-1);
+}
+
+static bool isRISCVPrintfCoreFloatHelperName(StringRef name) {
+  return StringSwitch<bool>(name)
+      .Cases("__fpclassifyl", "frexpl", true)
+      .Cases("__floatsitf", "__floatunsitf", "__extenddftf2", true)
+      .Cases("__multf3", "__divtf3", "__addtf3", "__subtf3", true)
+      .Cases("__fixtfsi", "__fixunstfsi", "__eqtf2", "__netf2", true)
+      .Default(false);
+}
+
+static bool isRISCVPrintfNonFloatFormat(StringRef s) {
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] != '%')
+      continue;
+    if (++i < s.size() && s[i] == '%')
+      continue;
+    while (i < s.size() && StringRef("-+ #0").contains(s[i]))
+      ++i;
+    if (i < s.size() && s[i] == '*')
+      ++i;
+    else
+      while (i < s.size() && isDigit(s[i]))
+        ++i;
+    if (i < s.size() && s[i] == '.') {
+      ++i;
+      if (i < s.size() && s[i] == '*')
+        ++i;
+      else
+        while (i < s.size() && isDigit(s[i]))
+          ++i;
+    }
+    bool longDouble = false;
+    if (i < s.size() && s[i] == 'L') {
+      longDouble = true;
+      ++i;
+    } else if (i + 1 < s.size() &&
+               (s.substr(i, 2) == "hh" || s.substr(i, 2) == "ll")) {
+      i += 2;
+    } else if (i < s.size() && StringRef("hljzt").contains(s[i])) {
+      ++i;
+    }
+    if (i >= s.size())
+      return false;
+    if (StringRef("fFeEgGaA").contains(s[i]) || longDouble)
+      return false;
+  }
+  return true;
+}
+
+static bool readRISCVPrintfCString(InputSectionBase &sec, uint64_t off,
+                                   std::string &out) {
+  ArrayRef<uint8_t> data = sec.content();
+  if (off >= data.size())
+    return false;
+  constexpr size_t maxLen = 512;
+  out.clear();
+  for (uint64_t i = off; i < data.size() && out.size() < maxLen; ++i) {
+    uint8_t c = data[i];
+    if (c == 0)
+      return !out.empty();
+    if ((c < 0x20 || c > 0x7e) && c != '\n' && c != '\t' && c != '\r')
+      return false;
+    out.push_back(static_cast<char>(c));
+  }
+  return false;
+}
+
+static bool isRISCVReadOnlyCStringTarget(Defined &sym, int64_t addend,
+                                         std::string &text) {
+  auto *sec = dyn_cast_or_null<InputSectionBase>(sym.section);
+  if (!sec || sec == &InputSection::discarded)
+    return false;
+  if (!(sec->flags & SHF_ALLOC) || (sec->flags & SHF_WRITE) ||
+      (sec->flags & SHF_EXECINSTR) || sec->type != SHT_PROGBITS)
+    return false;
+  if (addend < 0 && static_cast<uint64_t>(-addend) > sym.value)
+    return false;
+  return readRISCVPrintfCString(*sec, sym.value + addend, text);
+}
+
+struct RISCVPrintfInsn {
+  uint64_t offset = 0;
+  uint32_t raw = 0;
+  uint8_t size = 0;
+  int rd = -1;
+  int rs1 = -1;
+  int rs2 = -1;
+  bool writesRd = false;
+  bool lui = false;
+  bool addi = false;
+  bool copy = false;
+  bool controlFlow = false;
+  bool call = false;
+};
+
+static bool decodeRISCVPrintfInsn(ArrayRef<uint8_t> data, uint64_t off,
+                                  RISCVPrintfInsn &insn) {
+  if (off + 2 > data.size())
+    return false;
+  uint16_t half = llvm::support::endian::read16le(data.data() + off);
+  insn = {};
+  insn.offset = off;
+  if ((half & 0x3) != 0x3) {
+    insn.size = 2;
+    insn.raw = half;
+    uint16_t quadrant = half & 0x3;
+    uint16_t funct3 = (half >> 13) & 0x7;
+    if (quadrant == 1 && (funct3 == 5 || funct3 == 6 || funct3 == 7))
+      insn.controlFlow = true;
+    else if (quadrant == 2 && funct3 == 4) {
+      int rs2 = (half >> 2) & 0x1f;
+      bool bit12 = half & 0x1000;
+      insn.rs1 = (half >> 7) & 0x1f;
+      insn.rs2 = rs2;
+      if (rs2 == 0) {
+        insn.controlFlow = true;
+        insn.call = bit12;
+      } else if (bit12) {
+        insn.controlFlow = true;
+        insn.call = true;
+      } else {
+        insn.rd = insn.rs1;
+        insn.copy = true;
+        insn.writesRd = true;
+      }
+    }
+    return true;
+  }
+  if (off + 4 > data.size())
+    return false;
+  uint32_t raw = llvm::support::endian::read32le(data.data() + off);
+  uint32_t opcode = raw & 0x7f;
+  insn.size = 4;
+  insn.raw = raw;
+  insn.rd = (raw >> 7) & 0x1f;
+  insn.rs1 = (raw >> 15) & 0x1f;
+  insn.rs2 = (raw >> 20) & 0x1f;
+  if (opcode == 0x37) {
+    insn.lui = true;
+    insn.writesRd = true;
+  } else if (opcode == 0x13 && ((raw >> 12) & 0x7) == 0) {
+    insn.addi = true;
+    insn.copy = (static_cast<int32_t>(raw) >> 20) == 0;
+    insn.writesRd = true;
+  } else if (opcode == 0x6f || opcode == 0x67) {
+    insn.controlFlow = true;
+    insn.call = insn.rd == 1 || insn.rd == 5;
+  } else if (opcode == 0x63) {
+    insn.controlFlow = true;
+  }
+  return true;
+}
+
+static bool isRISCVIntegerCalleeSavedReg(int reg) {
+  return reg == 8 || reg == 9 || (reg >= 18 && reg <= 27);
+}
+
+static bool riscvPrintfInsnWritesReg(const RISCVPrintfInsn &insn, int reg) {
+  return reg >= 0 && insn.writesRd && insn.rd == reg;
+}
+
+template <class ELFT>
+static bool findRISCVPrintfAbsRel(InputSectionBase &sec, uint64_t off,
+                                  RelType wanted, Defined *&sym,
+                                  int64_t &addend) {
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  for (const auto &r : rels.relas) {
+    if (r.r_offset != off || r.getType(config->isMips64EL) != wanted)
+      continue;
+    sym = dyn_cast<Defined>(&sec.getFile<ELFT>()->getRelocTargetSym(r));
+    addend = r.r_addend;
+    return sym != nullptr;
+  }
+  return false;
+}
+
+template <class ELFT, class RelTy>
+static bool proveRISCVPrintfDirectAbsFormat(InputSectionBase &sec,
+                                            Defined &source, const RelTy &rel,
+                                            Defined &target) {
+  int argReg = getRISCVPrintfFormatArgReg(target.getName());
+  if (argReg < 0 || !(sec.flags & SHF_EXECINSTR))
+    return false;
+  ArrayRef<uint8_t> data = sec.content();
+  if (rel.r_offset < source.value || rel.r_offset > data.size())
+    return false;
+  SmallVector<RISCVPrintfInsn, 0> insns;
+  for (uint64_t off = source.value; off < rel.r_offset;) {
+    RISCVPrintfInsn insn;
+    if (!decodeRISCVPrintfInsn(data, off, insn))
+      return false;
+    insns.push_back(insn);
+    off += insn.size;
+  }
+  if (insns.size() < 2)
+    return false;
+  const RISCVPrintfInsn &lo = insns[insns.size() - 1];
+  const RISCVPrintfInsn &hi = insns[insns.size() - 2];
+  if (!lo.addi || lo.rd != argReg || lo.rs1 != argReg || !hi.lui ||
+      hi.rd != argReg)
+    return false;
+
+  Defined *hiSym = nullptr, *loSym = nullptr;
+  int64_t hiAddend = 0, loAddend = 0;
+  if (!findRISCVPrintfAbsRel<ELFT>(sec, hi.offset, R_RISCV_HI20, hiSym,
+                                   hiAddend) ||
+      !findRISCVPrintfAbsRel<ELFT>(sec, lo.offset, R_RISCV_LO12_I, loSym,
+                                   loAddend))
+    return false;
+  if (hiSym != loSym || hiAddend != loAddend)
+    return false;
+  std::string text;
+  return isRISCVReadOnlyCStringTarget(*loSym, loAddend, text) &&
+         isRISCVPrintfNonFloatFormat(text);
+}
+
+template <class ELFT, class RelTy>
+static bool proveRISCVPrintfEntryCalleeSavedFormat(InputSectionBase &sec,
+                                                   Defined &source,
+                                                   const RelTy &rel,
+                                                   Defined &target) {
+  int argReg = getRISCVPrintfFormatArgReg(target.getName());
+  if (argReg < 0 || !(sec.flags & SHF_EXECINSTR))
+    return false;
+  ArrayRef<uint8_t> data = sec.content();
+  SmallVector<RISCVPrintfInsn, 0> insns;
+  for (uint64_t off = source.value; off < rel.r_offset;) {
+    RISCVPrintfInsn insn;
+    if (!decodeRISCVPrintfInsn(data, off, insn))
+      return false;
+    insns.push_back(insn);
+    off += insn.size;
+  }
+
+  const RISCVPrintfInsn *copy = nullptr;
+  for (size_t i = insns.size(); i > 0; --i) {
+    const RISCVPrintfInsn &insn = insns[i - 1];
+    if (!riscvPrintfInsnWritesReg(insn, argReg))
+      continue;
+    copy = &insn;
+    break;
+  }
+  int copySrc = copy ? (copy->size == 2 ? copy->rs2 : copy->rs1) : -1;
+  if (!copy || !copy->copy || !isRISCVIntegerCalleeSavedReg(copySrc))
+    return false;
+  int savedReg = copySrc;
+
+  size_t prefixEnd = insns.size();
+  for (auto [i, insn] : llvm::enumerate(insns)) {
+    if (insn.controlFlow) {
+      prefixEnd = i;
+      break;
+    }
+  }
+
+  const RISCVPrintfInsn *hi = nullptr;
+  const RISCVPrintfInsn *lo = nullptr;
+  for (size_t i = 1; i < prefixEnd; ++i) {
+    const RISCVPrintfInsn &cur = insns[i];
+    const RISCVPrintfInsn &prev = insns[i - 1];
+    if (!cur.addi || cur.rd != savedReg || !prev.lui || prev.rd != cur.rs1)
+      continue;
+    Defined *hiSym = nullptr, *loSym = nullptr;
+    int64_t hiAddend = 0, loAddend = 0;
+    if (!findRISCVPrintfAbsRel<ELFT>(sec, prev.offset, R_RISCV_HI20, hiSym,
+                                     hiAddend) ||
+        !findRISCVPrintfAbsRel<ELFT>(sec, cur.offset, R_RISCV_LO12_I, loSym,
+                                     loAddend))
+      continue;
+    if (hiSym == loSym && hiAddend == loAddend) {
+      hi = &prev;
+      lo = &cur;
+      break;
+    }
+  }
+  if (!hi || !lo)
+    return false;
+
+  bool afterInit = false;
+  for (const RISCVPrintfInsn &insn : insns) {
+    if (insn.offset == lo->offset) {
+      afterInit = true;
+      continue;
+    }
+    if (!afterInit || insn.offset >= copy->offset)
+      continue;
+    if (riscvPrintfInsnWritesReg(insn, savedReg))
+      return false;
+  }
+  for (const RISCVPrintfInsn &insn : insns) {
+    if (insn.offset <= copy->offset)
+      continue;
+    if (insn.controlFlow || riscvPrintfInsnWritesReg(insn, argReg))
+      return false;
+  }
+
+  Defined *loSym = nullptr;
+  int64_t loAddend = 0;
+  if (!findRISCVPrintfAbsRel<ELFT>(sec, lo->offset, R_RISCV_LO12_I, loSym,
+                                   loAddend))
+    return false;
+  std::string text;
+  return isRISCVReadOnlyCStringTarget(*loSym, loAddend, text) &&
+         isRISCVPrintfNonFloatFormat(text);
+}
+
+static bool isRISCVPrintfCallPair(ArrayRef<uint8_t> content, uint64_t off) {
+  if (off > content.size() || content.size() - off < 8)
+    return false;
+  uint32_t auipc = llvm::support::endian::read32le(content.data() + off);
+  uint32_t jalr = llvm::support::endian::read32le(content.data() + off + 4);
+  if ((auipc & 0x7f) != 0x17 || (jalr & 0x7f) != 0x67)
+    return false;
+  int rd = (auipc >> 7) & 0x1f;
+  int jalrRd = (jalr >> 7) & 0x1f;
+  int rs1 = (jalr >> 15) & 0x1f;
+  int funct3 = (jalr >> 12) & 0x7;
+  int imm = static_cast<int32_t>(jalr) >> 20;
+  return rd == rs1 && (jalrRd == 1 || jalrRd == 5) && funct3 == 0 &&
+         imm == 0;
+}
+
+template <class ELFT> static void specializeRISCVPrintf() {
+  if (!config->riscvPrintfSpecialization || config->emachine != EM_RISCV ||
+      config->relocatable)
+    return;
+
+  SmallVector<Defined *, 0> printfCores;
+  for (ELFFileBase *file : ctx.objectFiles)
+    for (Symbol *sym : file->getSymbols())
+      if (auto *d = dyn_cast_or_null<Defined>(sym))
+        if (d->type == STT_FUNC && d->getName() == "printf_core")
+          if (auto *sec = dyn_cast_or_null<InputSectionBase>(d->section))
+            if (sec != &InputSection::discarded && sec->file &&
+                (sec->flags & SHF_ALLOC))
+              printfCores.push_back(d);
+  if (printfCores.size() != 1)
+    return;
+
+  bool sawRoute = false;
+  std::set<std::tuple<InputSectionBase *, uint64_t, Defined *>> seenCalls;
+  for (InputSectionBase *sec : ctx.inputSections) {
+    if (!sec || sec == &InputSection::discarded || !sec->file ||
+        !(sec->flags & SHF_ALLOC))
+      continue;
+    RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
+    if (rels.areRelocsRel())
+      return;
+    for (const auto &rel : rels.relas) {
+      Symbol &sym = sec->getFile<ELFT>()->getRelocTargetSym(rel);
+      Defined *target = dyn_cast<Defined>(&sym);
+      StringRef name = sym.getName();
+      bool relevant = isRISCVPrintfFamilyName(name) || name == "printf_core";
+      if (!relevant && target && target->type == STT_FUNC)
+        relevant = llvm::any_of(printfCores, [&](Defined *core) {
+          return target->section == core->section &&
+                 target->value == core->value;
+        });
+      if (!relevant)
+        continue;
+      if (!target || target->type != STT_FUNC)
+        return;
+      RelType type = rel.getType(config->isMips64EL);
+      if (type != R_RISCV_CALL && type != R_RISCV_CALL_PLT)
+        return;
+      if (target->getName() == "printf_core") {
+        Defined *source = sec->getEnclosingFunction(rel.r_offset);
+        if (source && source->getName() == "vfprintf")
+          continue;
+        return;
+      }
+      if (!isRISCVPrintfFamilyName(target->getName()))
+        return;
+      Defined *source = sec->getEnclosingFunction(rel.r_offset);
+      if (!source)
+        return;
+      if (source->getName() == "printf" && target->getName() == "vfprintf")
+        continue;
+      sawRoute = true;
+      if (!seenCalls.insert({sec, rel.r_offset, target}).second)
+        continue;
+      if (!proveRISCVPrintfDirectAbsFormat<ELFT>(*sec, *source, rel,
+                                                 *target) &&
+          !proveRISCVPrintfEntryCalleeSavedFormat<ELFT>(*sec, *source, rel,
+                                                        *target))
+        return;
+    }
+  }
+  if (!sawRoute)
+    return;
+
+  Defined *printfCore = printfCores[0];
+  auto *sec = dyn_cast_or_null<InputSectionBase>(printfCore->section);
+  if (!sec || sec->kind() != SectionBase::Regular ||
+      sec->name != ".text.printf_core")
+    return;
+  RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
+  if (rels.areRelocsRel())
+    return;
+
+  using Elf_Rela = typename ELFT::Rela;
+  ArrayRef<uint8_t> content = sec->content();
+  uint64_t funcEnd = printfCore->value + printfCore->size;
+  if (printfCore->value > content.size() || funcEnd > content.size())
+    return;
+
+  DenseSet<uint64_t> callOffsets;
+  DenseSet<uint64_t> removeIndexes;
+  for (auto [i, rel] : llvm::enumerate(rels.relas)) {
+    RelType type = rel.getType(config->isMips64EL);
+    if (type != R_RISCV_CALL && type != R_RISCV_CALL_PLT)
+      continue;
+    if (rel.r_offset < printfCore->value || rel.r_offset >= funcEnd)
+      continue;
+    Defined *target =
+        dyn_cast<Defined>(&sec->getFile<ELFT>()->getRelocTargetSym(rel));
+    if (!target || !isRISCVPrintfCoreFloatHelperName(target->getName()))
+      continue;
+    if (!isRISCVPrintfCallPair(content, rel.r_offset))
+      return;
+    callOffsets.insert(rel.r_offset);
+    removeIndexes.insert(i);
+  }
+  if (callOffsets.empty())
+    return;
+
+  for (auto [i, rel] : llvm::enumerate(rels.relas)) {
+    bool inCallPair = false;
+    for (uint64_t off : callOffsets)
+      if (rel.r_offset >= off && rel.r_offset < off + 8) {
+        inCallPair = true;
+        break;
+      }
+    if (!inCallPair)
+      continue;
+    RelType type = rel.getType(config->isMips64EL);
+    if (callOffsets.contains(rel.r_offset) &&
+        (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT ||
+         type == R_RISCV_RELAX)) {
+      removeIndexes.insert(i);
+      continue;
+    }
+    return;
+  }
+
+  uint8_t *newContent = makeThreadLocalN<uint8_t>(content.size());
+  llvm::copy(content, newContent);
+  for (uint64_t off : callOffsets) {
+    llvm::support::endian::write32le(newContent + off, 0x00000013);
+    llvm::support::endian::write32le(newContent + off + 4, 0x00000013);
+  }
+
+  SmallVector<Elf_Rela, 0> keptRelas;
+  for (auto [i, rel] : llvm::enumerate(rels.relas))
+    if (!removeIndexes.contains(i))
+      keptRelas.push_back(rel);
+  Elf_Rela *buf = makeThreadLocalN<Elf_Rela>(keptRelas.size());
+  llvm::copy(keptRelas, buf);
+  RISCVRelocOverrideStorage storage;
+  storage.relocsAreRela = true;
+  storage.relocs = buf;
+  storage.relocCount = static_cast<uint32_t>(keptRelas.size());
+  riscvRelocOverrideStorage[sec] = storage;
+  sec->content_ = newContent;
 }
 } // namespace
 
@@ -4625,6 +5110,7 @@ void LinkerDriver::link(opt::InputArgList &args) {
 
   // Split SHF_MERGE and .eh_frame sections into pieces in preparation for garbage collection.
   invokeELFT(splitSections,);
+  invokeELFT(specializeRISCVPrintf,);
 
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);

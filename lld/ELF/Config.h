@@ -270,6 +270,7 @@ struct Config {
   bool printIcfSections;
   bool printMemoryUsage;
   bool printRISCVFunctionSectionsSplit;
+  bool riscvPrintfSpecialization;
   bool relax;
   bool relaxGP;
   bool riscvRelaxJalRVC;
