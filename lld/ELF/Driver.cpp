@@ -4365,6 +4365,15 @@ static bool isPrintfFloatDependencyName(StringRef name) {
       .Default(false);
 }
 
+static bool isRISCVPrintfCoreFloatHelperName(StringRef name) {
+  return StringSwitch<bool>(name)
+      .Cases("__fpclassifyl", "frexpl", true)
+      .Cases("__floatsitf", "__floatunsitf", "__extenddftf2", true)
+      .Cases("__multf3", "__divtf3", "__addtf3", "__subtf3", true)
+      .Cases("__fixtfsi", "__fixunstfsi", "__eqtf2", "__netf2", true)
+      .Default(false);
+}
+
 struct RISCVLibcIncomingRef {
   Defined *sourceFunction = nullptr;
   InputSectionBase *sourceSection = nullptr;
@@ -4468,6 +4477,25 @@ struct RISCVLibcLoopCarriedDiag {
   uint64_t externalEntrySource = std::numeric_limits<uint64_t>::max();
   uint64_t externalEntryTarget = std::numeric_limits<uint64_t>::max();
   uint64_t unknownControlFlowOffset = std::numeric_limits<uint64_t>::max();
+};
+
+struct RISCVLibcPrintfCoreFloatCall {
+  InputSectionBase *sourceSection = nullptr;
+  Defined *sourceFunction = nullptr;
+  Defined *helper = nullptr;
+  InputSectionBase *targetSection = nullptr;
+  uint64_t helperSize = 0;
+  uint64_t relocOffset = 0;
+  uint64_t callInsnOffset = 0;
+  RelType relocType = R_RISCV_NONE;
+};
+
+struct RISCVLibcPrintfCoreFloatRegion {
+  InputSectionBase *section = nullptr;
+  Defined *function = nullptr;
+  uint64_t start = std::numeric_limits<uint64_t>::max();
+  uint64_t end = 0;
+  uint32_t helperCallCount = 0;
 };
 
 struct RISCVLibcAuditPerfStats {
@@ -5135,6 +5163,128 @@ static bool hasRISCVLibcExternalEntryToProtectedInterval(
     }
   }
   return false;
+}
+
+static bool isRISCVLibcDirectBranchOrJumpReloc(RelType type) {
+  return type == R_RISCV_BRANCH || type == R_RISCV_JAL ||
+         type == R_RISCV_RVC_BRANCH || type == R_RISCV_RVC_JUMP;
+}
+
+static bool isRISCVLibcControlFlowAuditReloc(RelType type) {
+  return isRISCVLibcDirectBranchOrJumpReloc(type);
+}
+
+static bool containsRISCVLibcOffset(const RISCVLibcPrintfCoreFloatRegion &r,
+                                    uint64_t off) {
+  return off >= r.start && off <= r.end;
+}
+
+static uint64_t getRISCVLibcCallInsnOffset(const RISCVLibcFunctionDecode &d,
+                                           uint64_t relocOffset) {
+  for (const RISCVLibcInsn &insn : d.instructions) {
+    if (insn.offset == relocOffset)
+      return insn.offset;
+    if (insn.size == 4 && (insn.raw & 0x7f) == 0x67 &&
+        insn.offset >= 4 && insn.offset - 4 == relocOffset)
+      return insn.offset;
+  }
+  return relocOffset;
+}
+
+static const RISCVLibcInsn *
+getRISCVLibcInsnAt(const RISCVLibcFunctionDecode &d, uint64_t off) {
+  for (const RISCVLibcInsn &insn : d.instructions)
+    if (insn.offset == off)
+      return &insn;
+  return nullptr;
+}
+
+static const RISCVLibcInsn *
+getRISCVLibcNextInsn(const RISCVLibcFunctionDecode &d,
+                     const RISCVLibcInsn &insn) {
+  uint64_t next = insn.offset + insn.size;
+  return getRISCVLibcInsnAt(d, next);
+}
+
+static bool isRISCVLibcLinkReg(int reg) { return reg == 1 || reg == 5; }
+
+static std::optional<bool> isRISCVLibcCallLikeControlFlow(
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &relocs,
+    const RISCVLibcInsn &insn) {
+  if (!insn.controlFlow)
+    return false;
+  if (isRISCVLibcNormalDirectCall(relocs, insn))
+    return true;
+  if (insn.size == 4) {
+    uint32_t opcode = insn.raw & 0x7f;
+    if (opcode == 0x6f || opcode == 0x67)
+      return isRISCVLibcLinkReg(insn.rd);
+    if (opcode == 0x63)
+      return false;
+    return std::nullopt;
+  }
+  uint16_t half = static_cast<uint16_t>(insn.raw);
+  uint16_t quadrant = half & 0x3;
+  uint16_t funct3 = (half >> 13) & 0x7;
+  bool bit12 = half & 0x1000;
+  int rd = (half >> 7) & 0x1f;
+  int rs2 = (half >> 2) & 0x1f;
+  if (quadrant == 1 && funct3 == 1)
+    return true; // C.JAL on RV32.
+  if (quadrant == 1 && (funct3 == 5 || funct3 == 6 || funct3 == 7))
+    return false;
+  if (quadrant == 2 && funct3 == 4 && rs2 == 0) {
+    if (bit12)
+      return true; // C.JALR links through ra.
+    return false;  // C.JR.
+  }
+  if (insn.call)
+    return isRISCVLibcLinkReg(rd);
+  return std::nullopt;
+}
+
+static bool isRISCVLibcNonCallControlFlow(
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &relocs,
+    const RISCVLibcInsn &insn) {
+  if (!insn.controlFlow)
+    return false;
+  std::optional<bool> callLike = isRISCVLibcCallLikeControlFlow(relocs, insn);
+  return !callLike || !*callLike;
+}
+
+static std::optional<bool> hasRISCVLibcKnownFallthrough(
+    const DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &relocs,
+    const RISCVLibcInsn &insn) {
+  if (!insn.controlFlow)
+    return true;
+  std::optional<bool> callLike = isRISCVLibcCallLikeControlFlow(relocs, insn);
+  if (!callLike)
+    return std::nullopt;
+  if (*callLike)
+    return true;
+  if (isRISCVLibcReturn(insn))
+    return false;
+  if (insn.size == 4) {
+    uint32_t opcode = insn.raw & 0x7f;
+    if (opcode == 0x63)
+      return true;
+    if (opcode == 0x6f || opcode == 0x67)
+      return false;
+    return std::nullopt;
+  }
+  uint16_t half = static_cast<uint16_t>(insn.raw);
+  uint16_t quadrant = half & 0x3;
+  uint16_t funct3 = (half >> 13) & 0x7;
+  if (quadrant == 1 && (funct3 == 6 || funct3 == 7))
+    return true;
+  if (quadrant == 1 && funct3 == 5)
+    return false;
+  if (quadrant == 2 && funct3 == 4)
+    return false;
+  return std::nullopt;
 }
 
 static std::string hexOffset(uint64_t off) {
@@ -6560,6 +6710,276 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
       userPrintfCalls > 0 && provenUserFormats == userPrintfCalls &&
       unknownUserFormats == 0 && provenFloatFormats == 0 &&
       provenLongDoubleFormats == 0;
+  SmallVector<RISCVLibcPrintfCoreFloatCall, 0> printfCoreFloatCalls;
+  DenseSet<Defined *> printfCoreFloatHelpers;
+  SmallVector<RISCVLibcPrintfCoreFloatRegion, 0> printfCoreFloatRegions;
+  uint64_t printfCoreFloatCandidateBytes = 0;
+  uint32_t printfCoreFloatInternalEdges = 0;
+  uint32_t printfCoreFloatIncomingEdges = 0;
+  uint32_t printfCoreFloatOutgoingEdges = 0;
+  uint32_t printfCoreFloatIncomingFallthroughEdges = 0;
+  uint32_t printfCoreFloatOutgoingFallthroughEdges = 0;
+  uint32_t printfCoreFloatDispatchCandidates = 0;
+  uint32_t printfCoreFloatUnknownControlFlow = 0;
+  uint32_t printfCoreFloatHelperCallMisses = 0;
+  bool printfCoreFloatRegionIsolatable = false;
+
+  auto regionIndexFor = [&](InputSectionBase *section, Defined *function,
+                            uint64_t off) -> int {
+    for (auto [i, r] : llvm::enumerate(printfCoreFloatRegions))
+      if (r.section == section && r.function == function &&
+          containsRISCVLibcOffset(r, off))
+        return static_cast<int>(i);
+    return -1;
+  };
+
+  for (unsigned idx : printfCoreRoots) {
+    RISCVLibcFunctionNode &node = nodes[idx];
+    RISCVLibcFunctionDecode &decoded = getRISCVLibcFunctionDecodeCached(
+        *node.section, *node.sym, decodeCache, perfStats);
+    DenseMap<uint64_t, SmallVector<RISCVLibcControlFlowRelocInfo, 0>>
+        &controlFlowRelocs =
+            getRISCVLibcControlFlowRelocsCached<ELFT>(*node.section,
+                                                      controlFlowRelocCache);
+    size_t firstCall = printfCoreFloatCalls.size();
+    RelsOrRelas<ELFT> rels = node.section->template relsOrRelas<ELFT>();
+    auto scanCallRels = [&](auto rels) {
+      for (const auto &rel : rels) {
+        if (rel.r_offset < node.sym->value ||
+            rel.r_offset >= node.sym->value + node.sym->size)
+          continue;
+        RelType type = rel.getType(config->isMips64EL);
+        if (type != R_RISCV_CALL && type != R_RISCV_CALL_PLT)
+          continue;
+        Symbol &targetSym =
+            node.section->getFile<ELFT>()->getRelocTargetSym(rel);
+        Defined *target = dyn_cast<Defined>(&targetSym);
+        if (!target || !isRISCVPrintfCoreFloatHelperName(target->getName()))
+          continue;
+        RISCVLibcPrintfCoreFloatCall call;
+        call.sourceSection = node.section;
+        call.sourceFunction = node.sym;
+        call.helper = target;
+        call.targetSection = dyn_cast_or_null<InputSectionBase>(target->section);
+        call.helperSize = target->size;
+        call.relocOffset = rel.r_offset;
+        call.callInsnOffset = getRISCVLibcCallInsnOffset(decoded, rel.r_offset);
+        call.relocType = type;
+        printfCoreFloatCalls.push_back(call);
+        printfCoreFloatHelpers.insert(target);
+      }
+    };
+    scanCallRels(rels.rels);
+    scanCallRels(rels.relas);
+
+    DenseSet<uint64_t> blockBoundaries;
+    blockBoundaries.insert(decoded.funcStart);
+    for (const RISCVLibcInsn &insn : decoded.instructions) {
+      if (insn.offset < node.sym->value ||
+          insn.offset >= node.sym->value + node.sym->size)
+        continue;
+      if (!isRISCVLibcNonCallControlFlow(controlFlowRelocs, insn))
+        continue;
+      if (const RISCVLibcInsn *next = getRISCVLibcNextInsn(decoded, insn))
+        if (next->offset < node.sym->value + node.sym->size)
+          blockBoundaries.insert(next->offset);
+    }
+    for (const auto &entry : controlFlowRelocs) {
+      uint64_t source = entry.first;
+      const RISCVLibcInsn *sourceInsn = getRISCVLibcInsnAt(decoded, source);
+      if (!sourceInsn || source < node.sym->value ||
+          source >= node.sym->value + node.sym->size)
+        continue;
+      for (const RISCVLibcControlFlowRelocInfo &r : entry.second) {
+        if (!isRISCVLibcDirectBranchOrJumpReloc(r.type))
+          continue;
+        if (isRISCVLibcNormalDirectCall(controlFlowRelocs, *sourceInsn))
+          continue;
+        if (!r.hasTarget || r.targetSection != node.section)
+          continue;
+        if (r.targetOffset >= node.sym->value &&
+            r.targetOffset < node.sym->value + node.sym->size &&
+            getRISCVLibcInsnAt(decoded, r.targetOffset))
+          blockBoundaries.insert(r.targetOffset);
+      }
+    }
+
+    SmallVector<uint64_t, 0> sortedBoundaries;
+    for (uint64_t off : blockBoundaries)
+      sortedBoundaries.push_back(off);
+    llvm::sort(sortedBoundaries);
+
+    auto blockForCall = [&](uint64_t callOff,
+                            RISCVLibcPrintfCoreFloatRegion &region) {
+      if (!getRISCVLibcInsnAt(decoded, callOff))
+        return false;
+      auto it = llvm::upper_bound(sortedBoundaries, callOff);
+      if (it == sortedBoundaries.begin())
+        return false;
+      uint64_t blockStart = *(it - 1);
+      const RISCVLibcInsn *startInsn = getRISCVLibcInsnAt(decoded, blockStart);
+      if (!startInsn)
+        return false;
+      uint64_t nextBoundary =
+          it == sortedBoundaries.end() ? node.sym->value + node.sym->size : *it;
+      uint64_t blockEnd = std::numeric_limits<uint64_t>::max();
+      bool sawCall = false;
+      for (const RISCVLibcInsn &insn : decoded.instructions) {
+        if (insn.offset < blockStart)
+          continue;
+        if (insn.offset >= nextBoundary)
+          break;
+        if (insn.offset == callOff)
+          sawCall = true;
+        blockEnd = insn.offset + insn.size - 1;
+        if (isRISCVLibcNonCallControlFlow(controlFlowRelocs, insn))
+          break;
+      }
+      if (blockEnd == std::numeric_limits<uint64_t>::max() ||
+          blockStart < node.sym->value ||
+          blockEnd >= node.sym->value + node.sym->size || !sawCall ||
+          callOff < blockStart || callOff > blockEnd)
+        return false;
+      region.section = node.section;
+      region.function = node.sym;
+      region.start = blockStart;
+      region.end = blockEnd;
+      region.helperCallCount = 1;
+      return true;
+    };
+
+    for (const RISCVLibcPrintfCoreFloatCall &call :
+         ArrayRef<RISCVLibcPrintfCoreFloatCall>(printfCoreFloatCalls)
+             .slice(firstCall)) {
+      if (call.callInsnOffset < node.sym->value ||
+          call.callInsnOffset >= node.sym->value + node.sym->size)
+        continue;
+      RISCVLibcPrintfCoreFloatRegion r;
+      if (!blockForCall(call.callInsnOffset, r)) {
+        ++printfCoreFloatUnknownControlFlow;
+        continue;
+      }
+      bool found = false;
+      for (RISCVLibcPrintfCoreFloatRegion &old : printfCoreFloatRegions) {
+        if (old.section == r.section && old.function == r.function &&
+            old.start == r.start && old.end == r.end) {
+          ++old.helperCallCount;
+          found = true;
+          break;
+        }
+      }
+      if (!found)
+        printfCoreFloatRegions.push_back(r);
+    }
+
+    llvm::sort(printfCoreFloatRegions,
+               [](const RISCVLibcPrintfCoreFloatRegion &a,
+                  const RISCVLibcPrintfCoreFloatRegion &b) {
+                 if (a.section != b.section)
+                   return a.section < b.section;
+                 if (a.function != b.function)
+                   return a.function < b.function;
+                 return a.start < b.start;
+               });
+    for (const auto &entry : controlFlowRelocs) {
+      uint64_t source = entry.first;
+      for (const RISCVLibcControlFlowRelocInfo &r : entry.second) {
+        if (!isRISCVLibcControlFlowAuditReloc(r.type))
+          continue;
+        int sourceRegion = regionIndexFor(node.section, node.sym, source);
+        if (!r.hasTarget || r.targetSection != node.section) {
+          if (sourceRegion >= 0)
+            ++printfCoreFloatUnknownControlFlow;
+          continue;
+        }
+        int targetRegion =
+            regionIndexFor(node.section, node.sym, r.targetOffset);
+        if (sourceRegion >= 0 && targetRegion >= 0 &&
+            sourceRegion == targetRegion) {
+          ++printfCoreFloatInternalEdges;
+        } else if (sourceRegion < 0 && targetRegion >= 0) {
+          ++printfCoreFloatIncomingEdges;
+          ++printfCoreFloatDispatchCandidates;
+          message(Twine("  float_dispatch_candidate source_offset=") +
+                  hexOffset(source) + " target_offset=" +
+                  hexOffset(r.targetOffset) + " relocation=" +
+                  lld::toString(r.type) + " target_region=" +
+                  Twine(targetRegion));
+        } else if (sourceRegion >= 0 && targetRegion < 0) {
+          ++printfCoreFloatOutgoingEdges;
+        }
+      }
+    }
+
+    for (const RISCVLibcPrintfCoreFloatRegion &region :
+         printfCoreFloatRegions) {
+      if (region.section != node.section || region.function != node.sym)
+        continue;
+      const RISCVLibcInsn *firstInsn = getRISCVLibcInsnAt(decoded, region.start);
+      const RISCVLibcInsn *lastInsn = nullptr;
+      for (const RISCVLibcInsn &insn : decoded.instructions) {
+        if (insn.offset > region.end)
+          break;
+        if (insn.offset >= region.start)
+          lastInsn = &insn;
+      }
+      if (!firstInsn || !lastInsn) {
+        ++printfCoreFloatUnknownControlFlow;
+        continue;
+      }
+      const RISCVLibcInsn *prevInsn = nullptr;
+      for (const RISCVLibcInsn &insn : decoded.instructions) {
+        if (insn.offset + insn.size == region.start) {
+          prevInsn = &insn;
+          break;
+        }
+      }
+      if (prevInsn) {
+        std::optional<bool> fallthrough =
+            hasRISCVLibcKnownFallthrough(controlFlowRelocs, *prevInsn);
+        if (!fallthrough) {
+          ++printfCoreFloatUnknownControlFlow;
+        } else if (*fallthrough) {
+          ++printfCoreFloatIncomingFallthroughEdges;
+          message(Twine("  float_region_edge kind=fallthrough direction=incoming"
+                        " source_offset=") +
+                  hexOffset(prevInsn->offset) + " target_offset=" +
+                  hexOffset(region.start));
+        }
+      }
+      std::optional<bool> fallthrough =
+          hasRISCVLibcKnownFallthrough(controlFlowRelocs, *lastInsn);
+      if (!fallthrough) {
+        ++printfCoreFloatUnknownControlFlow;
+      } else if (*fallthrough) {
+        const RISCVLibcInsn *nextInsn = getRISCVLibcNextInsn(decoded, *lastInsn);
+        if (nextInsn && !containsRISCVLibcOffset(region, nextInsn->offset)) {
+          ++printfCoreFloatOutgoingFallthroughEdges;
+          message(Twine("  float_region_edge kind=fallthrough direction=outgoing"
+                        " source_offset=") +
+                  hexOffset(lastInsn->offset) + " target_offset=" +
+                  hexOffset(nextInsn->offset));
+        }
+      }
+    }
+  }
+
+  for (const RISCVLibcPrintfCoreFloatCall &call : printfCoreFloatCalls) {
+    uint32_t matches = 0;
+    for (const RISCVLibcPrintfCoreFloatRegion &r : printfCoreFloatRegions)
+      if (r.section == call.sourceSection && r.function == call.sourceFunction &&
+          containsRISCVLibcOffset(r, call.callInsnOffset))
+        ++matches;
+    if (matches != 1) {
+      ++printfCoreFloatHelperCallMisses;
+      ++printfCoreFloatUnknownControlFlow;
+    }
+  }
+
+  for (const RISCVLibcPrintfCoreFloatRegion &r : printfCoreFloatRegions)
+    if (r.end >= r.start)
+      printfCoreFloatCandidateBytes += r.end - r.start + 1;
+
   uint32_t failedCallsiteDumpRequested =
       config->riscvLibcSpecializationAuditDumpFailedCalls;
   uint32_t failedCallsiteDumpEmitted = 0;
@@ -6619,6 +7039,24 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
             " exclusive=" + Twine(exclusive ? 1 : 0) +
             " outside_live_incoming=" + Twine(outsideLiveIncoming(i)));
   }
+
+  for (const RISCVLibcPrintfCoreFloatCall &call : printfCoreFloatCalls) {
+    message(Twine("  printf_core_float_call helper=") +
+            call.helper->getName() + " call_offset=" +
+            hexOffset(call.relocOffset) + " call_insn_offset=" +
+            hexOffset(call.callInsnOffset) + " reloc=" +
+            lld::toString(call.relocType) + " target_section=" +
+            (call.targetSection ? call.targetSection->name
+                                : StringRef("none")) +
+            " target_size=" + Twine(call.helperSize));
+  }
+  for (auto [i, region] : llvm::enumerate(printfCoreFloatRegions))
+    message(Twine("  printf_core_float_region index=") + Twine(i) +
+            " start=" + hexOffset(region.start) +
+            " end=" + hexOffset(region.end) + " bytes=" +
+            Twine(region.end >= region.start ? region.end - region.start + 1
+                                             : 0) +
+            " helper_calls=" + Twine(region.helperCallCount));
 
   for (RISCVLibcPrintfCall &call : printfCalls) {
     bool dumpByOffset =
@@ -6749,6 +7187,34 @@ template <class ELFT> static void printRISCVLibcSpecializationAudit() {
           Twine(loopCarriedFailOther));
   message(Twine("  all_user_printf_formats_proven_non_float=") +
           Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
+  message(Twine("  printf_specialization_gate_ready=") +
+          Twine(allUserPrintfFormatsProvenNonFloat ? 1 : 0));
+  message(Twine("  printf_core_float_helper_calls=") +
+          Twine(printfCoreFloatCalls.size()));
+  message(Twine("  printf_core_float_helper_unique_functions=") +
+          Twine(printfCoreFloatHelpers.size()));
+  message(Twine("  printf_core_float_candidate_regions=") +
+          Twine(printfCoreFloatRegions.size()));
+  message(Twine("  printf_core_float_candidate_bytes=") +
+          Twine(printfCoreFloatCandidateBytes));
+  message(Twine("  printf_core_float_region_internal_edges=") +
+          Twine(printfCoreFloatInternalEdges));
+  message(Twine("  printf_core_float_region_incoming_edges=") +
+          Twine(printfCoreFloatIncomingEdges));
+  message(Twine("  printf_core_float_region_outgoing_edges=") +
+          Twine(printfCoreFloatOutgoingEdges));
+  message(Twine("  printf_core_float_region_incoming_fallthrough_edges=") +
+          Twine(printfCoreFloatIncomingFallthroughEdges));
+  message(Twine("  printf_core_float_region_outgoing_fallthrough_edges=") +
+          Twine(printfCoreFloatOutgoingFallthroughEdges));
+  message(Twine("  printf_core_float_dispatch_candidates=") +
+          Twine(printfCoreFloatDispatchCandidates));
+  message(Twine("  printf_core_float_unknown_control_flow=") +
+          Twine(printfCoreFloatUnknownControlFlow));
+  message(Twine("  printf_core_float_region_helper_call_misses=") +
+          Twine(printfCoreFloatHelperCallMisses));
+  message(Twine("  printf_core_float_region_isolatable=") +
+          Twine(printfCoreFloatRegionIsolatable ? 1 : 0));
   message(Twine("  candidate_float_format_seen=") +
           Twine(candidateFloatFormatSeen ? 1 : 0));
   message(Twine("  candidate_long_double_format_seen=") +
