@@ -4949,6 +4949,9 @@ struct RISCVConfigProofResult {
   uint32_t loopIterations = 0;
   uint32_t readonlyLoads = 0;
   uint32_t directCalls = 0;
+  uint32_t constantBranches = 0;
+  uint32_t alwaysTakenBranches = 0;
+  uint32_t neverTakenBranches = 0;
   std::map<std::string, std::optional<int64_t>> values;
 };
 
@@ -5100,6 +5103,35 @@ static bool isRISCVConfigReturn(const RISCVConfigInsn &insn) {
   return false;
 }
 
+static bool evaluateRISCVConfigBranch(uint32_t insn, int64_t lhs, int64_t rhs,
+                                      bool &taken) {
+  uint32_t funct3 = bits(insn, 14, 12);
+  uint32_t lhs32 = static_cast<uint32_t>(lhs);
+  uint32_t rhs32 = static_cast<uint32_t>(rhs);
+  switch (funct3) {
+  case 0:
+    taken = lhs32 == rhs32;
+    return true;
+  case 1:
+    taken = lhs32 != rhs32;
+    return true;
+  case 4:
+    taken = static_cast<int32_t>(lhs32) < static_cast<int32_t>(rhs32);
+    return true;
+  case 5:
+    taken = static_cast<int32_t>(lhs32) >= static_cast<int32_t>(rhs32);
+    return true;
+  case 6:
+    taken = lhs32 < rhs32;
+    return true;
+  case 7:
+    taken = lhs32 >= rhs32;
+    return true;
+  default:
+    return false;
+  }
+}
+
 template <class ELFT>
 static SmallVector<RISCVConfigBasicBlock, 0>
 buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
@@ -5115,6 +5147,17 @@ buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
       return {};
     }
     allInsns.push_back(insn);
+    if (insn.size == 4 && (insn.raw & 0x7f) == 0x63) {
+      int64_t signedTarget = static_cast<int64_t>(off) + decodeBranch(insn.raw);
+      uint64_t fallthrough = off + insn.size;
+      if (signedTarget >= 0) {
+        uint64_t target = static_cast<uint64_t>(signedTarget);
+        if (target >= func.value && target < func.value + func.size)
+          boundaries.insert(target);
+      }
+      if (fallthrough < func.value + func.size)
+        boundaries.insert(fallthrough);
+    }
     off += insn.size;
   }
 
@@ -5437,8 +5480,32 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         return result;
       }
       if (opcode == 0x63) {
-        result.reason = "branch-evaluator-not-implemented";
-        return result;
+        if (state.regs[insn.rs1].kind != RISCVConfigValueKind::Integer ||
+            state.regs[insn.rs2].kind != RISCVConfigValueKind::Integer) {
+          result.reason = "unknown-branch-operands";
+          return result;
+        }
+        bool taken = false;
+        if (!evaluateRISCVConfigBranch(insn.raw, state.regs[insn.rs1].value,
+                                       state.regs[insn.rs2].value, taken)) {
+          result.reason = "unsupported-branch-kind";
+          return result;
+        }
+        ++result.constantBranches;
+        if (taken)
+          ++result.alwaysTakenBranches;
+        else
+          ++result.neverTakenBranches;
+        int64_t branchImm = decodeBranch(insn.raw);
+        int64_t signedTarget = static_cast<int64_t>(insn.off) + branchImm;
+        if (taken && signedTarget < 0) {
+          result.reason = "branch-target-out-of-range";
+          return result;
+        }
+        current = taken ? static_cast<uint64_t>(signedTarget)
+                        : insn.off + insn.size;
+        transferred = true;
+        break;
       }
       if (opcode == 0x6f || opcode == 0x67) {
         ++result.directCalls;
@@ -5600,6 +5667,9 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " executed_instructions=" + Twine(proof.executedInstructions) +
           " loop_iterations=" + Twine(proof.loopIterations) +
           " readonly_loads=" + Twine(proof.readonlyLoads) +
+          " evaluator_constant_branches=" + Twine(proof.constantBranches) +
+          " evaluator_always_taken=" + Twine(proof.alwaysTakenBranches) +
+          " evaluator_never_taken=" + Twine(proof.neverTakenBranches) +
           " direct_calls=" + Twine(proof.directCalls) +
           " final_status=" + (proof.complete ? Twine("complete")
                                              : Twine("failed")) +
