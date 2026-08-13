@@ -7108,7 +7108,7 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
     }
   }
 
-  if (initCall && initCaller)
+  if (initCall && initCaller) {
     uint64_t displayOffset = initCall->callOffset;
     for (const RISCVConfigInitOrderEdge &edge : initOrderEdges)
       if (edge.caller == initCaller && edge.callerOffset == initCall->callOffset &&
@@ -7119,6 +7119,7 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
             " call_offset=0x" + Twine::utohexstr(displayOffset) +
             " before=before-init after=after-init"
             " reason=proven-initialization-call");
+  }
   for (const RISCVConfigInitOrderEdge &edge : initOrderEdges) {
     auto it = initCallsiteStates.find({edge.caller, edge.callerOffset});
     if (it == initCallsiteStates.end())
