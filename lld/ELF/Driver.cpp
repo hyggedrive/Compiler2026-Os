@@ -4294,6 +4294,13 @@ enum class RISCVConfigInsnKind {
   CLui,
   CMv,
   CAdd,
+  CSrli,
+  CSrai,
+  CAndi,
+  CSub,
+  CXor,
+  COr,
+  CAnd,
   CLwsp,
   CSwsp,
   CControlFlow,
@@ -4320,6 +4327,20 @@ static StringRef riscvConfigInsnKindName(RISCVConfigInsnKind kind) {
     return "c.mv";
   case RISCVConfigInsnKind::CAdd:
     return "c.add";
+  case RISCVConfigInsnKind::CSrli:
+    return "c.srli";
+  case RISCVConfigInsnKind::CSrai:
+    return "c.srai";
+  case RISCVConfigInsnKind::CAndi:
+    return "c.andi";
+  case RISCVConfigInsnKind::CSub:
+    return "c.sub";
+  case RISCVConfigInsnKind::CXor:
+    return "c.xor";
+  case RISCVConfigInsnKind::COr:
+    return "c.or";
+  case RISCVConfigInsnKind::CAnd:
+    return "c.and";
   case RISCVConfigInsnKind::CLwsp:
     return "c.lwsp";
   case RISCVConfigInsnKind::CSwsp:
@@ -4397,6 +4418,49 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
         insn.kind = RISCVConfigInsnKind::CLui;
         insn.imm = SignExtend64<18>((bits(half, 12, 12) << 17) |
                                     (bits(half, 6, 2) << 12));
+      }
+    } else if (quadrant == 1 && funct3 == 4) {
+      uint32_t op = bits(half, 11, 10);
+      insn.rd = 8 + bits(half, 9, 7);
+      insn.rs1 = insn.rd;
+      if (op == 0) {
+        if (bits(half, 12, 12) != 0) {
+          insn.kind = RISCVConfigInsnKind::Unknown;
+        } else {
+          insn.kind = RISCVConfigInsnKind::CSrli;
+          insn.imm = (bits(half, 12, 12) << 5) | bits(half, 6, 2);
+        }
+      } else if (op == 1) {
+        if (bits(half, 12, 12) != 0) {
+          insn.kind = RISCVConfigInsnKind::Unknown;
+        } else {
+          insn.kind = RISCVConfigInsnKind::CSrai;
+          insn.imm = (bits(half, 12, 12) << 5) | bits(half, 6, 2);
+        }
+      } else if (op == 2) {
+        insn.kind = RISCVConfigInsnKind::CAndi;
+        insn.imm =
+            SignExtend64<6>((bits(half, 12, 12) << 5) | bits(half, 6, 2));
+      } else {
+        insn.rs2 = 8 + bits(half, 4, 2);
+        if (bits(half, 12, 12) != 0) {
+          insn.kind = RISCVConfigInsnKind::Unknown;
+        } else {
+          switch (bits(half, 6, 5)) {
+          case 0:
+            insn.kind = RISCVConfigInsnKind::CSub;
+            break;
+          case 1:
+            insn.kind = RISCVConfigInsnKind::CXor;
+            break;
+          case 2:
+            insn.kind = RISCVConfigInsnKind::COr;
+            break;
+          case 3:
+            insn.kind = RISCVConfigInsnKind::CAnd;
+            break;
+          }
+        }
       }
     } else if (quadrant == 2 && funct3 == 4) {
       insn.rd = bits(half, 11, 7);
@@ -5919,6 +5983,47 @@ tryEvaluateRISCVConfigInitialization(
           state.regs[insn.rd] = out;
           continue;
         }
+        if (insn.kind == RISCVConfigInsnKind::CSrli ||
+            insn.kind == RISCVConfigInsnKind::CSrai ||
+            insn.kind == RISCVConfigInsnKind::CAndi) {
+          if (state.regs[insn.rs1].kind != RISCVConfigValueKind::Integer) {
+            result.reason = "unknown-c-misc-alu-source";
+            return result;
+          }
+          uint32_t src = static_cast<uint32_t>(state.regs[insn.rs1].value);
+          if (insn.kind == RISCVConfigInsnKind::CSrli)
+            state.regs[insn.rd] = riscvConfigInteger(src >> insn.imm);
+          else if (insn.kind == RISCVConfigInsnKind::CSrai)
+            state.regs[insn.rd] = riscvConfigInteger(
+                static_cast<int32_t>(src) >> insn.imm);
+          else
+            state.regs[insn.rd] = riscvConfigInteger(
+                src & static_cast<uint32_t>(insn.imm));
+          continue;
+        }
+        if (insn.kind == RISCVConfigInsnKind::CSub ||
+            insn.kind == RISCVConfigInsnKind::CXor ||
+            insn.kind == RISCVConfigInsnKind::COr ||
+            insn.kind == RISCVConfigInsnKind::CAnd) {
+          if (state.regs[insn.rs1].kind != RISCVConfigValueKind::Integer ||
+              state.regs[insn.rs2].kind != RISCVConfigValueKind::Integer) {
+            result.reason = "unknown-c-reg-alu-source";
+            return result;
+          }
+          uint32_t lhs = static_cast<uint32_t>(state.regs[insn.rs1].value);
+          uint32_t rhs = static_cast<uint32_t>(state.regs[insn.rs2].value);
+          uint32_t out = 0;
+          if (insn.kind == RISCVConfigInsnKind::CSub)
+            out = lhs - rhs;
+          else if (insn.kind == RISCVConfigInsnKind::CXor)
+            out = lhs ^ rhs;
+          else if (insn.kind == RISCVConfigInsnKind::COr)
+            out = lhs | rhs;
+          else
+            out = lhs & rhs;
+          state.regs[insn.rd] = riscvConfigInteger(out);
+          continue;
+        }
         if (insn.kind == RISCVConfigInsnKind::CSwsp) {
           if (state.regs[2].kind != RISCVConfigValueKind::StackAddress) {
             result.reason = "c-swsp-sp-not-stack";
@@ -5983,16 +6088,18 @@ tryEvaluateRISCVConfigInitialization(
         } else if (funct3 == 7 &&
                    state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
           state.regs[insn.rd] =
-              riscvConfigInteger(state.regs[insn.rs1].value & insn.imm);
+              riscvConfigInteger(static_cast<uint32_t>(
+                  state.regs[insn.rs1].value) &
+                                 static_cast<uint32_t>(insn.imm));
         } else if (funct3 == 1 && bits(insn.raw, 31, 25) == 0 &&
                    state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
-          state.regs[insn.rd] = riscvConfigInteger(
-              state.regs[insn.rs1].value << bits(insn.raw, 24, 20));
+          state.regs[insn.rd] = riscvConfigInteger(static_cast<uint32_t>(
+              state.regs[insn.rs1].value) << bits(insn.raw, 24, 20));
         } else if (funct3 == 5 && bits(insn.raw, 31, 25) == 0 &&
                    state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
-          state.regs[insn.rd] = riscvConfigInteger(static_cast<int64_t>(
+          state.regs[insn.rd] = riscvConfigInteger(
               static_cast<uint32_t>(state.regs[insn.rs1].value) >>
-              bits(insn.raw, 24, 20)));
+              bits(insn.raw, 24, 20));
         } else {
           result.reason = "unsupported-op-imm";
           return result;
@@ -6024,27 +6131,44 @@ tryEvaluateRISCVConfigInitialization(
           return result;
         }
         if (funct3 == 0 && funct7 == 0) {
-          RISCVConfigValue out;
-          if (!riscvConfigAddValues(state.regs[insn.rs1], state.regs[insn.rs2],
-                                    out)) {
-            result.reason = "unsupported-add-address-arithmetic";
-            return result;
+          if (state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer &&
+              state.regs[insn.rs2].kind == RISCVConfigValueKind::Integer) {
+            state.regs[insn.rd] = riscvConfigInteger(
+                static_cast<uint32_t>(state.regs[insn.rs1].value) +
+                static_cast<uint32_t>(state.regs[insn.rs2].value));
+          } else {
+            RISCVConfigValue out;
+            if (!riscvConfigAddValues(state.regs[insn.rs1],
+                                      state.regs[insn.rs2], out)) {
+              result.reason = "unsupported-add-address-arithmetic";
+              return result;
+            }
+            state.regs[insn.rd] = out;
           }
-          state.regs[insn.rd] = out;
         } else if (funct3 == 0 && funct7 == 0x20 &&
                    state.regs[insn.rs2].kind == RISCVConfigValueKind::Integer) {
-          RISCVConfigValue out;
-          if (!riscvConfigSubInteger(state.regs[insn.rs1],
-                                     state.regs[insn.rs2].value, out)) {
-            result.reason = "unsupported-sub-address-arithmetic";
-            return result;
+          if (state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
+            state.regs[insn.rd] = riscvConfigInteger(
+                static_cast<uint32_t>(state.regs[insn.rs1].value) -
+                static_cast<uint32_t>(state.regs[insn.rs2].value));
+          } else {
+            RISCVConfigValue out;
+            if (!riscvConfigSubInteger(state.regs[insn.rs1],
+                                       state.regs[insn.rs2].value, out)) {
+              result.reason = "unsupported-sub-address-arithmetic";
+              return result;
+            }
+            state.regs[insn.rd] = out;
           }
-          state.regs[insn.rd] = out;
         } else if (funct3 == 0 && funct7 == 1 &&
                    state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer &&
                    state.regs[insn.rs2].kind == RISCVConfigValueKind::Integer)
           state.regs[insn.rd] = riscvConfigInteger(
-              state.regs[insn.rs1].value * state.regs[insn.rs2].value);
+              static_cast<uint32_t>(
+                  static_cast<uint64_t>(static_cast<uint32_t>(
+                      state.regs[insn.rs1].value)) *
+                  static_cast<uint64_t>(static_cast<uint32_t>(
+                      state.regs[insn.rs2].value))));
         else {
           result.reason = "unsupported-op";
           return result;
