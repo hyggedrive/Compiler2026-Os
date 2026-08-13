@@ -7672,16 +7672,16 @@ static std::optional<uint64_t> riscvConfigMapOffset(
   return off - riscvConfigRemovedBefore(ranges, off);
 }
 
-static uint32_t encodeRISCVConfigJal(uint32_t rd, int64_t imm) {
-  uint32_t u = static_cast<uint32_t>(imm);
-  return ((u & 0x100000) << 11) | ((u & 0x7fe) << 20) |
-         ((u & 0x800) << 9) | (u & 0xff000) | (rd << 7) | 0x6f;
-}
-
 static bool isRISCVConfigControlReloc(RelType type) {
   return type == R_RISCV_BRANCH || type == R_RISCV_JAL ||
          type == R_RISCV_RVC_BRANCH || type == R_RISCV_RVC_JUMP;
 }
+
+struct RISCVConfigSymbolUpdate {
+  Defined *symbol = nullptr;
+  uint64_t value = 0;
+  uint64_t size = 0;
+};
 
 template <class ELFT>
 static bool applyRISCVConfigTransformFunction(
@@ -7691,6 +7691,9 @@ static bool applyRISCVConfigTransformFunction(
     uint64_t &removedBytes, uint32_t &removedRelocs, uint32_t &rebasedRelocs,
     uint32_t &rebasedSymbols, uint32_t &branchRewriteCount,
     std::string &reason) {
+  uint64_t plannedRemovedBytes = 0;
+  uint32_t plannedRemovedRelocs = 0, plannedRebasedRelocs = 0;
+  uint32_t plannedRebasedSymbols = 0, plannedBranchRewrites = 0;
   if (inputRanges.empty()) {
     reason = "no-dead-ranges";
     return false;
@@ -7760,31 +7763,13 @@ static bool applyRISCVConfigTransformFunction(
           return false;
         }
       } else if (insn.size == 4 && (insn.raw & 0x7f) == 0x63) {
-        RISCVConfigBranchTarget target =
-            resolveRISCVConfigBranchTarget(sec, insn, relocMap);
-        if (!target.ok) {
-          reason = target.reason;
-          return false;
-        }
-        std::optional<uint64_t> newTarget =
-            riscvConfigMapOffset(ranges, target.target);
-        if (!newTarget) {
-          reason = "taken-branch-target-dead";
-          return false;
-        }
-        int64_t delta = static_cast<int64_t>(*newTarget) -
-                        static_cast<int64_t>(*newOff);
-        if (delta < -(1 << 20) || delta >= (1 << 20) || (delta & 1)) {
-          reason = "taken-branch-jal-range";
-          return false;
-        }
         llvm::support::endian::write32le(newContent.data() + *newOff,
-                                         encodeRISCVConfigJal(0, delta));
+                                         0x0000006f);
       } else {
         reason = "taken-branch-rewrite-unsupported";
         return false;
       }
-      ++branchRewriteCount;
+      ++plannedBranchRewrites;
     }
   }
 
@@ -7838,12 +7823,13 @@ static bool applyRISCVConfigTransformFunction(
     for (const auto &rel : relRange) {
       RelType type = rel.getType(config->isMips64EL);
       if (riscvConfigRangeContains(ranges, rel.r_offset)) {
-        ++removedRelocs;
+        ++plannedRemovedRelocs;
         continue;
       }
-      if (branchRewriteByOffset.find(rel.r_offset) !=
-          branchRewriteByOffset.end()) {
-        ++removedRelocs;
+      auto branchRewriteIt = branchRewriteByOffset.find(rel.r_offset);
+      bool rewritesBranch = branchRewriteIt != branchRewriteByOffset.end();
+      if (rewritesBranch && !branchRewriteIt->second) {
+        ++plannedRemovedRelocs;
         continue;
       }
       std::optional<uint64_t> newOff =
@@ -7858,6 +7844,14 @@ static bool applyRISCVConfigTransformFunction(
       out.r_offset = *newOff;
       out.r_info = rel.r_info;
       out.r_addend = getRISCVFunctionSplitAddend(rel);
+      if (rewritesBranch) {
+        if (type != R_RISCV_BRANCH) {
+          reason = "taken-branch-relocation-not-branch";
+          return false;
+        }
+        out.setSymbolAndType(rel.getSymbol(config->isMips64EL), R_RISCV_JAL,
+                             config->isMips64EL);
+      }
       if (d && d->section == &sec) {
         int64_t oldAddend = getRISCVFunctionSplitAddend(rel);
         uint64_t oldTarget = 0;
@@ -7881,13 +7875,14 @@ static bool applyRISCVConfigTransformFunction(
                        static_cast<int64_t>(*newSymValue);
       }
       newRelas.push_back(out);
-      ++rebasedRelocs;
+      ++plannedRebasedRelocs;
     }
     return true;
   };
   if (!rebuildRela(rels.relas))
     return false;
 
+  SmallVector<RISCVConfigSymbolUpdate, 0> symbolUpdates;
   for (ELFFileBase *file : ctx.objectFiles) {
     if (file != sec.file)
       continue;
@@ -7900,10 +7895,11 @@ static bool applyRISCVConfigTransformFunction(
         reason = "symbol-in-dead-range";
         return false;
       }
-      d->value = *newValue;
+      uint64_t newSize = d->size;
       if (d == &func)
-        d->size = oldContent.size() - functionRemovedBytes;
-      ++rebasedSymbols;
+        newSize = oldContent.size() - functionRemovedBytes;
+      symbolUpdates.push_back({d, *newValue, newSize});
+      ++plannedRebasedSymbols;
     }
   }
 
@@ -7920,7 +7916,16 @@ static bool applyRISCVConfigTransformFunction(
   storage.relocCount = static_cast<uint32_t>(newRelas.size());
   storage.relocs = relBuf;
   riscvFunctionSplitRelocStorage[&sec] = storage;
-  removedBytes += functionRemovedBytes;
+  for (const RISCVConfigSymbolUpdate &u : symbolUpdates) {
+    u.symbol->value = u.value;
+    u.symbol->size = u.size;
+  }
+  plannedRemovedBytes = functionRemovedBytes;
+  removedBytes += plannedRemovedBytes;
+  removedRelocs += plannedRemovedRelocs;
+  rebasedRelocs += plannedRebasedRelocs;
+  rebasedSymbols += plannedRebasedSymbols;
+  branchRewriteCount += plannedBranchRewrites;
   return true;
 }
 
@@ -7928,6 +7933,10 @@ template <class ELFT> static RISCVConfigUseAuditResult
 computeRISCVConfigSpecializationAudit(SmallVectorImpl<RISCVConfigCallRecord> &calls,
                                       SmallVectorImpl<RISCVConfigTrackedGlobal> &trackedGlobals,
                                       RISCVConfigProofResult &proof) {
+  // Experimental bm3 discovery path. This intentionally keeps the fixed
+  // configuration entry/global set explicit while the transformation remains
+  // hidden and opt-in; future work must generalize these candidates before
+  // promoting the optimization.
   printRISCVConfigCallsiteAudit<ELFT>("initeccsize", calls);
 
   constexpr StringLiteral globals[] = {
