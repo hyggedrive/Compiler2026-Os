@@ -379,6 +379,10 @@ def print_riscv_function_sections_split: FF<"print-riscv-function-sections-split
   HelpText<"Print RISC-V function section split audit statistics">,
   Flags<[HelpHidden]>;
 
+def print_riscv_config_specialization_audit: FF<"print-riscv-config-specialization-audit">,
+  HelpText<"Print RISC-V fixed configuration specialization audit statistics">,
+  Flags<[HelpHidden]>;
+
 defm relax: BB<"relax",
   "Enable target-specific relaxations if supported (default)",
   "Disable target-specific relaxations">;
