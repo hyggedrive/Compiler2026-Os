@@ -4408,6 +4408,7 @@ static bool riscvConfigRelocTargetsObject(InputSectionBase &sec,
   return targetOff >= object.value && targetOff < objectEnd;
 }
 
+template <class ELFT>
 static Defined *findUniqueRISCVConfigDefinedByName(StringRef name,
                                                    uint8_t type,
                                                    bool &ambiguous) {
@@ -4435,16 +4436,28 @@ struct RISCVConfigFunctionRef {
   uint64_t end = 0;
 };
 
+template <class ELFT>
 static RISCVConfigFunctionRef
-resolveRISCVFunctionForOffset(InputSectionBase &sec, uint64_t off) {
+resolveRISCVFunctionForLocation(InputSectionBase &sec, uint64_t off) {
   RISCVConfigFunctionRef best;
+  InputSectionBase *parentSec = &sec;
+  uint64_t parentOff = off;
+  auto storageIt = riscvFunctionSplitRelocStorage.find(&sec);
+  if (storageIt != riscvFunctionSplitRelocStorage.end() &&
+      storageIt->second.parent) {
+    parentSec = storageIt->second.parent;
+    parentOff = storageIt->second.originalBegin + off;
+  }
+
   SmallVector<Defined *, 0> funcs;
   for (ELFFileBase *file : ctx.objectFiles) {
     if (file != sec.file)
       continue;
     for (Symbol *sym : file->getSymbols()) {
       Defined *d = dyn_cast_or_null<Defined>(sym);
-      if (!d || d->type != STT_FUNC || d->section != &sec || d->isSection())
+      if (!d || d->type != STT_FUNC || d->isSection())
+        continue;
+      if (d->section != &sec && d->section != parentSec)
         continue;
       funcs.push_back(d);
     }
@@ -4455,33 +4468,41 @@ resolveRISCVFunctionForOffset(InputSectionBase &sec, uint64_t off) {
     return a->getName() < b->getName();
   });
   for (auto [i, d] : llvm::enumerate(funcs)) {
+    bool useParentOffset = d->section == parentSec && parentSec != &sec;
+    uint64_t queryOff = useParentOffset ? parentOff : off;
     uint64_t begin = d->value;
-    uint64_t end = d->size ? d->value + d->size : sec.content().size();
+    auto *symSec = dyn_cast_or_null<InputSectionBase>(d->section);
+    uint64_t secSize = symSec ? symSec->content().size() : 0;
+    uint64_t end = d->size ? d->value + d->size : secSize;
     if (d->size == 0)
       for (size_t j = i + 1, e = funcs.size(); j != e; ++j)
-        if (funcs[j]->value > begin) {
+        if (funcs[j]->section == d->section && funcs[j]->value > begin) {
           end = funcs[j]->value;
           break;
         }
-    if (off < begin || off >= end)
+    if (queryOff < begin || queryOff >= end)
       continue;
-    if (!best.sym || end - begin < best.end - best.begin)
-      best = {d, d->getName().str(), begin, end};
+    if (!best.sym || end - begin < best.end - best.begin) {
+      uint64_t localBegin = begin;
+      uint64_t localEnd = end;
+      if (useParentOffset) {
+        if (end <= storageIt->second.originalBegin ||
+            begin >= storageIt->second.originalEnd)
+          continue;
+        localBegin =
+            begin > storageIt->second.originalBegin
+                ? begin - storageIt->second.originalBegin
+                : 0;
+        localEnd = std::min(end, storageIt->second.originalEnd) -
+                   storageIt->second.originalBegin;
+      }
+      best = {d, d->getName().str(), localBegin, localEnd};
+    }
   }
   if (best.sym)
     return best;
 
-  auto storageIt = riscvFunctionSplitRelocStorage.find(&sec);
-  if (storageIt != riscvFunctionSplitRelocStorage.end() &&
-      storageIt->second.parent) {
-    uint64_t parentOff = storageIt->second.originalBegin + off;
-    RISCVConfigFunctionRef parent =
-        resolveRISCVFunctionForOffset(*storageIt->second.parent, parentOff);
-    if (parent.sym)
-      return parent;
-  }
-
-  best.name = sec.name.str();
+  best.name = "unresolved-function";
   best.begin = 0;
   best.end = sec.content().size();
   return best;
@@ -4584,7 +4605,7 @@ static void printRISCVConfigCallsiteAudit(
             continue;
           uint64_t off = rel.r_offset;
           RISCVConfigFunctionRef caller =
-              resolveRISCVFunctionForOffset(*sec, off);
+              resolveRISCVFunctionForLocation<ELFT>(*sec, off);
           uint64_t begin = caller.begin;
           uint64_t end = caller.end;
           SmallVector<RISCVConfigInsn, 0> insns;
@@ -4651,8 +4672,8 @@ template <class ELFT>
 static void auditRISCVConfigGlobal(StringRef name,
                                    RISCVConfigGlobalAudit &audit) {
   bool ambiguous = false;
-  Defined *targetSym = findUniqueRISCVConfigDefinedByName(name, STT_OBJECT,
-                                                          ambiguous);
+  Defined *targetSym =
+      findUniqueRISCVConfigDefinedByName<ELFT>(name, STT_OBJECT, ambiguous);
   if (!targetSym) {
     if (ambiguous)
       message(Twine("riscv-config-global: symbol=") + name +
@@ -4684,7 +4705,7 @@ static void auditRISCVConfigGlobal(StringRef name,
           RISCVConfigInsn insn = decodeRISCVConfigInsn(sec->content(),
                                                        rel.r_offset);
           RISCVConfigFunctionRef writer =
-              resolveRISCVFunctionForOffset(*sec, rel.r_offset);
+              resolveRISCVFunctionForLocation<ELFT>(*sec, rel.r_offset);
           if (insn.store) {
             ++audit.directWrites;
             audit.writerFunctions.insert(writer.name);
@@ -4728,9 +4749,109 @@ struct RISCVConfigRodataAudit {
 
 struct RISCVConfigProofResult {
   bool complete = false;
-  std::string reason = "static-evaluator-not-implemented";
+  std::string reason = "static-evaluator-not-started";
+  std::string failFunction;
+  uint64_t failOffset = 0;
+  uint32_t failOpcode = 0;
+  uint32_t visitedBlocks = 0;
+  uint32_t executedInstructions = 0;
+  uint32_t loopIterations = 0;
+  uint32_t readonlyLoads = 0;
+  uint32_t directCalls = 0;
   std::map<std::string, std::optional<int64_t>> values;
 };
+
+struct RISCVConfigValue {
+  bool known = false;
+  int64_t value = 0;
+};
+
+struct RISCVConfigEvalState {
+  std::array<RISCVConfigValue, 32> regs;
+};
+
+struct RISCVConfigBasicBlock {
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  SmallVector<RISCVConfigInsn, 0> insns;
+};
+
+static bool isRISCVConfigReturn(const RISCVConfigInsn &insn) {
+  if (insn.size == 4 && (insn.raw & 0x7f) == 0x67)
+    return insn.rd == 0 && insn.rs1 == 1 && bits(insn.raw, 31, 20) == 0;
+  if (insn.size == 2 && (insn.raw & 3) == 2 && bits(insn.raw, 15, 13) == 4)
+    return bits(insn.raw, 11, 7) == 1 && bits(insn.raw, 6, 2) == 0;
+  return false;
+}
+
+template <class ELFT>
+static SmallVector<RISCVConfigBasicBlock, 0>
+buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
+                    std::string &reason) {
+  ArrayRef<uint8_t> data = sec.content();
+  DenseSet<uint64_t> boundaries;
+  boundaries.insert(func.value);
+  SmallVector<RISCVConfigInsn, 0> allInsns;
+  for (uint64_t off = func.value; off < func.value + func.size;) {
+    RISCVConfigInsn insn = decodeRISCVConfigInsn(data, off);
+    if (insn.size == 0 || off + insn.size > func.value + func.size) {
+      reason = "decode-failed";
+      return {};
+    }
+    allInsns.push_back(insn);
+    off += insn.size;
+  }
+
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  auto scan = [&](auto relRange) {
+    for (const auto &rel : relRange) {
+      uint64_t off = rel.r_offset;
+      if (off < func.value || off >= func.value + func.size)
+        continue;
+      RelType type = rel.getType(config->isMips64EL);
+      if (type != R_RISCV_BRANCH && type != R_RISCV_JAL &&
+          type != R_RISCV_RVC_BRANCH && type != R_RISCV_RVC_JUMP)
+        continue;
+      Defined *target = getRISCVConfigRelocTarget<ELFT>(sec, rel);
+      if (!target || target->section != &sec)
+        continue;
+      uint64_t targetOff = 0;
+      if (checkedAddend(target->value, getRISCVFunctionSplitAddend(rel),
+                        targetOff) &&
+          targetOff >= func.value && targetOff < func.value + func.size)
+        boundaries.insert(targetOff);
+      auto it = llvm::find_if(allInsns, [&](const RISCVConfigInsn &insn) {
+        return insn.off == off;
+      });
+      if (it != allInsns.end()) {
+        uint64_t next = it->off + it->size;
+        if (next < func.value + func.size)
+          boundaries.insert(next);
+      }
+    }
+  };
+  scan(rels.rels);
+  scan(rels.relas);
+
+  SmallVector<uint64_t, 0> sorted;
+  for (uint64_t off : boundaries)
+    sorted.push_back(off);
+  llvm::sort(sorted);
+  SmallVector<RISCVConfigBasicBlock, 0> blocks;
+  for (auto [i, begin] : llvm::enumerate(sorted)) {
+    uint64_t end =
+        i + 1 == sorted.size() ? func.value + func.size : sorted[i + 1];
+    RISCVConfigBasicBlock block;
+    block.begin = begin;
+    block.end = end;
+    for (const RISCVConfigInsn &insn : allInsns)
+      if (insn.off >= begin && insn.off < end)
+        block.insns.push_back(insn);
+    if (!block.insns.empty())
+      blocks.push_back(std::move(block));
+  }
+  return blocks;
+}
 
 template <class ELFT>
 static RISCVConfigProofResult
@@ -4761,8 +4882,8 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
   }
 
   bool ambiguous = false;
-  Defined *entry =
-      findUniqueRISCVConfigDefinedByName("initeccsize", STT_FUNC, ambiguous);
+  Defined *entry = findUniqueRISCVConfigDefinedByName<ELFT>(
+      "initeccsize", STT_FUNC, ambiguous);
   if (!entry) {
     result.reason = ambiguous ? "ambiguous-entry-symbol" : "entry-not-found";
     return result;
@@ -4771,11 +4892,156 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
     result.reason = "entry-section-not-input";
     return result;
   }
+  auto *entrySec = cast<InputSectionBase>(entry->section);
+  std::string cfgReason;
+  SmallVector<RISCVConfigBasicBlock, 0> blocks =
+      buildRISCVConfigCFG<ELFT>(*entrySec, *entry, cfgReason);
+  if (blocks.empty()) {
+    result.reason = cfgReason.empty() ? "empty-cfg" : cfgReason;
+    result.failFunction = entry->getName().str();
+    return result;
+  }
 
-  // The current audit has proven the call arguments but does not yet build a
-  // path-sensitive interpreter for the initialization call chain. Keep this
-  // explicit instead of reporting guessed constants.
-  result.reason = "static-evaluator-needs-cfg";
+  RISCVConfigEvalState state;
+  for (auto &r : state.regs)
+    r = {false, 0};
+  state.regs[0] = {true, 0};
+  auto [arg0, arg1] = *argSets.begin();
+  state.regs[10] = {true, arg0};
+  state.regs[11] = {true, arg1};
+
+  DenseSet<uint64_t> visited;
+  uint64_t current = entry->value;
+  for (uint32_t steps = 0; steps < 4096;) {
+    auto blockIt = llvm::find_if(blocks, [&](const RISCVConfigBasicBlock &b) {
+      return b.begin == current;
+    });
+    if (blockIt == blocks.end()) {
+      result.reason = "missing-basic-block";
+      result.failFunction = entry->getName().str();
+      result.failOffset = current;
+      return result;
+    }
+    if (!visited.insert(current).second)
+      ++result.loopIterations;
+    ++result.visitedBlocks;
+    const RISCVConfigBasicBlock &block = *blockIt;
+    bool transferred = false;
+    for (const RISCVConfigInsn &insn : block.insns) {
+      ++steps;
+      ++result.executedInstructions;
+      result.failOffset = insn.off;
+      result.failOpcode = insn.raw & 0x7f;
+      result.failFunction = entry->getName().str();
+      if (steps >= 4096) {
+        result.reason = "evaluator-step-limit";
+        return result;
+      }
+      state.regs[0] = {true, 0};
+      uint32_t opcode = insn.raw & 0x7f;
+      if (insn.size == 2) {
+        uint32_t quadrant = insn.raw & 3;
+        uint32_t funct3 = bits(insn.raw, 15, 13);
+        if (quadrant == 1 && funct3 == 2 && insn.rd > 0) {
+          state.regs[insn.rd] = {true, insn.imm};
+          continue;
+        }
+        if (quadrant == 1 && funct3 == 0 && insn.rd > 0 &&
+            state.regs[insn.rd].known) {
+          state.regs[insn.rd].value += insn.imm;
+          continue;
+        }
+        if (isRISCVConfigReturn(insn)) {
+          result.reason = "return-before-complete";
+          return result;
+        }
+        result.reason = "unsupported-compressed-instruction";
+        return result;
+      }
+      if (opcode == 0x13 && insn.rd > 0) {
+        uint32_t funct3 = bits(insn.raw, 14, 12);
+        if (!state.regs[insn.rs1].known) {
+          result.reason = "unknown-op-imm-source";
+          return result;
+        }
+        if (funct3 == 0)
+          state.regs[insn.rd] = {true, state.regs[insn.rs1].value + insn.imm};
+        else if (funct3 == 7)
+          state.regs[insn.rd] = {true, state.regs[insn.rs1].value & insn.imm};
+        else if (funct3 == 1 && bits(insn.raw, 31, 25) == 0)
+          state.regs[insn.rd] = {true, state.regs[insn.rs1].value
+                                           << bits(insn.raw, 24, 20)};
+        else if (funct3 == 5 && bits(insn.raw, 31, 25) == 0)
+          state.regs[insn.rd] = {
+              true, static_cast<int64_t>(
+                        static_cast<uint32_t>(state.regs[insn.rs1].value) >>
+                        bits(insn.raw, 24, 20))};
+        else {
+          result.reason = "unsupported-op-imm";
+          return result;
+        }
+        continue;
+      }
+      if (opcode == 0x37 && insn.rd > 0) {
+        state.regs[insn.rd] = {true, insn.imm};
+        continue;
+      }
+      if (opcode == 0x33) {
+        uint32_t funct3 = bits(insn.raw, 14, 12);
+        uint32_t funct7 = bits(insn.raw, 31, 25);
+        if (!state.regs[insn.rs1].known || !state.regs[insn.rs2].known) {
+          result.reason = "unknown-op-source";
+          return result;
+        }
+        if (funct3 == 0 && funct7 == 0)
+          state.regs[insn.rd] = {true, state.regs[insn.rs1].value +
+                                           state.regs[insn.rs2].value};
+        else if (funct3 == 0 && funct7 == 0x20)
+          state.regs[insn.rd] = {true, state.regs[insn.rs1].value -
+                                           state.regs[insn.rs2].value};
+        else if (funct3 == 0 && funct7 == 1)
+          state.regs[insn.rd] = {true, state.regs[insn.rs1].value *
+                                           state.regs[insn.rs2].value};
+        else {
+          result.reason = "unsupported-op";
+          return result;
+        }
+        continue;
+      }
+      if (opcode == 0x03) {
+        result.reason = "readonly-load-evaluator-not-implemented";
+        return result;
+      }
+      if (opcode == 0x23) {
+        result.reason = "config-store-evaluator-not-implemented";
+        return result;
+      }
+      if (opcode == 0x63) {
+        result.reason = "branch-evaluator-not-implemented";
+        return result;
+      }
+      if (opcode == 0x6f || opcode == 0x67) {
+        ++result.directCalls;
+        result.reason = "interprocedural-evaluator-not-implemented";
+        return result;
+      }
+      if (isRISCVConfigReturn(insn)) {
+        result.reason = "return-before-complete";
+        return result;
+      }
+      result.reason = "unsupported-instruction";
+      return result;
+    }
+    if (!transferred) {
+      uint64_t next = block.end;
+      if (next >= entry->value + entry->size) {
+        result.reason = "fallthrough-out-of-function";
+        return result;
+      }
+      current = next;
+    }
+  }
+  result.reason = "evaluator-step-limit";
   return result;
 }
 
@@ -4783,8 +5049,8 @@ template <class ELFT>
 static void auditRISCVConfigRodata(StringRef name,
                                    RISCVConfigRodataAudit &audit) {
   bool ambiguous = false;
-  Defined *targetSym = findUniqueRISCVConfigDefinedByName(name, STT_OBJECT,
-                                                          ambiguous);
+  Defined *targetSym =
+      findUniqueRISCVConfigDefinedByName<ELFT>(name, STT_OBJECT, ambiguous);
   if (!targetSym) {
     if (ambiguous)
       message(Twine("riscv-config-rodata: symbol=") + name +
@@ -4804,7 +5070,7 @@ static void auditRISCVConfigRodata(StringRef name,
             continue;
           ++audit.liveReferenceCount;
           RISCVConfigFunctionRef ref =
-              resolveRISCVFunctionForOffset(*sec, rel.r_offset);
+              resolveRISCVFunctionForLocation<ELFT>(*sec, rel.r_offset);
           audit.referenceFunctions.insert(ref.name);
           if (!(sec->flags & SHF_EXECINSTR))
             audit.addressTaken = true;
@@ -4907,6 +5173,20 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " eccblkwid=" + valueOrUnknown("eccblkwid") +
           " proof_complete=" + Twine(proof.complete ? 1 : 0) +
           " rejection_reason=" + proof.reason);
+  message(Twine("riscv-config-evaluator: entry=initeccsize") +
+          " visited_blocks=" + Twine(proof.visitedBlocks) +
+          " executed_instructions=" + Twine(proof.executedInstructions) +
+          " loop_iterations=" + Twine(proof.loopIterations) +
+          " readonly_loads=" + Twine(proof.readonlyLoads) +
+          " direct_calls=" + Twine(proof.directCalls) +
+          " final_status=" + (proof.complete ? Twine("complete")
+                                             : Twine("failed")) +
+          " rejection_reason=" + proof.reason +
+          " function=" +
+          (proof.failFunction.empty() ? Twine("none")
+                                      : Twine(proof.failFunction)) +
+          " offset=0x" + Twine::utohexstr(proof.failOffset) +
+          " opcode=0x" + Twine::utohexstr(proof.failOpcode));
 
   uint32_t constantLoads = 0;
   uint32_t constantBranches = 0;
