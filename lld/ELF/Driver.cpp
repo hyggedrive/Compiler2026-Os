@@ -4858,6 +4858,11 @@ static bool proveRISCVConfigRegConst(ArrayRef<RISCVConfigInsn> insns,
   return false;
 }
 
+static bool convertRISCVConfigTargetOffset(InputSectionBase &evalSec,
+                                           InputSectionBase &targetSec,
+                                           uint64_t targetOff,
+                                           uint64_t &evalOff);
+
 struct RISCVConfigCallRecord {
   std::string callee;
   std::string caller;
