@@ -5141,11 +5141,121 @@ static int64_t decodeRISCVConfigBImm(uint32_t insn) {
   return SignExtend64<13>(imm);
 }
 
+struct RISCVConfigBranchTarget {
+  bool ok = false;
+  uint64_t target = 0;
+  StringRef source = "raw";
+  std::string reason;
+  std::string relocSymbol = "none";
+  std::string relocSection = "none";
+  int64_t relocAddend = 0;
+};
+
+static bool
+convertRISCVConfigTargetOffset(InputSectionBase &evalSec,
+                               InputSectionBase &targetSec,
+                               uint64_t targetOff, uint64_t &evalOff) {
+  if (&targetSec == &evalSec) {
+    evalOff = targetOff;
+    return true;
+  }
+
+  InputSectionBase *targetParent = &targetSec;
+  uint64_t parentOff = targetOff;
+  auto targetStorage = riscvFunctionSplitRelocStorage.find(&targetSec);
+  if (targetStorage != riscvFunctionSplitRelocStorage.end() &&
+      targetStorage->second.parent) {
+    targetParent = targetStorage->second.parent;
+    if (targetOff > std::numeric_limits<uint64_t>::max() -
+                        targetStorage->second.originalBegin)
+      return false;
+    parentOff = targetStorage->second.originalBegin + targetOff;
+  }
+
+  if (&evalSec == targetParent) {
+    evalOff = parentOff;
+    return true;
+  }
+
+  auto evalStorage = riscvFunctionSplitRelocStorage.find(&evalSec);
+  if (evalStorage != riscvFunctionSplitRelocStorage.end() &&
+      evalStorage->second.parent == targetParent) {
+    if (parentOff < evalStorage->second.originalBegin ||
+        parentOff >= evalStorage->second.originalEnd)
+      return false;
+    evalOff = parentOff - evalStorage->second.originalBegin;
+    return true;
+  }
+
+  return false;
+}
+
+static RISCVConfigBranchTarget resolveRISCVConfigBranchTarget(
+    InputSectionBase &sec, const RISCVConfigInsn &insn,
+    const DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> &relocMap) {
+  RISCVConfigBranchTarget result;
+  auto it = relocMap.find(insn.off);
+  const RISCVConfigRelocInfo *branchReloc = nullptr;
+  if (it != relocMap.end()) {
+    for (const RISCVConfigRelocInfo &r : it->second) {
+      if (r.type != R_RISCV_BRANCH)
+        continue;
+      if (branchReloc) {
+        result.reason = "ambiguous-branch-relocation";
+        return result;
+      }
+      branchReloc = &r;
+    }
+  }
+
+  if (branchReloc) {
+    result.source = "relocation";
+    result.relocAddend = branchReloc->addend;
+    if (!branchReloc->target) {
+      result.reason = "branch-relocation-target-unresolved";
+      return result;
+    }
+    result.relocSymbol = branchReloc->target->getName().str();
+    auto *targetSec =
+        dyn_cast_or_null<InputSectionBase>(branchReloc->target->section);
+    if (!targetSec) {
+      result.reason = "branch-relocation-target-section-unresolved";
+      return result;
+    }
+    result.relocSection = targetSec->name.str();
+    uint64_t targetOff = 0;
+    if (!checkedAddend(branchReloc->target->value, branchReloc->addend,
+                       targetOff)) {
+      result.reason = "branch-relocation-target-overflow";
+      return result;
+    }
+    if (!convertRISCVConfigTargetOffset(sec, *targetSec, targetOff,
+                                        result.target)) {
+      result.reason = "branch-relocation-target-out-of-section";
+      return result;
+    }
+    result.ok = true;
+    return result;
+  }
+
+  int64_t signedTarget =
+      static_cast<int64_t>(insn.off) + decodeRISCVConfigBImm(insn.raw);
+  if (signedTarget < 0) {
+    result.reason = "branch-target-out-of-range";
+    return result;
+  }
+  result.target = static_cast<uint64_t>(signedTarget);
+  result.ok = true;
+  return result;
+}
+
 template <class ELFT>
 static SmallVector<RISCVConfigBasicBlock, 0>
 buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
                     std::string &reason) {
   ArrayRef<uint8_t> data = sec.content();
+  DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap =
+      getRISCVConfigRelocs<ELFT>(sec);
   DenseSet<uint64_t> boundaries;
   boundaries.insert(func.value);
   SmallVector<RISCVConfigInsn, 0> allInsns;
@@ -5157,14 +5267,15 @@ buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
     }
     allInsns.push_back(insn);
     if (insn.size == 4 && (insn.raw & 0x7f) == 0x63) {
-      int64_t signedTarget =
-          static_cast<int64_t>(off) + decodeRISCVConfigBImm(insn.raw);
-      uint64_t fallthrough = off + insn.size;
-      if (signedTarget >= 0) {
-        uint64_t target = static_cast<uint64_t>(signedTarget);
-        if (target >= func.value && target < func.value + func.size)
-          boundaries.insert(target);
+      RISCVConfigBranchTarget target =
+          resolveRISCVConfigBranchTarget(sec, insn, relocMap);
+      if (!target.ok) {
+        reason = target.reason;
+        return {};
       }
+      uint64_t fallthrough = off + insn.size;
+      if (target.target >= func.value && target.target < func.value + func.size)
+        boundaries.insert(target.target);
       if (fallthrough < func.value + func.size)
         boundaries.insert(fallthrough);
     }
@@ -5509,13 +5620,14 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
           ++result.alwaysTakenBranches;
         else
           ++result.neverTakenBranches;
-        int64_t branchImm = decodeRISCVConfigBImm(insn.raw);
-        int64_t signedTarget = static_cast<int64_t>(insn.off) + branchImm;
-        if (taken && signedTarget < 0) {
-          result.reason = "branch-target-out-of-range";
+        RISCVConfigBranchTarget branchTarget =
+            resolveRISCVConfigBranchTarget(*entrySec, insn, relocMap);
+        if (!branchTarget.ok) {
+          result.reason = branchTarget.reason;
           return result;
         }
-        uint64_t takenTarget = static_cast<uint64_t>(signedTarget);
+        int64_t branchImm = decodeRISCVConfigBImm(insn.raw);
+        uint64_t takenTarget = branchTarget.target;
         uint64_t fallthrough = insn.off + insn.size;
         uint64_t successor = taken ? takenTarget : fallthrough;
         if (result.branchTraceEmitted < 48) {
@@ -5529,6 +5641,12 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
                   " rhs=" + Twine(state.regs[insn.rs2].value) +
                   " taken=" + Twine(taken ? 1 : 0) +
                   " decoded_imm=" + Twine(branchImm) +
+                  " target_source=" + branchTarget.source +
+                  " reloc_target_symbol=" + branchTarget.relocSymbol +
+                  " reloc_target_section=" + branchTarget.relocSection +
+                  " reloc_addend=" + Twine(branchTarget.relocAddend) +
+                  " resolved_target=0x" +
+                  Twine::utohexstr(branchTarget.target) +
                   " taken_target=0x" + Twine::utohexstr(takenTarget) +
                   " fallthrough=0x" + Twine::utohexstr(fallthrough) +
                   " current_block=0x" + Twine::utohexstr(block.begin));
@@ -5719,9 +5837,9 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " offset=0x" + Twine::utohexstr(proof.failOffset) +
           " opcode=0x" + Twine::utohexstr(proof.failOpcode) +
           " raw16=0x" + Twine::utohexstr(proof.failRaw16) +
-          " quadrant=" + Twine(proof.failQuadrant) +
-          " funct3=" + Twine(proof.failFunct3) +
-          " bit12=" + Twine(proof.failBit12) +
+          " quadrant=" + Twine(unsigned(proof.failQuadrant)) +
+          " funct3=" + Twine(unsigned(proof.failFunct3)) +
+          " bit12=" + Twine(unsigned(proof.failBit12)) +
           " rd_rs1=" + Twine(proof.failRd) +
           " rs2=" + Twine(proof.failRs2) +
           " decoded_kind=" + riscvConfigInsnKindName(proof.failKind));
