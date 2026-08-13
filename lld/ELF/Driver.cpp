@@ -4964,7 +4964,7 @@ static void auditRISCVConfigGlobal(StringRef name,
   audit.size = targetSym->size;
   for (ELFFileBase *file : ctx.objectFiles) {
     for (InputSectionBase *sec : file->getSections()) {
-      if (!sec || !sec->isLive() || !sec->file)
+      if (!sec || !sec->isLive() || !(sec->flags & SHF_ALLOC) || !sec->file)
         continue;
       RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
       auto scan = [&](auto relsRange) {
@@ -5055,6 +5055,8 @@ struct RISCVConfigProofResult {
   uint32_t neverTakenBranches = 0;
   uint32_t branchTraceEmitted = 0;
   std::map<std::string, std::optional<int64_t>> values;
+  std::set<std::string> evaluatedFunctionNames;
+  std::set<Defined *> readonlySourceObjects;
 };
 
 enum class RISCVConfigValueKind {
@@ -5839,6 +5841,7 @@ tryEvaluateRISCVConfigInitialization(
   }
   ++result.functionsEvaluated;
   evaluatedFunctions.insert(entry->getName().str());
+  result.evaluatedFunctionNames.insert(entry->getName().str());
 
   for (uint32_t steps = 0; steps < 4096;) {
     auto blockIt = llvm::find_if(frame.blocks, [&](const RISCVConfigBasicBlock &b) {
@@ -5922,6 +5925,7 @@ tryEvaluateRISCVConfigInitialization(
           }
           ++result.functionsEvaluated;
           evaluatedFunctions.insert(directCall.target->getName().str());
+          result.evaluatedFunctionNames.insert(directCall.target->getName().str());
           transferred = true;
           break;
         }
@@ -6224,6 +6228,7 @@ tryEvaluateRISCVConfigInitialization(
           result.reason = loadReason;
           return result;
         }
+        result.readonlySourceObjects.insert(loadSym);
         state.regs[insn.rd] = riscvConfigInteger(byte);
         ++result.readonlyLoads;
         continue;
@@ -6441,6 +6446,580 @@ tryEvaluateRISCVConfigInitialization(
   return result;
 }
 
+struct RISCVConfigUseAuditResult {
+  uint32_t provenConstantGlobals = 0;
+  uint32_t constantLoads = 0;
+  uint32_t constantBranches = 0;
+  uint32_t alwaysTakenBranches = 0;
+  uint32_t neverTakenBranches = 0;
+  uint32_t functionsAnalyzed = 0;
+  uint32_t cfgSafeFunctions = 0;
+  uint32_t candidateDeadRegions = 0;
+  uint32_t safeDeadRegions = 0;
+  uint64_t potentialDeadTextBytes = 0;
+  uint64_t conservativeDeadTextBytes = 0;
+  uint64_t potentialDeadRodataBytes = 0;
+  uint64_t conservativeDeadRodataBytes = 0;
+  uint64_t candidateInitializationRodataBytes = 0;
+  bool initializationOrderProven = false;
+};
+
+struct RISCVConfigDataflowState {
+  std::array<RISCVConfigValue, 32> regs;
+  bool valid = false;
+};
+
+static bool sameRISCVConfigValue(const RISCVConfigValue &a,
+                                 const RISCVConfigValue &b) {
+  if (a.kind != b.kind)
+    return false;
+  if (a.kind == RISCVConfigValueKind::Unknown)
+    return true;
+  if (a.kind == RISCVConfigValueKind::Integer)
+    return static_cast<uint32_t>(a.value) == static_cast<uint32_t>(b.value);
+  return a.symbol == b.symbol && a.offset == b.offset;
+}
+
+static RISCVConfigValue mergeRISCVConfigValue(const RISCVConfigValue &a,
+                                              const RISCVConfigValue &b) {
+  return sameRISCVConfigValue(a, b) ? a : RISCVConfigValue{};
+}
+
+static bool mergeRISCVConfigState(RISCVConfigDataflowState &dst,
+                                  const RISCVConfigDataflowState &src) {
+  if (!dst.valid) {
+    dst = src;
+    dst.valid = true;
+    return true;
+  }
+  bool changed = false;
+  for (int i = 0; i < 32; ++i) {
+    RISCVConfigValue merged = mergeRISCVConfigValue(dst.regs[i], src.regs[i]);
+    if (!sameRISCVConfigValue(merged, dst.regs[i])) {
+      dst.regs[i] = merged;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+static bool evalRISCVConfigIntegerInsn(const RISCVConfigInsn &insn,
+                                       RISCVConfigDataflowState &state,
+                                       std::string &reason) {
+  if (insn.size == 2) {
+    if (insn.kind == RISCVConfigInsnKind::CLi && insn.rd > 0) {
+      state.regs[insn.rd] = riscvConfigInteger(insn.imm);
+      return true;
+    }
+    if (insn.kind == RISCVConfigInsnKind::CLui && insn.rd > 0) {
+      state.regs[insn.rd] = riscvConfigInteger(insn.imm);
+      return true;
+    }
+    if (insn.kind == RISCVConfigInsnKind::CAddi && insn.rd > 0) {
+      if (state.regs[insn.rd].kind == RISCVConfigValueKind::Unknown)
+        return true;
+      RISCVConfigValue out;
+      if (!riscvConfigAddValues(state.regs[insn.rd],
+                                riscvConfigInteger(insn.imm), out)) {
+        state.regs[insn.rd] = {};
+        return true;
+      }
+      state.regs[insn.rd] = out;
+      return true;
+    }
+    if (insn.kind == RISCVConfigInsnKind::CMv && insn.rd > 0) {
+      state.regs[insn.rd] = state.regs[insn.rs2];
+      return true;
+    }
+    if (insn.kind == RISCVConfigInsnKind::CAdd && insn.rd > 0) {
+      RISCVConfigValue out;
+      if (!riscvConfigAddValues(state.regs[insn.rd], state.regs[insn.rs2],
+                                out))
+        out = {};
+      state.regs[insn.rd] = out;
+      return true;
+    }
+    if (insn.kind == RISCVConfigInsnKind::CSrli ||
+        insn.kind == RISCVConfigInsnKind::CSrai ||
+        insn.kind == RISCVConfigInsnKind::CAndi) {
+      if (state.regs[insn.rs1].kind != RISCVConfigValueKind::Integer) {
+        state.regs[insn.rd] = {};
+        return true;
+      }
+      uint32_t src = static_cast<uint32_t>(state.regs[insn.rs1].value);
+      if (insn.kind == RISCVConfigInsnKind::CSrli)
+        state.regs[insn.rd] = riscvConfigInteger(src >> insn.imm);
+      else if (insn.kind == RISCVConfigInsnKind::CSrai)
+        state.regs[insn.rd] =
+            riscvConfigInteger(static_cast<int32_t>(src) >> insn.imm);
+      else
+        state.regs[insn.rd] =
+            riscvConfigInteger(src & static_cast<uint32_t>(insn.imm));
+      return true;
+    }
+    if (insn.kind == RISCVConfigInsnKind::CSub ||
+        insn.kind == RISCVConfigInsnKind::CXor ||
+        insn.kind == RISCVConfigInsnKind::COr ||
+        insn.kind == RISCVConfigInsnKind::CAnd) {
+      if (state.regs[insn.rs1].kind != RISCVConfigValueKind::Integer ||
+          state.regs[insn.rs2].kind != RISCVConfigValueKind::Integer) {
+        state.regs[insn.rd] = {};
+        return true;
+      }
+      uint32_t lhs = static_cast<uint32_t>(state.regs[insn.rs1].value);
+      uint32_t rhs = static_cast<uint32_t>(state.regs[insn.rs2].value);
+      uint32_t out = 0;
+      if (insn.kind == RISCVConfigInsnKind::CSub)
+        out = lhs - rhs;
+      else if (insn.kind == RISCVConfigInsnKind::CXor)
+        out = lhs ^ rhs;
+      else if (insn.kind == RISCVConfigInsnKind::COr)
+        out = lhs | rhs;
+      else
+        out = lhs & rhs;
+      state.regs[insn.rd] = riscvConfigInteger(out);
+      return true;
+    }
+    if (insn.load && insn.rd > 0) {
+      state.regs[insn.rd] = {};
+      return true;
+    }
+    if (insn.store || isRISCVConfigReturn(insn))
+      return true;
+    reason = "unsupported-compressed-dataflow";
+    return false;
+  }
+
+  uint32_t opcode = insn.raw & 0x7f;
+  if (opcode == 0x13 && insn.rd > 0) {
+    uint32_t funct3 = bits(insn.raw, 14, 12);
+    if (funct3 == 0) {
+      RISCVConfigValue out;
+      if (!riscvConfigAddValues(state.regs[insn.rs1],
+                                riscvConfigInteger(insn.imm), out))
+        out = {};
+      state.regs[insn.rd] = out;
+    } else if (funct3 == 7 &&
+               state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
+      state.regs[insn.rd] = riscvConfigInteger(
+          static_cast<uint32_t>(state.regs[insn.rs1].value) &
+          static_cast<uint32_t>(insn.imm));
+    } else if (funct3 == 1 && bits(insn.raw, 31, 25) == 0 &&
+               state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
+      state.regs[insn.rd] = riscvConfigInteger(
+          static_cast<uint32_t>(state.regs[insn.rs1].value)
+          << bits(insn.raw, 24, 20));
+    } else if (funct3 == 5 && bits(insn.raw, 31, 25) == 0 &&
+               state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
+      state.regs[insn.rd] = riscvConfigInteger(
+          static_cast<uint32_t>(state.regs[insn.rs1].value) >>
+          bits(insn.raw, 24, 20));
+    } else {
+      state.regs[insn.rd] = {};
+    }
+    return true;
+  }
+  if ((opcode == 0x37 || opcode == 0x17) && insn.rd > 0) {
+    state.regs[insn.rd] = riscvConfigInteger(insn.imm);
+    return true;
+  }
+  if (opcode == 0x33 && insn.rd > 0) {
+    uint32_t funct3 = bits(insn.raw, 14, 12);
+    uint32_t funct7 = bits(insn.raw, 31, 25);
+    if (state.regs[insn.rs1].kind != RISCVConfigValueKind::Integer ||
+        state.regs[insn.rs2].kind != RISCVConfigValueKind::Integer) {
+      state.regs[insn.rd] = {};
+      return true;
+    }
+    uint32_t lhs = static_cast<uint32_t>(state.regs[insn.rs1].value);
+    uint32_t rhs = static_cast<uint32_t>(state.regs[insn.rs2].value);
+    if (funct3 == 0 && funct7 == 0)
+      state.regs[insn.rd] = riscvConfigInteger(lhs + rhs);
+    else if (funct3 == 0 && funct7 == 0x20)
+      state.regs[insn.rd] = riscvConfigInteger(lhs - rhs);
+    else if (funct3 == 0 && funct7 == 1)
+      state.regs[insn.rd] = riscvConfigInteger(static_cast<uint32_t>(
+          static_cast<uint64_t>(lhs) * static_cast<uint64_t>(rhs)));
+    else if (funct3 == 4 && funct7 == 0)
+      state.regs[insn.rd] = riscvConfigInteger(lhs ^ rhs);
+    else if (funct3 == 6 && funct7 == 0)
+      state.regs[insn.rd] = riscvConfigInteger(lhs | rhs);
+    else if (funct3 == 7 && funct7 == 0)
+      state.regs[insn.rd] = riscvConfigInteger(lhs & rhs);
+    else
+      state.regs[insn.rd] = {};
+    return true;
+  }
+  if (opcode == 0x03 && insn.rd > 0) {
+    state.regs[insn.rd] = {};
+    return true;
+  }
+  if (opcode == 0x23 || opcode == 0x63 || opcode == 0x6f ||
+      opcode == 0x67 || isRISCVConfigReturn(insn))
+    return true;
+  reason = "unsupported-dataflow-instruction";
+  return false;
+}
+
+template <class ELFT>
+static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
+    const RISCVConfigProofResult &proof,
+    ArrayRef<RISCVConfigTrackedGlobal> trackedGlobals) {
+  RISCVConfigUseAuditResult out;
+  if (!proof.complete)
+    return out;
+
+  DenseMap<Defined *, int64_t> provenValues;
+  for (const RISCVConfigTrackedGlobal &g : trackedGlobals) {
+    auto it = proof.values.find(g.name);
+    if (!g.sym || it == proof.values.end() || !it->second ||
+        g.audit.addressTaken || g.audit.unknownPointerUse)
+      return out;
+    provenValues[g.sym] = *it->second;
+  }
+  out.provenConstantGlobals = provenValues.size();
+  DenseMap<Defined *, uint32_t> readonlyLiveRefs;
+  DenseMap<Defined *, uint32_t> readonlyDeadRefs;
+  DenseMap<Defined *, uint64_t> readonlySizes;
+  DenseSet<Defined *> readonlyAddressTaken;
+  auto noteReadonlyRef = [&](InputSectionBase &source, Defined *target,
+                             bool countLive, bool dead) {
+    if (!target || target->type != STT_OBJECT)
+      return;
+    auto *targetSec = dyn_cast_or_null<InputSectionBase>(target->section);
+    if (!targetSec || (targetSec->flags & SHF_WRITE) ||
+        !(targetSec->flags & SHF_ALLOC))
+      return;
+    if (countLive)
+      ++readonlyLiveRefs[target];
+    readonlySizes[target] = target->size;
+    if (!(source.flags & SHF_EXECINSTR))
+      readonlyAddressTaken.insert(target);
+    if (dead)
+      ++readonlyDeadRefs[target];
+  };
+  for (ELFFileBase *file : ctx.objectFiles) {
+    for (InputSectionBase *sec : file->getSections()) {
+      if (!sec || !sec->isLive() || !sec->file)
+        continue;
+      RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
+      auto scan = [&](auto relRange) {
+        for (const auto &rel : relRange)
+          noteReadonlyRef(*sec, getRISCVConfigRelocTarget<ELFT>(*sec, rel),
+                          true, false);
+      };
+      scan(rels.rels);
+      scan(rels.relas);
+    }
+  }
+
+  for (ELFFileBase *file : ctx.objectFiles) {
+    for (InputSectionBase *sec : file->getSections()) {
+      if (!sec || !sec->isLive() || !(sec->flags & SHF_EXECINSTR) ||
+          !sec->file)
+        continue;
+      DenseSet<Defined *> funcs;
+      RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
+      auto collectFuncs = [&](auto relRange) {
+        for (const auto &rel : relRange) {
+          Defined *d = getRISCVConfigRelocTarget<ELFT>(*sec, rel);
+          if (!d)
+            continue;
+          for (const RISCVConfigTrackedGlobal &g : trackedGlobals) {
+            int64_t objectOff = 0;
+            if (g.sym &&
+                resolveRISCVConfigObjectOffset(d, getRISCVFunctionSplitAddend(rel),
+                                               *g.sym, objectOff)) {
+              RISCVConfigFunctionRef f =
+                  resolveRISCVFunctionForLocation<ELFT>(*sec, rel.r_offset);
+              if (f.sym)
+                funcs.insert(f.sym);
+            }
+          }
+        }
+      };
+      collectFuncs(rels.rels);
+      collectFuncs(rels.relas);
+
+      for (Defined *func : funcs) {
+        auto *funcSec = dyn_cast_or_null<InputSectionBase>(func->section);
+        if (!funcSec)
+          continue;
+        ++out.functionsAnalyzed;
+        std::string cfgReason;
+        SmallVector<RISCVConfigBasicBlock, 0> blocks =
+            buildRISCVConfigCFG<ELFT>(*funcSec, *func, cfgReason);
+        if (blocks.empty())
+          continue;
+        DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap =
+            getRISCVConfigRelocs<ELFT>(*funcSec);
+        DenseMap<uint64_t, RISCVConfigDataflowState> in;
+        DenseMap<uint64_t, const RISCVConfigBasicBlock *> blockByBegin;
+        DenseSet<uint64_t> baselineReachable;
+        DenseSet<uint64_t> specializedReachable;
+        SmallVector<uint64_t, 0> worklist;
+        RISCVConfigDataflowState entryState;
+        entryState.valid = true;
+        for (auto &r : entryState.regs)
+          r = {};
+        entryState.regs[0] = riscvConfigInteger(0);
+        for (const RISCVConfigBasicBlock &b : blocks)
+          blockByBegin[b.begin] = &b;
+        in[func->value] = entryState;
+        worklist.push_back(func->value);
+        bool cfgSafe = true;
+        uint32_t iterations = 0;
+
+        auto addBaselineSucc = [&](SmallVectorImpl<uint64_t> &succs,
+                                   uint64_t target) {
+          if (target >= func->value && target < func->value + func->size &&
+              blockByBegin.find(target) != blockByBegin.end())
+            succs.push_back(target);
+        };
+        SmallVector<uint64_t, 0> baselineWorklist;
+        baselineWorklist.push_back(func->value);
+        while (!baselineWorklist.empty()) {
+          uint64_t begin = baselineWorklist.pop_back_val();
+          if (!baselineReachable.insert(begin).second)
+            continue;
+          const RISCVConfigBasicBlock *bb = blockByBegin.lookup(begin);
+          if (!bb || bb->insns.empty())
+            continue;
+          const RISCVConfigBasicBlock &b = *bb;
+          if (b.insns.empty())
+            continue;
+          const RISCVConfigInsn &last = b.insns.back();
+          uint32_t opcode = last.raw & 0x7f;
+          SmallVector<uint64_t, 2> succs;
+          if (last.size == 4 && opcode == 0x63) {
+            RISCVConfigBranchTarget target =
+                resolveRISCVConfigBranchTarget(*funcSec, last, relocMap);
+            if (target.ok)
+              addBaselineSucc(succs, target.target);
+            else
+              cfgSafe = false;
+            addBaselineSucc(succs, last.off + last.size);
+          } else if (last.size == 4 && opcode == 0x6f && last.rd == 0) {
+            RISCVConfigBranchTarget target =
+                resolveRISCVConfigJalTarget(*funcSec, last, relocMap);
+            if (target.ok)
+              addBaselineSucc(succs, target.target);
+            else
+              cfgSafe = false;
+          } else if (!isRISCVConfigReturn(last)) {
+            addBaselineSucc(succs, b.end);
+          }
+          for (uint64_t succ : succs)
+            baselineWorklist.push_back(succ);
+        }
+
+        while (!worklist.empty() && ++iterations < 10000) {
+          uint64_t begin = worklist.pop_back_val();
+          auto blockIt = blockByBegin.find(begin);
+          if (blockIt == blockByBegin.end()) {
+            cfgSafe = false;
+            continue;
+          }
+          specializedReachable.insert(begin);
+          RISCVConfigDataflowState state = in[begin];
+          const RISCVConfigBasicBlock &block = *blockIt->second;
+          SmallVector<std::pair<uint64_t, RISCVConfigDataflowState>, 2> succs;
+          uint64_t skipUntil = 0;
+          bool noFallthrough = false;
+
+          for (const RISCVConfigInsn &insn : block.insns) {
+            if (insn.off < skipUntil)
+              continue;
+            uint32_t opcode = insn.raw & 0x7f;
+            RISCVConfigDirectCallTarget directCall =
+                resolveRISCVConfigDirectCallTarget(*funcSec, insn, relocMap);
+            if (directCall.found) {
+              if (!directCall.ok) {
+                cfgSafe = false;
+                break;
+              }
+              if (directCall.tail) {
+                noFallthrough = true;
+                break;
+              }
+              constexpr int callerSaved[] = {1,  5,  6,  7,  10, 11,
+                                             12, 13, 14, 15, 16, 17,
+                                             28, 29, 30, 31};
+              for (int r : callerSaved)
+                state.regs[r] = {};
+              state.regs[0] = riscvConfigInteger(0);
+              skipUntil = insn.off + directCall.size;
+              continue;
+            }
+            if (insn.size == 4 && opcode == 0x63) {
+              bool known = state.regs[insn.rs1].kind ==
+                               RISCVConfigValueKind::Integer &&
+                           state.regs[insn.rs2].kind ==
+                               RISCVConfigValueKind::Integer;
+              RISCVConfigBranchTarget target =
+                  resolveRISCVConfigBranchTarget(*funcSec, insn, relocMap);
+              if (!target.ok) {
+                cfgSafe = false;
+                break;
+              }
+              uint64_t fallthrough = insn.off + insn.size;
+              if (known) {
+                bool taken = false;
+                if (!evaluateRISCVConfigBranch(insn.raw,
+                                               state.regs[insn.rs1].value,
+                                               state.regs[insn.rs2].value,
+                                               taken)) {
+                  cfgSafe = false;
+                  break;
+                }
+                ++out.constantBranches;
+                if (taken)
+                  ++out.alwaysTakenBranches;
+                else
+                  ++out.neverTakenBranches;
+                message(Twine("riscv-config-constant-branch: function=") +
+                        func->getName() +
+                        " offset=0x" + Twine::utohexstr(insn.off) +
+                        " kind=0x" + Twine::utohexstr(bits(insn.raw, 14, 12)) +
+                        " lhs=" + Twine(state.regs[insn.rs1].value) +
+                        " rhs=" + Twine(state.regs[insn.rs2].value) +
+                        " result=" + (taken ? Twine("taken")
+                                             : Twine("not-taken")) +
+                        " target=0x" + Twine::utohexstr(target.target) +
+                        " fallthrough=0x" + Twine::utohexstr(fallthrough) +
+                        " source_globals=unknown");
+                succs.push_back({taken ? target.target : fallthrough, state});
+              } else {
+                succs.push_back({target.target, state});
+                succs.push_back({fallthrough, state});
+              }
+              break;
+            }
+            if (insn.size == 4 && opcode == 0x6f && insn.rd == 0) {
+              RISCVConfigBranchTarget target =
+                  resolveRISCVConfigJalTarget(*funcSec, insn, relocMap);
+              if (!target.ok) {
+                cfgSafe = false;
+                break;
+              }
+              succs.push_back({target.target, state});
+              noFallthrough = true;
+              break;
+            }
+            if (opcode == 0x67 || isRISCVConfigReturn(insn)) {
+              noFallthrough = true;
+              break;
+            }
+            if (insn.size == 4 && opcode == 0x03 && bits(insn.raw, 14, 12) == 4 &&
+                insn.rd > 0) {
+              bool loadedTracked = false;
+              RISCVConfigValue base = state.regs[insn.rs1];
+              auto relIt = relocMap.find(insn.off);
+              if (relIt != relocMap.end()) {
+                const RISCVConfigRelocInfo *lo =
+                    findRISCVConfigReloc(relIt->second, {R_RISCV_LO12_I});
+                if (lo && lo->target)
+                  base = riscvConfigSymbolAddress(lo->target, lo->addend);
+              }
+              if (base.kind == RISCVConfigValueKind::SymbolAddress) {
+                for (auto [sym, value] : provenValues) {
+                  int64_t objectOff = 0;
+                  if (resolveRISCVConfigObjectOffset(
+                          base.symbol, base.offset + insn.imm, *sym,
+                          objectOff) &&
+                      objectOff == 0) {
+                    state.regs[insn.rd] = riscvConfigInteger(value);
+                    ++out.constantLoads;
+                    loadedTracked = true;
+                    message(Twine("riscv-config-constant-load: function=") +
+                            func->getName() +
+                            " offset=0x" + Twine::utohexstr(insn.off) +
+                            " symbol=" + sym->getName() +
+                            " value=" + Twine(value) +
+                            " safe=1 reason=tracked-global");
+                    break;
+                  }
+                }
+              }
+              if (loadedTracked)
+                continue;
+            }
+            std::string evalReason;
+            if (!evalRISCVConfigIntegerInsn(insn, state, evalReason)) {
+              cfgSafe = false;
+              break;
+            }
+            if (insn.size == 4 && (opcode == 0x37 || opcode == 0x17) &&
+                insn.rd > 0) {
+              auto it = relocMap.find(insn.off);
+              if (it != relocMap.end()) {
+                const RISCVConfigRelocInfo *hi = findRISCVConfigReloc(
+                    it->second, {R_RISCV_HI20, R_RISCV_PCREL_HI20});
+                if (hi && hi->target)
+                  state.regs[insn.rd] =
+                      riscvConfigSymbolAddress(hi->target, hi->addend);
+              }
+            } else if (insn.size == 4 && opcode == 0x13 && insn.rd > 0) {
+              auto it = relocMap.find(insn.off);
+              if (it != relocMap.end()) {
+                const RISCVConfigRelocInfo *lo = findRISCVConfigReloc(
+                    it->second, {R_RISCV_LO12_I, R_RISCV_PCREL_LO12_I});
+                if (lo && lo->target)
+                  state.regs[insn.rd] =
+                      riscvConfigSymbolAddress(lo->target, lo->addend);
+              }
+            }
+          }
+
+          if (succs.empty() && !noFallthrough &&
+              block.end < func->value + func->size)
+            succs.push_back({block.end, state});
+          for (auto &[target, succState] : succs) {
+            if (blockByBegin.find(target) == blockByBegin.end())
+              continue;
+            if (mergeRISCVConfigState(in[target], succState))
+              worklist.push_back(target);
+          }
+        }
+        if (iterations >= 10000)
+          cfgSafe = false;
+        if (cfgSafe)
+          ++out.cfgSafeFunctions;
+
+        uint64_t candidateBytes = 0;
+        for (const RISCVConfigBasicBlock &b : blocks) {
+          if (baselineReachable.contains(b.begin) &&
+              !specializedReachable.contains(b.begin) && b.begin != func->value) {
+            ++out.candidateDeadRegions;
+            candidateBytes += b.end - b.begin;
+            for (const auto &kv : relocMap) {
+              if (kv.first < b.begin || kv.first >= b.end)
+                continue;
+              for (const RISCVConfigRelocInfo &r : kv.second)
+                noteReadonlyRef(*funcSec, r.target, false, true);
+            }
+            message(Twine("riscv-config-dead-region: function=") +
+                    func->getName() +
+                    " begin=0x" + Twine::utohexstr(b.begin) +
+                    " end=0x" + Twine::utohexstr(b.end) +
+                    " bytes=" + Twine(b.end - b.begin) +
+                    " safe=0 reason=initialization-order-not-proven"
+                    " controlling_branches=unknown");
+          }
+        }
+        out.potentialDeadTextBytes += candidateBytes;
+      }
+    }
+  }
+  for (auto [sym, liveRefs] : readonlyLiveRefs) {
+    uint32_t deadRefs = readonlyDeadRefs.lookup(sym);
+    if (liveRefs != 0 && liveRefs == deadRefs &&
+        !readonlyAddressTaken.contains(sym))
+      out.potentialDeadRodataBytes += readonlySizes.lookup(sym);
+  }
+  return out;
+}
+
 template <class ELFT>
 static void auditRISCVConfigRodata(StringRef name,
                                    RISCVConfigRodataAudit &audit) {
@@ -6542,21 +7121,15 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
 
   constexpr StringLiteral rodataSyms[] = {"eccblocks", "vpat",  "fmtword",
                                           "adelta",    "g0exp", "g0log"};
-  uint64_t potentialRodataBytes = 0;
+  SmallVector<RISCVConfigRodataAudit, 0> rodataAudits;
   bool eccblocksDead = false, vpatDead = false;
   for (StringRef name : rodataSyms) {
     RISCVConfigRodataAudit audit;
     auditRISCVConfigRodata<ELFT>(name, audit);
-    if (!audit.name.empty() && audit.liveReferenceCount == 0) {
-      potentialRodataBytes += audit.size;
-      if (name == "eccblocks")
-        eccblocksDead = true;
-      if (name == "vpat")
-        vpatDead = true;
-    }
+    if (!audit.name.empty())
+      rodataAudits.push_back(audit);
   }
 
-  bool phaseSafe = false;
   RISCVConfigProofResult proof =
       tryEvaluateRISCVConfigInitialization<ELFT>(calls, trackedGlobals);
   auto valueOrUnknown = [&](StringRef name) -> Twine {
@@ -6605,14 +7178,62 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " rs2=" + Twine(proof.failRs2) +
           " decoded_kind=" + riscvConfigInsnKindName(proof.failKind));
 
-  uint32_t constantLoads = 0;
-  uint32_t constantBranches = 0;
-  uint32_t alwaysTakenBranches = 0;
-  uint32_t neverTakenBranches = 0;
-  message("riscv-config-constant-use-summary: constant_loads=0"
-          " constant_branches=0"
-          " always_taken_branches=0"
-          " never_taken_branches=0");
+  RISCVConfigUseAuditResult useAudit =
+      auditRISCVConfigConstantUses<ELFT>(proof, trackedGlobals);
+  uint64_t candidateInitializationRodataBytes = 0;
+  for (const RISCVConfigRodataAudit &audit : rodataAudits) {
+    bool ambiguous = false;
+    Defined *sym =
+        findUniqueRISCVConfigDefinedByName<ELFT>(audit.name, STT_OBJECT,
+                                                 ambiguous);
+    bool allRefsInInit = !audit.referenceFunctions.empty() &&
+                         llvm::all_of(audit.referenceFunctions,
+                                      [&](const std::string &name) {
+                                        return proof.evaluatedFunctionNames
+                                            .count(name) != 0;
+                                      });
+    bool resolvedByProof = sym && proof.readonlySourceObjects.count(sym) != 0;
+    bool candidate = allRefsInInit && resolvedByProof && !audit.addressTaken;
+    if (candidate)
+      candidateInitializationRodataBytes += audit.size;
+    message(Twine("riscv-config-init-rodata-candidate: symbol=") +
+            audit.name +
+            " size=" + Twine(audit.size) +
+            " all_refs_in_initialization_chain=" +
+            Twine(allRefsInInit ? 1 : 0) +
+            " resolved_by_proof=" + Twine(resolvedByProof ? 1 : 0) +
+            " candidate=" + Twine(candidate ? 1 : 0));
+    if (audit.name == "eccblocks" && candidate)
+      eccblocksDead = true;
+    if (audit.name == "vpat" && candidate)
+      vpatDead = true;
+  }
+  useAudit.candidateInitializationRodataBytes =
+      candidateInitializationRodataBytes;
+  useAudit.potentialDeadRodataBytes = 0;
+  useAudit.conservativeDeadRodataBytes = 0;
+  message(Twine("riscv-config-constant-use-summary: proven_constant_globals=") +
+          Twine(useAudit.provenConstantGlobals) +
+          " constant_loads=" + Twine(useAudit.constantLoads) +
+          " constant_branches=" + Twine(useAudit.constantBranches) +
+          " always_taken_branches=" + Twine(useAudit.alwaysTakenBranches) +
+          " never_taken_branches=" + Twine(useAudit.neverTakenBranches) +
+          " functions_analyzed=" + Twine(useAudit.functionsAnalyzed) +
+          " cfg_safe_functions=" + Twine(useAudit.cfgSafeFunctions) +
+          " candidate_dead_regions=" + Twine(useAudit.candidateDeadRegions) +
+          " safe_dead_regions=" + Twine(useAudit.safeDeadRegions) +
+          " potential_dead_text_bytes=" +
+          Twine(useAudit.potentialDeadTextBytes) +
+          " conservative_dead_text_bytes=" +
+          Twine(useAudit.conservativeDeadTextBytes) +
+          " potential_dead_rodata_bytes=" +
+          Twine(useAudit.potentialDeadRodataBytes) +
+          " conservative_dead_rodata_bytes=" +
+          Twine(useAudit.conservativeDeadRodataBytes) +
+          " candidate_initialization_rodata_bytes=" +
+          Twine(useAudit.candidateInitializationRodataBytes) +
+          " initialization_order_proven=" +
+          Twine(useAudit.initializationOrderProven ? 1 : 0));
 
   message(Twine("riscv-config-specialization-summary: candidate_entry=initeccsize") +
           " live_calls=" + Twine(calls.size()) +
@@ -6621,21 +7242,36 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " config_globals=" + Twine(globalCount) +
           " candidate_writer_set_safe_globals=" +
           Twine(candidateSafeGlobals) +
-          " proven_constant_globals=0"
-          " constant_loads=" + Twine(constantLoads) +
-          " constant_branches=" + Twine(constantBranches) +
-          " always_taken_branches=" + Twine(alwaysTakenBranches) +
-          " never_taken_branches=" + Twine(neverTakenBranches) +
-          " safe_dead_regions=0"
-          " potential_dead_text_bytes=0"
-          " potential_dead_rodata_bytes=" + Twine(potentialRodataBytes) +
-          " total_conservative_opportunity_bytes=" +
-          Twine(potentialRodataBytes) +
+          " proven_constant_globals=" +
+          Twine(useAudit.provenConstantGlobals) +
+          " constant_loads=" + Twine(useAudit.constantLoads) +
+          " constant_branches=" + Twine(useAudit.constantBranches) +
+          " always_taken_branches=" + Twine(useAudit.alwaysTakenBranches) +
+          " never_taken_branches=" + Twine(useAudit.neverTakenBranches) +
+          " safe_dead_regions=" + Twine(useAudit.safeDeadRegions) +
+          " potential_dead_text_bytes=" +
+          Twine(useAudit.potentialDeadTextBytes) +
+          " potential_dead_rodata_bytes=" +
+          Twine(useAudit.potentialDeadRodataBytes) +
+          " candidate_initialization_rodata_bytes=" +
+          Twine(useAudit.candidateInitializationRodataBytes) +
+          " candidate_total_opportunity_bytes=" +
+          Twine(useAudit.potentialDeadTextBytes +
+                useAudit.potentialDeadRodataBytes +
+                useAudit.candidateInitializationRodataBytes) +
+          " conservative_total_opportunity_bytes=" +
+          Twine(useAudit.conservativeDeadTextBytes +
+                useAudit.conservativeDeadRodataBytes) +
           " eccblocks_fully_dead_candidate=" +
           Twine(eccblocksDead ? 1 : 0) +
           " vpat_fully_dead_candidate=" + Twine(vpatDead ? 1 : 0) +
           " transformation_recommended=" +
-          Twine(potentialRodataBytes >= 300 && phaseSafe ? 1 : 0) +
+          Twine((useAudit.potentialDeadTextBytes +
+                 useAudit.potentialDeadRodataBytes +
+                 useAudit.candidateInitializationRodataBytes) > 0
+                    ? 1
+                    : 0) +
+          " transformation_safety_proven=0" +
           " rejection_reason_counts=" + proof.reason + ":1");
 }
 
