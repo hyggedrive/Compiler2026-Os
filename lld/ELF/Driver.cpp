@@ -4287,10 +4287,62 @@ static void printRISCVFunctionSplitGCStats() {
             " dead bytes " + Twine(d.deadBytes));
 }
 
+enum class RISCVConfigInsnKind {
+  Unknown,
+  CAddi,
+  CLi,
+  CLui,
+  CMv,
+  CAdd,
+  CControlFlow,
+  Addi,
+  Lui,
+  Auipc,
+  Load,
+  Store,
+  ControlFlow,
+  Op,
+};
+
+static StringRef riscvConfigInsnKindName(RISCVConfigInsnKind kind) {
+  switch (kind) {
+  case RISCVConfigInsnKind::Unknown:
+    return "unknown";
+  case RISCVConfigInsnKind::CAddi:
+    return "c.addi";
+  case RISCVConfigInsnKind::CLi:
+    return "c.li";
+  case RISCVConfigInsnKind::CLui:
+    return "c.lui";
+  case RISCVConfigInsnKind::CMv:
+    return "c.mv";
+  case RISCVConfigInsnKind::CAdd:
+    return "c.add";
+  case RISCVConfigInsnKind::CControlFlow:
+    return "c.control-flow";
+  case RISCVConfigInsnKind::Addi:
+    return "addi";
+  case RISCVConfigInsnKind::Lui:
+    return "lui";
+  case RISCVConfigInsnKind::Auipc:
+    return "auipc";
+  case RISCVConfigInsnKind::Load:
+    return "load";
+  case RISCVConfigInsnKind::Store:
+    return "store";
+  case RISCVConfigInsnKind::ControlFlow:
+    return "control-flow";
+  case RISCVConfigInsnKind::Op:
+    return "op";
+  }
+  llvm_unreachable("invalid RISC-V config instruction kind");
+}
+
 struct RISCVConfigInsn {
   uint64_t off = 0;
   uint32_t raw = 0;
   uint8_t size = 0;
+  RISCVConfigInsnKind kind = RISCVConfigInsnKind::Unknown;
   bool controlFlow = false;
   bool call = false;
   bool load = false;
@@ -4314,16 +4366,19 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
     uint32_t quadrant = half & 3;
     uint32_t funct3 = bits(half, 15, 13);
     if (quadrant == 1 && funct3 == 0) {
+      insn.kind = RISCVConfigInsnKind::CAddi;
       insn.rd = bits(half, 11, 7);
       insn.rs1 = insn.rd;
       insn.imm =
           SignExtend64<6>((bits(half, 12, 12) << 5) | bits(half, 6, 2));
     } else if (quadrant == 1 && funct3 == 2) {
+      insn.kind = RISCVConfigInsnKind::CLi;
       insn.rd = bits(half, 11, 7);
       insn.rs1 = 0;
       insn.imm =
           SignExtend64<6>((bits(half, 12, 12) << 5) | bits(half, 6, 2));
     } else if (quadrant == 1 && funct3 == 3) {
+      insn.kind = RISCVConfigInsnKind::CLui;
       insn.rd = bits(half, 11, 7);
       if (insn.rd != 2)
         insn.imm = SignExtend64<18>((bits(half, 12, 12) << 17) |
@@ -4332,10 +4387,18 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
       insn.rd = bits(half, 11, 7);
       insn.rs1 = insn.rd;
       insn.rs2 = bits(half, 6, 2);
-      if (insn.rs2 == 0)
+      if (bits(half, 12, 12) == 0 && insn.rs2 != 0 && insn.rd != 0) {
+        insn.kind = RISCVConfigInsnKind::CMv;
+      } else if (bits(half, 12, 12) == 1 && insn.rs2 != 0 &&
+                 insn.rd != 0) {
+        insn.kind = RISCVConfigInsnKind::CAdd;
+      } else if (insn.rs2 == 0) {
+        insn.kind = RISCVConfigInsnKind::CControlFlow;
         insn.controlFlow = true;
+      }
     } else if (quadrant == 1 &&
                (funct3 == 1 || funct3 == 5 || funct3 == 6 || funct3 == 7)) {
+      insn.kind = RISCVConfigInsnKind::CControlFlow;
       insn.controlFlow = true;
     }
     return insn;
@@ -4351,19 +4414,28 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
   insn.rs2 = bits(word, 24, 20);
   switch (opcode) {
   case 0x13:
+    insn.kind = RISCVConfigInsnKind::Addi;
     insn.imm = SignExtend64<12>(bits(word, 31, 20));
     break;
   case 0x37:
+    insn.kind = RISCVConfigInsnKind::Lui;
+    insn.rs1 = -1;
+    insn.rs2 = -1;
+    insn.imm = SignExtend64<32>(word & 0xfffff000);
+    break;
   case 0x17:
+    insn.kind = RISCVConfigInsnKind::Auipc;
     insn.rs1 = -1;
     insn.rs2 = -1;
     insn.imm = SignExtend64<32>(word & 0xfffff000);
     break;
   case 0x03:
+    insn.kind = RISCVConfigInsnKind::Load;
     insn.load = true;
     insn.imm = SignExtend64<12>(bits(word, 31, 20));
     break;
   case 0x23:
+    insn.kind = RISCVConfigInsnKind::Store;
     insn.store = true;
     insn.rd = -1;
     insn.imm =
@@ -4372,7 +4444,11 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
   case 0x63:
   case 0x6f:
   case 0x67:
+    insn.kind = RISCVConfigInsnKind::ControlFlow;
     insn.controlFlow = true;
+    break;
+  case 0x33:
+    insn.kind = RISCVConfigInsnKind::Op;
     break;
   default:
     break;
@@ -4435,6 +4511,63 @@ struct RISCVConfigFunctionRef {
   uint64_t begin = 0;
   uint64_t end = 0;
 };
+
+template <class ELFT>
+static void dumpRISCVConfigResolverDebug(InputSectionBase &sec, uint64_t off) {
+  InputSectionBase *parentSec = &sec;
+  uint64_t originalBegin = 0;
+  uint64_t originalEnd = sec.content().size();
+  bool splitChild = false;
+  auto storageIt = riscvFunctionSplitRelocStorage.find(&sec);
+  if (storageIt != riscvFunctionSplitRelocStorage.end() &&
+      storageIt->second.parent) {
+    splitChild = true;
+    parentSec = storageIt->second.parent;
+    originalBegin = storageIt->second.originalBegin;
+    originalEnd = storageIt->second.originalEnd;
+  }
+  message(Twine("riscv-config-resolver-debug: file=") + toString(sec.file) +
+          " query_section=" + sec.name +
+          " query_section_ptr=0x" +
+          Twine::utohexstr(reinterpret_cast<uintptr_t>(&sec)) +
+          " query_offset=0x" + Twine::utohexstr(off) +
+          " split_child=" + Twine(splitChild ? 1 : 0) +
+          " parent_section=" + (parentSec ? parentSec->name : StringRef("none")) +
+          " parent_section_ptr=0x" +
+          Twine::utohexstr(reinterpret_cast<uintptr_t>(parentSec)) +
+          " original_begin=0x" + Twine::utohexstr(originalBegin) +
+          " original_end=0x" + Twine::utohexstr(originalEnd));
+  for (ELFFileBase *file : ctx.objectFiles) {
+    if (file != sec.file)
+      continue;
+    for (Symbol *sym : file->getSymbols()) {
+      Defined *d = dyn_cast_or_null<Defined>(sym);
+      if (!d || d->type != STT_FUNC || d->isSection())
+        continue;
+      auto *symSec = dyn_cast_or_null<InputSectionBase>(d->section);
+      if (!symSec)
+        continue;
+      auto childIt = riscvFunctionSplitRelocStorage.find(symSec);
+      bool symIsChild = childIt != riscvFunctionSplitRelocStorage.end() &&
+                        childIt->second.parent;
+      message(Twine("riscv-config-resolver-debug: candidate name=") +
+              d->getName() +
+              " binding=" + (d->isLocal() ? Twine("local") : Twine("global")) +
+              " section=" + symSec->name +
+              " section_ptr=0x" +
+              Twine::utohexstr(reinterpret_cast<uintptr_t>(symSec)) +
+              " value=0x" + Twine::utohexstr(d->value) +
+              " size=" + Twine(d->size) +
+              " child=" + Twine(symIsChild ? 1 : 0) +
+              " parent=" +
+              (symIsChild ? childIt->second.parent->name : StringRef("none")) +
+              " child_original_begin=0x" +
+              Twine::utohexstr(symIsChild ? childIt->second.originalBegin : 0) +
+              " child_original_end=0x" +
+              Twine::utohexstr(symIsChild ? childIt->second.originalEnd : 0));
+    }
+  }
+}
 
 template <class ELFT>
 static RISCVConfigFunctionRef
@@ -4521,16 +4654,14 @@ static bool proveRISCVConfigRegConst(ArrayRef<RISCVConfigInsn> insns,
     }
     if (insn.rd != reg)
       continue;
-    if (insn.size == 2) {
-      uint32_t quadrant = insn.raw & 3;
-      uint32_t funct3 = bits(insn.raw, 15, 13);
-      if (quadrant == 1 && funct3 == 2) {
-        value = insn.imm;
-        reason = "constant";
-        return true;
-      }
-      if (quadrant == 1 && funct3 == 0 && insn.rs1 == reg) {
-        int64_t base = 0;
+      if (insn.size == 2) {
+        if (insn.kind == RISCVConfigInsnKind::CLi) {
+          value = insn.imm;
+          reason = "constant";
+          return true;
+        }
+        if (insn.kind == RISCVConfigInsnKind::CAddi && insn.rs1 == reg) {
+          int64_t base = 0;
         if (!proveRISCVConfigRegConst(insns, insn.off, reg, base, reason))
           return false;
         value = base + insn.imm;
@@ -4606,6 +4737,8 @@ static void printRISCVConfigCallsiteAudit(
           uint64_t off = rel.r_offset;
           RISCVConfigFunctionRef caller =
               resolveRISCVFunctionForLocation<ELFT>(*sec, off);
+          if (!caller.sym)
+            dumpRISCVConfigResolverDebug<ELFT>(*sec, off);
           uint64_t begin = caller.begin;
           uint64_t end = caller.end;
           SmallVector<RISCVConfigInsn, 0> insns;
@@ -4706,6 +4839,8 @@ static void auditRISCVConfigGlobal(StringRef name,
                                                        rel.r_offset);
           RISCVConfigFunctionRef writer =
               resolveRISCVFunctionForLocation<ELFT>(*sec, rel.r_offset);
+          if (!writer.sym)
+            dumpRISCVConfigResolverDebug<ELFT>(*sec, rel.r_offset);
           if (insn.store) {
             ++audit.directWrites;
             audit.writerFunctions.insert(writer.name);
@@ -4753,6 +4888,13 @@ struct RISCVConfigProofResult {
   std::string failFunction;
   uint64_t failOffset = 0;
   uint32_t failOpcode = 0;
+  uint16_t failRaw16 = 0;
+  uint8_t failQuadrant = 0;
+  uint8_t failFunct3 = 0;
+  uint8_t failBit12 = 0;
+  int failRd = -1;
+  int failRs2 = -1;
+  RISCVConfigInsnKind failKind = RISCVConfigInsnKind::Unknown;
   uint32_t visitedBlocks = 0;
   uint32_t executedInstructions = 0;
   uint32_t loopIterations = 0;
@@ -4933,6 +5075,22 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
       result.failOffset = insn.off;
       result.failOpcode = insn.raw & 0x7f;
       result.failFunction = entry->getName().str();
+      result.failKind = insn.kind;
+      if (insn.size == 2) {
+        result.failRaw16 = static_cast<uint16_t>(insn.raw);
+        result.failQuadrant = insn.raw & 3;
+        result.failFunct3 = bits(insn.raw, 15, 13);
+        result.failBit12 = bits(insn.raw, 12, 12);
+        result.failRd = insn.rd;
+        result.failRs2 = insn.rs2;
+      } else {
+        result.failRaw16 = 0;
+        result.failQuadrant = 0;
+        result.failFunct3 = 0;
+        result.failBit12 = 0;
+        result.failRd = insn.rd;
+        result.failRs2 = insn.rs2;
+      }
       if (steps >= 4096) {
         result.reason = "evaluator-step-limit";
         return result;
@@ -4940,15 +5098,29 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
       state.regs[0] = {true, 0};
       uint32_t opcode = insn.raw & 0x7f;
       if (insn.size == 2) {
-        uint32_t quadrant = insn.raw & 3;
-        uint32_t funct3 = bits(insn.raw, 15, 13);
-        if (quadrant == 1 && funct3 == 2 && insn.rd > 0) {
+        if (insn.kind == RISCVConfigInsnKind::CLi && insn.rd > 0) {
           state.regs[insn.rd] = {true, insn.imm};
           continue;
         }
-        if (quadrant == 1 && funct3 == 0 && insn.rd > 0 &&
+        if (insn.kind == RISCVConfigInsnKind::CAddi && insn.rd > 0 &&
             state.regs[insn.rd].known) {
           state.regs[insn.rd].value += insn.imm;
+          continue;
+        }
+        if (insn.kind == RISCVConfigInsnKind::CMv && insn.rd > 0) {
+          if (!state.regs[insn.rs2].known) {
+            result.reason = "unknown-c-mv-source";
+            return result;
+          }
+          state.regs[insn.rd] = state.regs[insn.rs2];
+          continue;
+        }
+        if (insn.kind == RISCVConfigInsnKind::CAdd && insn.rd > 0) {
+          if (!state.regs[insn.rd].known || !state.regs[insn.rs2].known) {
+            result.reason = "unknown-c-add-source";
+            return result;
+          }
+          state.regs[insn.rd].value += state.regs[insn.rs2].value;
           continue;
         }
         if (isRISCVConfigReturn(insn)) {
@@ -5071,6 +5243,8 @@ static void auditRISCVConfigRodata(StringRef name,
           ++audit.liveReferenceCount;
           RISCVConfigFunctionRef ref =
               resolveRISCVFunctionForLocation<ELFT>(*sec, rel.r_offset);
+          if (!ref.sym)
+            dumpRISCVConfigResolverDebug<ELFT>(*sec, rel.r_offset);
           audit.referenceFunctions.insert(ref.name);
           if (!(sec->flags & SHF_EXECINSTR))
             audit.addressTaken = true;
@@ -5186,7 +5360,14 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           (proof.failFunction.empty() ? Twine("none")
                                       : Twine(proof.failFunction)) +
           " offset=0x" + Twine::utohexstr(proof.failOffset) +
-          " opcode=0x" + Twine::utohexstr(proof.failOpcode));
+          " opcode=0x" + Twine::utohexstr(proof.failOpcode) +
+          " raw16=0x" + Twine::utohexstr(proof.failRaw16) +
+          " quadrant=" + Twine(proof.failQuadrant) +
+          " funct3=" + Twine(proof.failFunct3) +
+          " bit12=" + Twine(proof.failBit12) +
+          " rd_rs1=" + Twine(proof.failRd) +
+          " rs2=" + Twine(proof.failRs2) +
+          " decoded_kind=" + riscvConfigInsnKindName(proof.failKind));
 
   uint32_t constantLoads = 0;
   uint32_t constantBranches = 0;
