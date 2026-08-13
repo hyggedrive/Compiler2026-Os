@@ -5540,6 +5540,55 @@ static RISCVConfigBranchTarget resolveRISCVConfigJalTarget(
   return result;
 }
 
+static RISCVConfigBranchTarget resolveRISCVConfigRvcControlTarget(
+    InputSectionBase &sec, const RISCVConfigInsn &insn,
+    const DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> &relocMap,
+    RelType expected) {
+  RISCVConfigBranchTarget result;
+  auto it = relocMap.find(insn.off);
+  const RISCVConfigRelocInfo *reloc = nullptr;
+  if (it != relocMap.end()) {
+    for (const RISCVConfigRelocInfo &r : it->second) {
+      if (r.type != expected)
+        continue;
+      if (reloc) {
+        result.reason = "ambiguous-rvc-control-relocation";
+        return result;
+      }
+      reloc = &r;
+    }
+  }
+  if (!reloc) {
+    result.reason = "rvc-control-relocation-missing";
+    return result;
+  }
+  result.source = "relocation";
+  result.relocAddend = reloc->addend;
+  if (!reloc->target) {
+    result.reason = "rvc-control-target-unresolved";
+    return result;
+  }
+  result.relocSymbol = reloc->target->getName().str();
+  auto *targetSec = dyn_cast_or_null<InputSectionBase>(reloc->target->section);
+  if (!targetSec) {
+    result.reason = "rvc-control-target-section-unresolved";
+    return result;
+  }
+  result.relocSection = targetSec->name.str();
+  uint64_t targetOff = 0;
+  if (!checkedAddend(reloc->target->value, reloc->addend, targetOff)) {
+    result.reason = "rvc-control-target-overflow";
+    return result;
+  }
+  if (!convertRISCVConfigTargetOffset(sec, *targetSec, targetOff,
+                                      result.target)) {
+    result.reason = "rvc-control-target-out-of-section";
+    return result;
+  }
+  result.ok = true;
+  return result;
+}
+
 static RISCVConfigDirectCallTarget resolveRISCVConfigDirectCallTarget(
     InputSectionBase &sec, const RISCVConfigInsn &insn,
     const DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> &relocMap) {
@@ -6509,6 +6558,8 @@ static bool evalRISCVConfigIntegerInsn(const RISCVConfigInsn &insn,
                                        RISCVConfigDataflowState &state,
                                        std::string &reason) {
   if (insn.size == 2) {
+    if (insn.kind == RISCVConfigInsnKind::CAddi && insn.rd == 0)
+      return true;
     if (insn.kind == RISCVConfigInsnKind::CLi && insn.rd > 0) {
       state.regs[insn.rd] = riscvConfigInteger(insn.imm);
       return true;
@@ -6750,6 +6801,32 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
         auto *funcSec = dyn_cast_or_null<InputSectionBase>(func->section);
         if (!funcSec)
           continue;
+        uint32_t directIncomingCalls = 0;
+        bool unresolvedIncoming = false;
+        bool addressTakenFunction = false;
+        for (ELFFileBase *inFile : ctx.objectFiles) {
+          for (InputSectionBase *inSec : inFile->getSections()) {
+            if (!inSec || !inSec->isLive() || !(inSec->flags & SHF_ALLOC) ||
+                !inSec->file)
+              continue;
+            RelsOrRelas<ELFT> inRels = inSec->template relsOrRelas<ELFT>();
+            auto scanIncoming = [&](auto relRange) {
+              for (const auto &rel : relRange) {
+                Defined *target = getRISCVConfigRelocTarget<ELFT>(*inSec, rel);
+                if (target != func)
+                  continue;
+                RelType type = rel.getType(config->isMips64EL);
+                if (isRISCVConfigDirectCallRel(type) &&
+                    (inSec->flags & SHF_EXECINSTR))
+                  ++directIncomingCalls;
+                else
+                  addressTakenFunction = true;
+              }
+            };
+            scanIncoming(inRels.rels);
+            scanIncoming(inRels.relas);
+          }
+        }
         ++out.functionsAnalyzed;
         std::string cfgReason;
         SmallVector<RISCVConfigBasicBlock, 0> blocks =
@@ -6770,6 +6847,8 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
           blockByBegin[b.begin] = &b;
         bool cfgSafe = true;
         std::string functionReason = "none";
+        RISCVConfigInsn unsupportedInsn;
+        bool hasUnsupportedInsn = false;
         DenseMap<uint64_t, Defined *> loadSiteSymbols;
 
         auto runDataflow = [&](bool specialize, DenseSet<uint64_t> &reachable,
@@ -6874,6 +6953,65 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
                 noFallthrough = true;
                 break;
               }
+              if (insn.size == 2 && isRISCVConfigReturn(insn)) {
+                noFallthrough = true;
+                break;
+              }
+              if (insn.size == 2 &&
+                  insn.kind == RISCVConfigInsnKind::CControlFlow) {
+                uint32_t funct3 = bits(insn.raw, 15, 13);
+                if (funct3 == 5) {
+                  RISCVConfigBranchTarget target =
+                      resolveRISCVConfigRvcControlTarget(
+                          *funcSec, insn, relocMap, R_RISCV_RVC_JUMP);
+                  if (!target.ok) {
+                    if (functionReason == "none")
+                      functionReason = target.reason;
+                    safe = false;
+                    break;
+                  }
+                  succs.push_back({target.target, state});
+                  noFallthrough = true;
+                  break;
+                }
+                if (funct3 == 6 || funct3 == 7) {
+                  RISCVConfigBranchTarget target =
+                      resolveRISCVConfigRvcControlTarget(
+                          *funcSec, insn, relocMap, R_RISCV_RVC_BRANCH);
+                  if (!target.ok) {
+                    if (functionReason == "none")
+                      functionReason = target.reason;
+                    safe = false;
+                    break;
+                  }
+                  int rs1 = 8 + bits(insn.raw, 9, 7);
+                  uint64_t fallthrough = insn.off + insn.size;
+                  if (state.regs[rs1].kind == RISCVConfigValueKind::Integer) {
+                    bool taken =
+                        (static_cast<uint32_t>(state.regs[rs1].value) == 0);
+                    if (funct3 == 7)
+                      taken = !taken;
+                    auto it = branchResults.find(insn.off);
+                    if (it == branchResults.end())
+                      branchResults[insn.off] = taken;
+                    else if (!it->second || *it->second != taken)
+                      branchResults[insn.off] = std::nullopt;
+                    succs.push_back({taken ? target.target : fallthrough,
+                                     state});
+                  } else {
+                    branchResults[insn.off] = std::nullopt;
+                    succs.push_back({target.target, state});
+                    succs.push_back({fallthrough, state});
+                  }
+                  break;
+                }
+                if (functionReason == "none")
+                  functionReason = "unsupported-rvc-control-flow";
+                unsupportedInsn = insn;
+                hasUnsupportedInsn = true;
+                safe = false;
+                break;
+              }
               if (opcode == 0x67 || isRISCVConfigReturn(insn)) {
                 noFallthrough = true;
                 break;
@@ -6917,6 +7055,8 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
               if (!evalRISCVConfigIntegerInsn(insn, state, evalReason)) {
                 if (functionReason == "none")
                   functionReason = evalReason;
+                unsupportedInsn = insn;
+                hasUnsupportedInsn = true;
                 safe = false;
                 break;
               }
@@ -7056,10 +7196,32 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
                 " specialization_dead_bytes=" + Twine(functionDeadBytes) +
                 " cfg_safe=" + Twine(cfgSafe ? 1 : 0) +
                 " reason=" + functionReason);
+        if (!cfgSafe && hasUnsupportedInsn && unsupportedInsn.size == 2) {
+          message(Twine("riscv-config-dataflow-unsupported: function=") +
+                  func->getName() +
+                  " offset=0x" + Twine::utohexstr(unsupportedInsn.off) +
+                  " raw16=0x" + Twine::utohexstr(unsupportedInsn.raw) +
+                  " quadrant=" + Twine(unsigned(unsupportedInsn.raw & 3)) +
+                  " funct3=" +
+                  Twine(unsigned(bits(unsupportedInsn.raw, 15, 13))) +
+                  " bit12=" +
+                  Twine(unsigned(bits(unsupportedInsn.raw, 12, 12))) +
+                  " decoded_kind=" +
+                  riscvConfigInsnKindName(unsupportedInsn.kind) +
+                  " reason=" + functionReason);
+        }
         message(Twine("riscv-config-function-audit: function=") +
                 func->getName() +
                 " cfg_safe=" + Twine(cfgSafe ? 1 : 0) +
                 " reason=" + functionReason);
+        message(Twine("riscv-config-init-order-function: function=") +
+                func->getName() +
+                " address_taken=" + Twine(addressTakenFunction ? 1 : 0) +
+                " preemptible=0" +
+                " unresolved_incoming=" + Twine(unresolvedIncoming ? 1 : 0) +
+                " direct_incoming_calls=" + Twine(directIncomingCalls) +
+                " entry_state=maybe"
+                " reason=interprocedural-init-order-not-proven");
       }
     }
   }
