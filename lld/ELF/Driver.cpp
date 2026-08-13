@@ -4952,6 +4952,7 @@ struct RISCVConfigProofResult {
   uint32_t constantBranches = 0;
   uint32_t alwaysTakenBranches = 0;
   uint32_t neverTakenBranches = 0;
+  uint32_t branchTraceEmitted = 0;
   std::map<std::string, std::optional<int64_t>> values;
 };
 
@@ -5132,6 +5133,14 @@ static bool evaluateRISCVConfigBranch(uint32_t insn, int64_t lhs, int64_t rhs,
   }
 }
 
+static int64_t decodeRISCVConfigBImm(uint32_t insn) {
+  uint32_t imm = (bits(insn, 31, 31) << 12) |
+                 (bits(insn, 7, 7) << 11) |
+                 (bits(insn, 30, 25) << 5) |
+                 (bits(insn, 11, 8) << 1);
+  return SignExtend64<13>(imm);
+}
+
 template <class ELFT>
 static SmallVector<RISCVConfigBasicBlock, 0>
 buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
@@ -5148,7 +5157,8 @@ buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
     }
     allInsns.push_back(insn);
     if (insn.size == 4 && (insn.raw & 0x7f) == 0x63) {
-      int64_t signedTarget = static_cast<int64_t>(off) + decodeBranch(insn.raw);
+      int64_t signedTarget =
+          static_cast<int64_t>(off) + decodeRISCVConfigBImm(insn.raw);
       uint64_t fallthrough = off + insn.size;
       if (signedTarget >= 0) {
         uint64_t target = static_cast<uint64_t>(signedTarget);
@@ -5270,6 +5280,9 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
   state.regs[11] = riscvConfigInteger(arg1);
   DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap =
       getRISCVConfigRelocs<ELFT>(*entrySec);
+  DenseSet<uint64_t> blockBoundaries;
+  for (const RISCVConfigBasicBlock &block : blocks)
+    blockBoundaries.insert(block.begin);
 
   DenseSet<uint64_t> visited;
   uint64_t current = entry->value;
@@ -5496,14 +5509,40 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
           ++result.alwaysTakenBranches;
         else
           ++result.neverTakenBranches;
-        int64_t branchImm = decodeBranch(insn.raw);
+        int64_t branchImm = decodeRISCVConfigBImm(insn.raw);
         int64_t signedTarget = static_cast<int64_t>(insn.off) + branchImm;
         if (taken && signedTarget < 0) {
           result.reason = "branch-target-out-of-range";
           return result;
         }
-        current = taken ? static_cast<uint64_t>(signedTarget)
-                        : insn.off + insn.size;
+        uint64_t takenTarget = static_cast<uint64_t>(signedTarget);
+        uint64_t fallthrough = insn.off + insn.size;
+        uint64_t successor = taken ? takenTarget : fallthrough;
+        if (result.branchTraceEmitted < 48) {
+          ++result.branchTraceEmitted;
+          message(Twine("riscv-config-branch-trace: function=") +
+                  entry->getName() +
+                  " offset=0x" + Twine::utohexstr(insn.off) +
+                  " raw=0x" + Twine::utohexstr(insn.raw) +
+                  " funct3=" + Twine(bits(insn.raw, 14, 12)) +
+                  " lhs=" + Twine(state.regs[insn.rs1].value) +
+                  " rhs=" + Twine(state.regs[insn.rs2].value) +
+                  " taken=" + Twine(taken ? 1 : 0) +
+                  " decoded_imm=" + Twine(branchImm) +
+                  " taken_target=0x" + Twine::utohexstr(takenTarget) +
+                  " fallthrough=0x" + Twine::utohexstr(fallthrough) +
+                  " current_block=0x" + Twine::utohexstr(block.begin));
+        }
+        if (successor < entry->value || successor >= entry->value + entry->size) {
+          result.reason = "branch-target-out-of-function";
+          return result;
+        }
+        if (!blockBoundaries.contains(successor)) {
+          result.reason = "branch-target-not-basic-block";
+          result.failOffset = successor;
+          return result;
+        }
+        current = successor;
         transferred = true;
         break;
       }
