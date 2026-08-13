@@ -4302,6 +4302,7 @@ enum class RISCVConfigInsnKind {
   CXor,
   COr,
   CAnd,
+  CLw,
   CLwsp,
   CSwsp,
   CControlFlow,
@@ -4344,6 +4345,8 @@ static StringRef riscvConfigInsnKindName(RISCVConfigInsnKind kind) {
     return "c.or";
   case RISCVConfigInsnKind::CAnd:
     return "c.and";
+  case RISCVConfigInsnKind::CLw:
+    return "c.lw";
   case RISCVConfigInsnKind::CLwsp:
     return "c.lwsp";
   case RISCVConfigInsnKind::CSwsp:
@@ -4395,7 +4398,14 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
     insn.size = 2;
     uint32_t quadrant = half & 3;
     uint32_t funct3 = bits(half, 15, 13);
-    if (quadrant == 1 && funct3 == 0) {
+    if (quadrant == 0 && funct3 == 2) {
+      insn.kind = RISCVConfigInsnKind::CLw;
+      insn.load = true;
+      insn.rd = 8 + bits(half, 4, 2);
+      insn.rs1 = 8 + bits(half, 9, 7);
+      insn.imm = (bits(half, 5, 5) << 6) | (bits(half, 12, 10) << 3) |
+                 (bits(half, 6, 6) << 2);
+    } else if (quadrant == 1 && funct3 == 0) {
       insn.kind = RISCVConfigInsnKind::CAddi;
       insn.rd = bits(half, 11, 7);
       insn.rs1 = insn.rd;
@@ -4867,16 +4877,7 @@ static void printRISCVConfigCallsiteAudit(
       if (!sec || !sec->isLive() || !(sec->flags & SHF_EXECINSTR) ||
           !sec->file)
         continue;
-      ArrayRef<uint8_t> data = sec->content();
       RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
-      DenseSet<uint64_t> callRelocOffsets;
-      auto collectCallRelocs = [&](auto relsRange) {
-        for (const auto &rel : relsRange)
-          if (isRISCVConfigDirectCallRel(rel.getType(config->isMips64EL)))
-            callRelocOffsets.insert(rel.r_offset);
-      };
-      collectCallRelocs(rels.rels);
-      collectCallRelocs(rels.relas);
       auto scan = [&](auto relsRange) {
         for (const auto &rel : relsRange) {
           RelType type = rel.getType(config->isMips64EL);
@@ -4890,34 +4891,64 @@ static void printRISCVConfigCallsiteAudit(
               resolveRISCVFunctionForLocation<ELFT>(*sec, off);
           if (!caller.sym)
             dumpRISCVConfigResolverDebug<ELFT>(*sec, off);
+          InputSectionBase *decodeSec = &*sec;
+          uint64_t decodeOff = off;
+          bool coordOk = true;
+          if (caller.sym) {
+            auto *callerSec =
+                dyn_cast_or_null<InputSectionBase>(caller.sym->section);
+            if (callerSec && callerSec != sec) {
+              coordOk = convertRISCVConfigTargetOffset(*callerSec, *sec, off,
+                                                       decodeOff);
+              if (coordOk)
+                decodeSec = callerSec;
+            }
+          }
+          ArrayRef<uint8_t> decodeData = decodeSec->content();
+          DenseSet<uint64_t> decodeCallRelocOffsets;
+          auto collectDecodeCallRelocs = [&](auto relRange) {
+            for (const auto &callRel : relRange) {
+              if (!isRISCVConfigDirectCallRel(
+                      callRel.getType(config->isMips64EL)))
+                continue;
+              uint64_t callOff = callRel.r_offset;
+              if (decodeSec != sec &&
+                  !convertRISCVConfigTargetOffset(*decodeSec, *sec,
+                                                  callRel.r_offset, callOff))
+                continue;
+              decodeCallRelocOffsets.insert(callOff);
+            }
+          };
+          collectDecodeCallRelocs(rels.rels);
+          collectDecodeCallRelocs(rels.relas);
           uint64_t begin = caller.begin;
           uint64_t end = caller.end;
           SmallVector<RISCVConfigInsn, 0> insns;
-          bool decodeOk = true;
+          bool decodeOk = coordOk;
           for (uint64_t pos = begin; pos < end;) {
-            RISCVConfigInsn insn = decodeRISCVConfigInsn(data, pos);
+            RISCVConfigInsn insn = decodeRISCVConfigInsn(decodeData, pos);
             if (insn.size == 0 || pos + insn.size > end) {
               decodeOk = false;
               break;
             }
-            insn.call = callRelocOffsets.contains(pos);
+            insn.call = decodeCallRelocOffsets.contains(pos);
             insns.push_back(insn);
-            if (pos == off)
+            if (pos == decodeOff)
               break;
             pos += insn.size;
           }
           RISCVConfigCallRecord rec;
           rec.callee = calleeName.str();
           rec.caller = caller.name;
-          rec.callOffset = off;
+          rec.callOffset = decodeOff;
           if (!decodeOk) {
             rec.reason = "decode-failed";
           } else {
             std::string reason0, reason1;
-            rec.arg0Proven =
-                proveRISCVConfigRegConst(insns, off, 10, rec.arg0Value, reason0);
-            rec.arg1Proven =
-                proveRISCVConfigRegConst(insns, off, 11, rec.arg1Value, reason1);
+            rec.arg0Proven = proveRISCVConfigRegConst(
+                insns, decodeOff, 10, rec.arg0Value, reason0);
+            rec.arg1Proven = proveRISCVConfigRegConst(
+                insns, decodeOff, 11, rec.arg1Value, reason1);
             rec.reason = (rec.arg0Proven && rec.arg1Proven)
                              ? "constant"
                              : (!rec.arg0Proven ? reason0 : reason1);
@@ -6837,7 +6868,8 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
   struct RISCVConfigInitOrderEdge {
     Defined *caller = nullptr;
     Defined *callee = nullptr;
-    uint64_t callOffset = 0;
+    uint64_t displayOffset = 0;
+    uint64_t callerOffset = 0;
   };
   struct RISCVConfigDeadRegionDiag {
     std::string function;
@@ -6878,7 +6910,14 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
                 resolveRISCVFunctionForLocation<ELFT>(*sec, rel.r_offset);
             if (!caller.sym)
               continue;
-            initOrderEdges.push_back({caller.sym, target, rel.r_offset});
+            uint64_t callerOff = rel.r_offset;
+            auto *callerSec =
+                dyn_cast_or_null<InputSectionBase>(caller.sym->section);
+            if (callerSec && callerSec != sec)
+              convertRISCVConfigTargetOffset(*callerSec, *sec, rel.r_offset,
+                                             callerOff);
+            initOrderEdges.push_back(
+                {caller.sym, target, rel.r_offset, callerOff});
             ++directIncomingByFunction[target];
           } else {
             addressTakenFunctions.insert(target);
@@ -6915,7 +6954,7 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
 
   auto recordInitCallsite = [&](Defined *caller, uint64_t off,
                                 RISCVConfigInitState state) {
-    auto key = std::make_pair(caller, off);
+      auto key = std::make_pair(caller, off);
     RISCVConfigInitState oldState = RISCVConfigInitState::None;
     auto oldIt = initCallsiteStates.find(key);
     if (oldIt != initCallsiteStates.end())
@@ -7050,7 +7089,7 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
       changedInitOrder |= analyzeInitOrderFunction(func,
                                                    initEntryStates.lookup(func));
     for (const RISCVConfigInitOrderEdge &edge : initOrderEdges) {
-      auto it = initCallsiteStates.find({edge.caller, edge.callOffset});
+      auto it = initCallsiteStates.find({edge.caller, edge.callerOffset});
       if (it == initCallsiteStates.end())
         continue;
       RISCVConfigInitState propagated = it->second;
@@ -7065,19 +7104,24 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
   }
 
   if (initCall && initCaller)
+    uint64_t displayOffset = initCall->callOffset;
+    for (const RISCVConfigInitOrderEdge &edge : initOrderEdges)
+      if (edge.caller == initCaller && edge.callerOffset == initCall->callOffset &&
+          edge.callee->getName() == initCall->callee)
+        displayOffset = edge.displayOffset;
     message(Twine("riscv-config-init-order-transition: function=") +
             initCall->caller +
-            " call_offset=0x" + Twine::utohexstr(initCall->callOffset) +
+            " call_offset=0x" + Twine::utohexstr(displayOffset) +
             " before=before-init after=after-init"
             " reason=proven-initialization-call");
   for (const RISCVConfigInitOrderEdge &edge : initOrderEdges) {
-    auto it = initCallsiteStates.find({edge.caller, edge.callOffset});
+    auto it = initCallsiteStates.find({edge.caller, edge.callerOffset});
     if (it == initCallsiteStates.end())
       continue;
     RISCVConfigInitState propagated = it->second;
     message(Twine("riscv-config-init-order-edge: caller=") +
             edge.caller->getName() +
-            " call_offset=0x" + Twine::utohexstr(edge.callOffset) +
+            " call_offset=0x" + Twine::utohexstr(edge.displayOffset) +
             " callee=" + edge.callee->getName() +
             " caller_state=" +
             riscvConfigInitStateName(initEntryStates.lookup(edge.caller)) +
