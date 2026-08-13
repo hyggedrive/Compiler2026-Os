@@ -1375,6 +1375,8 @@ static void readConfigs(opt::InputArgList &args) {
       args.hasArg(OPT_print_riscv_config_specialization_audit);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
+  config->riscvConfigSpecialization =
+      args.hasArg(OPT_riscv_config_specialization);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
   config->printSymbolOrder =
       args.getLastArgValue(OPT_print_symbol_order);
@@ -5203,6 +5205,7 @@ struct RISCVConfigBasicBlock {
 
 struct RISCVConfigRelocInfo {
   RelType type = static_cast<RelType>(0);
+  Symbol *sym = nullptr;
   Defined *target = nullptr;
   int64_t addend = 0;
 };
@@ -5216,7 +5219,9 @@ getRISCVConfigRelocs(InputSectionBase &sec) {
     for (const auto &rel : relRange) {
       RISCVConfigRelocInfo info;
       info.type = rel.getType(config->isMips64EL);
-      info.target = getRISCVConfigRelocTarget<ELFT>(sec, rel);
+      Symbol &sym = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+      info.sym = &sym;
+      info.target = dyn_cast<Defined>(&sym);
       info.addend = getRISCVFunctionSplitAddend(rel);
       result[rel.r_offset].push_back(info);
     }
@@ -6551,6 +6556,18 @@ tryEvaluateRISCVConfigInitialization(
 }
 
 struct RISCVConfigUseAuditResult {
+  struct DeadRange {
+    Defined *function = nullptr;
+    InputSectionBase *section = nullptr;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+  };
+  struct BranchRewrite {
+    Defined *function = nullptr;
+    InputSectionBase *section = nullptr;
+    uint64_t offset = 0;
+    bool taken = false;
+  };
   uint32_t provenConstantGlobals = 0;
   uint32_t constantLoads = 0;
   uint32_t constantBranches = 0;
@@ -6568,6 +6585,8 @@ struct RISCVConfigUseAuditResult {
   uint64_t candidateInitializationRodataBytes = 0;
   bool initializationOrderProven = false;
   uint32_t unsafeOrUnknownReadSites = 0;
+  SmallVector<DeadRange, 0> safeDeadRanges;
+  SmallVector<BranchRewrite, 0> branchRewrites;
 };
 
 struct RISCVConfigDataflowState {
@@ -6878,6 +6897,8 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
   };
   struct RISCVConfigDeadRegionDiag {
     std::string function;
+    Defined *functionSym = nullptr;
+    InputSectionBase *section = nullptr;
     uint64_t begin = 0;
     uint64_t end = 0;
     bool functionSafe = false;
@@ -7502,8 +7523,11 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
           if (baseIt != baselineBranchResults.end())
             baseline = baseIt->second;
           bool dependent = !baseline || *baseline != *specialized;
-          if (dependent)
+          if (dependent) {
             ++out.specializationDependentBranches;
+            out.branchRewrites.push_back(
+                {func, funcSec, off, *specialized});
+          }
           message(Twine("riscv-config-constant-branch: function=") +
                   func->getName() +
                   " offset=0x" + Twine::utohexstr(off) +
@@ -7533,7 +7557,8 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
                 cfgSafe &&
                 (initInternal || entryInitState == RISCVConfigInitState::After);
             deadRegionDiags.push_back(
-                {func->getName().str(), b.begin, b.end, functionSafe});
+                {func->getName().str(), func, funcSec, b.begin, b.end,
+                 functionSafe});
             for (const auto &kv : relocMap) {
               if (kv.first < b.begin || kv.first >= b.end)
                 continue;
@@ -7596,6 +7621,8 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
     if (regionSafe) {
       ++out.safeDeadRegions;
       out.conservativeDeadTextBytes += diag.end - diag.begin;
+      out.safeDeadRanges.push_back(
+          {diag.functionSym, diag.section, diag.begin, diag.end});
     }
     message(Twine("riscv-config-dead-region: function=") + diag.function +
             " begin=0x" + Twine::utohexstr(diag.begin) +
@@ -7617,6 +7644,392 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
       out.potentialDeadRodataBytes += readonlySizes.lookup(sym);
   }
   return out;
+}
+
+static bool riscvConfigRangeContains(
+    ArrayRef<RISCVConfigUseAuditResult::DeadRange> ranges, uint64_t off) {
+  return llvm::any_of(ranges, [&](const RISCVConfigUseAuditResult::DeadRange &r) {
+    return off >= r.begin && off < r.end;
+  });
+}
+
+static uint64_t riscvConfigRemovedBefore(
+    ArrayRef<RISCVConfigUseAuditResult::DeadRange> ranges, uint64_t off) {
+  uint64_t removed = 0;
+  for (const RISCVConfigUseAuditResult::DeadRange &r : ranges) {
+    if (off >= r.end)
+      removed += r.end - r.begin;
+    else if (off > r.begin)
+      removed += off - r.begin;
+  }
+  return removed;
+}
+
+static std::optional<uint64_t> riscvConfigMapOffset(
+    ArrayRef<RISCVConfigUseAuditResult::DeadRange> ranges, uint64_t off) {
+  if (riscvConfigRangeContains(ranges, off))
+    return std::nullopt;
+  return off - riscvConfigRemovedBefore(ranges, off);
+}
+
+static uint32_t encodeRISCVConfigJal(uint32_t rd, int64_t imm) {
+  uint32_t u = static_cast<uint32_t>(imm);
+  return ((u & 0x100000) << 11) | ((u & 0x7fe) << 20) |
+         ((u & 0x800) << 9) | (u & 0xff000) | (rd << 7) | 0x6f;
+}
+
+static bool isRISCVConfigControlReloc(RelType type) {
+  return type == R_RISCV_BRANCH || type == R_RISCV_JAL ||
+         type == R_RISCV_RVC_BRANCH || type == R_RISCV_RVC_JUMP;
+}
+
+template <class ELFT>
+static bool applyRISCVConfigTransformFunction(
+    Defined &func, InputSectionBase &sec,
+    ArrayRef<RISCVConfigUseAuditResult::DeadRange> inputRanges,
+    ArrayRef<RISCVConfigUseAuditResult::BranchRewrite> rewrites,
+    uint64_t &removedBytes, uint32_t &removedRelocs, uint32_t &rebasedRelocs,
+    uint32_t &rebasedSymbols, uint32_t &branchRewriteCount,
+    std::string &reason) {
+  if (inputRanges.empty()) {
+    reason = "no-dead-ranges";
+    return false;
+  }
+  SmallVector<RISCVConfigUseAuditResult::DeadRange, 0> ranges(inputRanges);
+  llvm::sort(ranges, [](const auto &a, const auto &b) {
+    return a.begin < b.begin;
+  });
+  for (size_t i = 0, e = ranges.size(); i != e; ++i) {
+    if (ranges[i].section != &sec || ranges[i].function != &func ||
+        ranges[i].begin >= ranges[i].end || ranges[i].end > sec.content().size()) {
+      reason = "invalid-dead-range";
+      return false;
+    }
+    if (i && ranges[i - 1].end > ranges[i].begin) {
+      reason = "overlapping-dead-range";
+      return false;
+    }
+  }
+
+  DenseMap<uint64_t, bool> branchRewriteByOffset;
+  for (const RISCVConfigUseAuditResult::BranchRewrite &rw : rewrites) {
+    if (rw.section != &sec || rw.function != &func)
+      continue;
+    if (riscvConfigRangeContains(ranges, rw.offset)) {
+      reason = "branch-rewrite-in-dead-range";
+      return false;
+    }
+    branchRewriteByOffset[rw.offset] = rw.taken;
+  }
+
+  ArrayRef<uint8_t> oldContent = sec.content();
+  uint64_t functionRemovedBytes = 0;
+  SmallVector<uint8_t, 0> newContent;
+  newContent.reserve(oldContent.size());
+  uint64_t cursor = 0;
+  for (const RISCVConfigUseAuditResult::DeadRange &r : ranges) {
+    newContent.append(oldContent.begin() + cursor, oldContent.begin() + r.begin);
+    functionRemovedBytes += r.end - r.begin;
+    cursor = r.end;
+  }
+  newContent.append(oldContent.begin() + cursor, oldContent.end());
+
+  DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap =
+      getRISCVConfigRelocs<ELFT>(sec);
+  for (auto &[off, rs] : relocMap) {
+    bool inDead = riscvConfigRangeContains(ranges, off);
+    if (inDead)
+      continue;
+    RISCVConfigInsn insn = decodeRISCVConfigInsn(oldContent, off);
+    bool rewrite = branchRewriteByOffset.find(off) != branchRewriteByOffset.end();
+    if (rewrite) {
+      std::optional<uint64_t> newOff = riscvConfigMapOffset(ranges, off);
+      if (!newOff) {
+        reason = "branch-rewrite-offset-dead";
+        return false;
+      }
+      bool taken = branchRewriteByOffset.lookup(off);
+      if (!taken) {
+        if (insn.size == 4)
+          llvm::support::endian::write32le(newContent.data() + *newOff,
+                                           0x00000013);
+        else if (insn.size == 2)
+          llvm::support::endian::write16le(newContent.data() + *newOff, 0x0001);
+        else {
+          reason = "branch-rewrite-unknown-size";
+          return false;
+        }
+      } else if (insn.size == 4 && (insn.raw & 0x7f) == 0x63) {
+        RISCVConfigBranchTarget target =
+            resolveRISCVConfigBranchTarget(sec, insn, relocMap);
+        if (!target.ok) {
+          reason = target.reason;
+          return false;
+        }
+        std::optional<uint64_t> newTarget =
+            riscvConfigMapOffset(ranges, target.target);
+        if (!newTarget) {
+          reason = "taken-branch-target-dead";
+          return false;
+        }
+        int64_t delta = static_cast<int64_t>(*newTarget) -
+                        static_cast<int64_t>(*newOff);
+        if (delta < -(1 << 20) || delta >= (1 << 20) || (delta & 1)) {
+          reason = "taken-branch-jal-range";
+          return false;
+        }
+        llvm::support::endian::write32le(newContent.data() + *newOff,
+                                         encodeRISCVConfigJal(0, delta));
+      } else {
+        reason = "taken-branch-rewrite-unsupported";
+        return false;
+      }
+      ++branchRewriteCount;
+    }
+  }
+
+  for (uint64_t off = 0; off < oldContent.size();) {
+    RISCVConfigInsn insn = decodeRISCVConfigInsn(oldContent, off);
+    if (insn.size == 0) {
+      reason = "decode-failed";
+      return false;
+    }
+    bool dead = riscvConfigRangeContains(ranges, off);
+    bool rewrite = branchRewriteByOffset.find(off) != branchRewriteByOffset.end();
+    bool hasControlReloc = false;
+    auto relocIt = relocMap.find(off);
+    if (relocIt != relocMap.end())
+      for (const RISCVConfigRelocInfo &r : relocIt->second)
+        if (isRISCVConfigControlReloc(r.type))
+          hasControlReloc = true;
+    if (!dead && !rewrite) {
+      uint32_t opcode = insn.raw & 0x7f;
+      bool pairedDirectCallJalr = false;
+      if (insn.size == 4 && opcode == 0x67 && off >= 4) {
+        auto prevRelocIt = relocMap.find(off - 4);
+        if (prevRelocIt != relocMap.end())
+          for (const RISCVConfigRelocInfo &r : prevRelocIt->second)
+            if (r.type == R_RISCV_CALL || r.type == R_RISCV_CALL_PLT)
+              pairedDirectCallJalr = true;
+      }
+      if ((insn.size == 4 && (opcode == 0x63 || opcode == 0x6f)) ||
+          (insn.size == 2 && insn.kind == RISCVConfigInsnKind::CControlFlow)) {
+        if (!isRISCVConfigReturn(insn) && !hasControlReloc) {
+          reason = "surviving-raw-control-flow";
+          return false;
+        }
+      } else if (insn.size == 4 && opcode == 0x67 &&
+                 !isRISCVConfigReturn(insn) && !pairedDirectCallJalr) {
+        reason = "surviving-raw-jalr";
+        return false;
+      }
+    }
+    off += insn.size;
+  }
+
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  if (!rels.rels.empty()) {
+    reason = "rel-relocations-unsupported";
+    return false;
+  }
+  using Elf_Rela = typename ELFT::Rela;
+  SmallVector<Elf_Rela, 0> newRelas;
+  auto rebuildRela = [&](auto relRange) -> bool {
+    for (const auto &rel : relRange) {
+      RelType type = rel.getType(config->isMips64EL);
+      if (riscvConfigRangeContains(ranges, rel.r_offset)) {
+        ++removedRelocs;
+        continue;
+      }
+      if (branchRewriteByOffset.find(rel.r_offset) !=
+          branchRewriteByOffset.end()) {
+        ++removedRelocs;
+        continue;
+      }
+      std::optional<uint64_t> newOff =
+          riscvConfigMapOffset(ranges, rel.r_offset);
+      if (!newOff) {
+        reason = "surviving-relocation-in-dead-range";
+        return false;
+      }
+      Symbol &sym = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+      Defined *d = dyn_cast<Defined>(&sym);
+      Elf_Rela out;
+      out.r_offset = *newOff;
+      out.r_info = rel.r_info;
+      out.r_addend = getRISCVFunctionSplitAddend(rel);
+      if (d && d->section == &sec) {
+        int64_t oldAddend = getRISCVFunctionSplitAddend(rel);
+        uint64_t oldTarget = 0;
+        if (!checkedAddend(d->value, oldAddend, oldTarget)) {
+          reason = "surviving-relocation-target-overflow";
+          return false;
+        }
+        std::optional<uint64_t> target =
+            riscvConfigMapOffset(ranges, oldTarget);
+        if (!target) {
+          reason = "surviving-relocation-target-dead-range";
+          return false;
+        }
+        std::optional<uint64_t> newSymValue =
+            riscvConfigMapOffset(ranges, d->value);
+        if (!newSymValue) {
+          reason = "surviving-relocation-symbol-dead-range";
+          return false;
+        }
+        out.r_addend = static_cast<int64_t>(*target) -
+                       static_cast<int64_t>(*newSymValue);
+      }
+      newRelas.push_back(out);
+      ++rebasedRelocs;
+    }
+    return true;
+  };
+  if (!rebuildRela(rels.relas))
+    return false;
+
+  for (ELFFileBase *file : ctx.objectFiles) {
+    if (file != sec.file)
+      continue;
+    for (Symbol *sym : file->getSymbols()) {
+      Defined *d = dyn_cast_or_null<Defined>(sym);
+      if (!d || d->section != &sec)
+        continue;
+      std::optional<uint64_t> newValue = riscvConfigMapOffset(ranges, d->value);
+      if (!newValue) {
+        reason = "symbol-in-dead-range";
+        return false;
+      }
+      d->value = *newValue;
+      if (d == &func)
+        d->size = oldContent.size() - functionRemovedBytes;
+      ++rebasedSymbols;
+    }
+  }
+
+  uint8_t *newBuf = makeThreadLocalN<uint8_t>(newContent.size());
+  llvm::copy(newContent, newBuf);
+  sec.content_ = newBuf;
+  sec.size = newContent.size();
+
+  auto *relBuf = makeThreadLocalN<Elf_Rela>(newRelas.size());
+  llvm::copy(newRelas, relBuf);
+  RISCVFunctionSplitRelocStorage storage =
+      riscvFunctionSplitRelocStorage.lookup(&sec);
+  storage.relocsAreRela = true;
+  storage.relocCount = static_cast<uint32_t>(newRelas.size());
+  storage.relocs = relBuf;
+  riscvFunctionSplitRelocStorage[&sec] = storage;
+  removedBytes += functionRemovedBytes;
+  return true;
+}
+
+template <class ELFT> static RISCVConfigUseAuditResult
+computeRISCVConfigSpecializationAudit(SmallVectorImpl<RISCVConfigCallRecord> &calls,
+                                      SmallVectorImpl<RISCVConfigTrackedGlobal> &trackedGlobals,
+                                      RISCVConfigProofResult &proof) {
+  printRISCVConfigCallsiteAudit<ELFT>("initeccsize", calls);
+
+  constexpr StringLiteral globals[] = {
+      "VERSION", "WD",       "WDB",      "ECCLEVEL",
+      "neccblk1", "neccblk2", "datablkw", "eccblkwid"};
+  for (StringRef name : globals) {
+    RISCVConfigGlobalAudit audit;
+    auditRISCVConfigGlobal<ELFT>(name, audit);
+    bool ambiguous = false;
+    Defined *sym =
+        findUniqueRISCVConfigDefinedByName<ELFT>(name, STT_OBJECT, ambiguous);
+    if (sym && !ambiguous)
+      trackedGlobals.push_back({sym, name.str(), audit});
+  }
+  proof = tryEvaluateRISCVConfigInitialization<ELFT>(calls, trackedGlobals);
+  return auditRISCVConfigConstantUses<ELFT>(proof, trackedGlobals, calls);
+}
+
+template <class ELFT> static void runRISCVConfigSpecialization() {
+  if (!config->riscvConfigSpecialization || config->emachine != EM_RISCV)
+    return;
+
+  SmallVector<RISCVConfigCallRecord, 0> calls;
+  SmallVector<RISCVConfigTrackedGlobal, 0> trackedGlobals;
+  RISCVConfigProofResult proof;
+  RISCVConfigUseAuditResult useAudit =
+      computeRISCVConfigSpecializationAudit<ELFT>(calls, trackedGlobals, proof);
+
+  bool gate = proof.complete && useAudit.initializationOrderProven &&
+              useAudit.conservativeDeadTextBytes != 0 &&
+              useAudit.unsafeOrUnknownReadSites == 0;
+  if (!gate) {
+    message("riscv-config-transform-summary: candidate_functions=0 "
+            "transformed_functions=0 fallback_functions=0 "
+            "removed_text_bytes=0");
+    return;
+  }
+
+  std::map<Defined *, SmallVector<RISCVConfigUseAuditResult::DeadRange, 0>>
+      rangesByFunction;
+  for (const auto &r : useAudit.safeDeadRanges)
+    rangesByFunction[r.function].push_back(r);
+
+  uint32_t candidateFunctions = rangesByFunction.size();
+  uint32_t transformedFunctions = 0;
+  uint32_t fallbackFunctions = 0;
+  uint64_t totalRemovedBytes = 0;
+  for (auto &[func, ranges] : rangesByFunction) {
+    auto *sec = dyn_cast_or_null<InputSectionBase>(func->section);
+    if (!sec) {
+      ++fallbackFunctions;
+      message(Twine("riscv-config-transform: function=") + func->getName() +
+              " old_size=0 new_size=0 removed_bytes=0"
+              " branch_rewrites=0 removed_relocations=0 rebased_relocations=0"
+              " rebased_symbols=0 status=fallback reason=function-section");
+      continue;
+    }
+    uint64_t oldSize = sec->content().size();
+    uint64_t removedBytes = 0;
+    uint32_t removedRelocs = 0, rebasedRelocs = 0, rebasedSymbols = 0;
+    uint32_t branchRewrites = 0;
+    std::string reason = "none";
+    uint64_t plannedRemoved = 0;
+    for (const auto &r : ranges)
+      plannedRemoved += r.end - r.begin;
+    message(Twine("riscv-config-transform-plan: function=") +
+            func->getName() +
+            " old_size=" + Twine(oldSize) +
+            " dead_ranges=" + Twine(ranges.size()) +
+            " planned_removed_bytes=" + Twine(plannedRemoved) +
+            " new_size=" + Twine(oldSize - plannedRemoved) +
+            " safe=1");
+    bool ok = applyRISCVConfigTransformFunction<ELFT>(
+        *func, *sec, ranges, useAudit.branchRewrites, removedBytes,
+        removedRelocs, rebasedRelocs, rebasedSymbols, branchRewrites, reason);
+    if (ok) {
+      ++transformedFunctions;
+      totalRemovedBytes += removedBytes;
+    } else {
+      ++fallbackFunctions;
+    }
+    message(Twine("riscv-config-transform: function=") + func->getName() +
+            " old_size=" + Twine(oldSize) +
+            " new_size=" + Twine(ok ? sec->content().size() : oldSize) +
+            " removed_bytes=" + Twine(ok ? removedBytes : 0) +
+            " branch_rewrites=" + Twine(branchRewrites) +
+            " removed_relocations=" + Twine(removedRelocs) +
+            " rebased_relocations=" + Twine(rebasedRelocs) +
+            " rebased_symbols=" + Twine(rebasedSymbols) +
+            " status=" + (ok ? Twine("transformed") : Twine("fallback")) +
+            " reason=" + (ok ? Twine("none") : Twine(reason)));
+  }
+
+  message(Twine("riscv-config-transform-plan-summary: functions=") +
+          Twine(candidateFunctions) +
+          " planned_removed_text_bytes=" +
+          Twine(useAudit.conservativeDeadTextBytes));
+  message(Twine("riscv-config-transform-summary: candidate_functions=") +
+          Twine(candidateFunctions) +
+          " transformed_functions=" + Twine(transformedFunctions) +
+          " fallback_functions=" + Twine(fallbackFunctions) +
+          " removed_text_bytes=" + Twine(totalRemovedBytes));
 }
 
 template <class ELFT>
@@ -8232,6 +8645,8 @@ void LinkerDriver::link(opt::InputArgList &args) {
 
   // Split SHF_MERGE and .eh_frame sections into pieces in preparation for garbage collection.
   invokeELFT(splitSections,);
+
+  invokeELFT(runRISCVConfigSpecialization,);
 
   // Garbage collection and removal of shared symbols from unused shared objects.
   invokeELFT(markLive,);

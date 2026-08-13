@@ -273,6 +273,7 @@ struct Config {
   bool printRISCVFunctionSectionsSplit;
   bool relax;
   bool relaxGP;
+  bool riscvConfigSpecialization;
   bool riscvRelaxJalRVC;
   bool riscvFunctionSectionsSplitDebugRelocs;
   bool riscvFunctionSectionsSplit;

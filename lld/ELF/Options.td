@@ -383,6 +383,10 @@ def print_riscv_config_specialization_audit: FF<"print-riscv-config-specializati
   HelpText<"Print RISC-V fixed configuration specialization audit statistics">,
   Flags<[HelpHidden]>;
 
+def riscv_config_specialization: FF<"riscv-config-specialization">,
+  HelpText<"Enable RISC-V fixed configuration specialization">,
+  Flags<[HelpHidden]>;
+
 defm relax: BB<"relax",
   "Enable target-specific relaxations if supported (default)",
   "Disable target-specific relaxations">;
