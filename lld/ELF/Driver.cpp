@@ -6450,6 +6450,7 @@ struct RISCVConfigUseAuditResult {
   uint32_t provenConstantGlobals = 0;
   uint32_t constantLoads = 0;
   uint32_t constantBranches = 0;
+  uint32_t specializationDependentBranches = 0;
   uint32_t alwaysTakenBranches = 0;
   uint32_t neverTakenBranches = 0;
   uint32_t functionsAnalyzed = 0;
@@ -6462,6 +6463,7 @@ struct RISCVConfigUseAuditResult {
   uint64_t conservativeDeadRodataBytes = 0;
   uint64_t candidateInitializationRodataBytes = 0;
   bool initializationOrderProven = false;
+  uint32_t unsafeOrUnknownReadSites = 0;
 };
 
 struct RISCVConfigDataflowState {
@@ -6700,7 +6702,7 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
   };
   for (ELFFileBase *file : ctx.objectFiles) {
     for (InputSectionBase *sec : file->getSections()) {
-      if (!sec || !sec->isLive() || !sec->file)
+      if (!sec || !sec->isLive() || !(sec->flags & SHF_ALLOC) || !sec->file)
         continue;
       RelsOrRelas<ELFT> rels = sec->template relsOrRelas<ELFT>();
       auto scan = [&](auto relRange) {
@@ -6713,6 +6715,7 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
     }
   }
 
+  DenseSet<Defined *> analyzedFunctions;
   for (ELFFileBase *file : ctx.objectFiles) {
     for (InputSectionBase *sec : file->getSections()) {
       if (!sec || !sec->isLive() || !(sec->flags & SHF_EXECINSTR) ||
@@ -6742,6 +6745,8 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
       collectFuncs(rels.relas);
 
       for (Defined *func : funcs) {
+        if (!analyzedFunctions.insert(func).second)
+          continue;
         auto *funcSec = dyn_cast_or_null<InputSectionBase>(func->section);
         if (!funcSec)
           continue;
@@ -6753,11 +6758,9 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
           continue;
         DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap =
             getRISCVConfigRelocs<ELFT>(*funcSec);
-        DenseMap<uint64_t, RISCVConfigDataflowState> in;
         DenseMap<uint64_t, const RISCVConfigBasicBlock *> blockByBegin;
         DenseSet<uint64_t> baselineReachable;
         DenseSet<uint64_t> specializedReachable;
-        SmallVector<uint64_t, 0> worklist;
         RISCVConfigDataflowState entryState;
         entryState.valid = true;
         for (auto &r : entryState.regs)
@@ -6765,233 +6768,268 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
         entryState.regs[0] = riscvConfigInteger(0);
         for (const RISCVConfigBasicBlock &b : blocks)
           blockByBegin[b.begin] = &b;
-        in[func->value] = entryState;
-        worklist.push_back(func->value);
         bool cfgSafe = true;
-        uint32_t iterations = 0;
+        std::string functionReason = "none";
+        DenseMap<uint64_t, Defined *> loadSiteSymbols;
 
-        auto addBaselineSucc = [&](SmallVectorImpl<uint64_t> &succs,
-                                   uint64_t target) {
-          if (target >= func->value && target < func->value + func->size &&
-              blockByBegin.find(target) != blockByBegin.end())
-            succs.push_back(target);
-        };
-        SmallVector<uint64_t, 0> baselineWorklist;
-        baselineWorklist.push_back(func->value);
-        while (!baselineWorklist.empty()) {
-          uint64_t begin = baselineWorklist.pop_back_val();
-          if (!baselineReachable.insert(begin).second)
-            continue;
-          const RISCVConfigBasicBlock *bb = blockByBegin.lookup(begin);
-          if (!bb || bb->insns.empty())
-            continue;
-          const RISCVConfigBasicBlock &b = *bb;
-          if (b.insns.empty())
-            continue;
-          const RISCVConfigInsn &last = b.insns.back();
-          uint32_t opcode = last.raw & 0x7f;
-          SmallVector<uint64_t, 2> succs;
-          if (last.size == 4 && opcode == 0x63) {
-            RISCVConfigBranchTarget target =
-                resolveRISCVConfigBranchTarget(*funcSec, last, relocMap);
-            if (target.ok)
-              addBaselineSucc(succs, target.target);
-            else
-              cfgSafe = false;
-            addBaselineSucc(succs, last.off + last.size);
-          } else if (last.size == 4 && opcode == 0x6f && last.rd == 0) {
-            RISCVConfigBranchTarget target =
-                resolveRISCVConfigJalTarget(*funcSec, last, relocMap);
-            if (target.ok)
-              addBaselineSucc(succs, target.target);
-            else
-              cfgSafe = false;
-          } else if (!isRISCVConfigReturn(last)) {
-            addBaselineSucc(succs, b.end);
-          }
-          for (uint64_t succ : succs)
-            baselineWorklist.push_back(succ);
-        }
-
-        while (!worklist.empty() && ++iterations < 10000) {
-          uint64_t begin = worklist.pop_back_val();
-          auto blockIt = blockByBegin.find(begin);
-          if (blockIt == blockByBegin.end()) {
-            cfgSafe = false;
-            continue;
-          }
-          specializedReachable.insert(begin);
-          RISCVConfigDataflowState state = in[begin];
-          const RISCVConfigBasicBlock &block = *blockIt->second;
-          SmallVector<std::pair<uint64_t, RISCVConfigDataflowState>, 2> succs;
-          uint64_t skipUntil = 0;
-          bool noFallthrough = false;
-
-          for (const RISCVConfigInsn &insn : block.insns) {
-            if (insn.off < skipUntil)
+        auto runDataflow = [&](bool specialize, DenseSet<uint64_t> &reachable,
+                               DenseMap<uint64_t, std::optional<bool>>
+                                   &branchResults,
+                               DenseSet<uint64_t> *loadSites) {
+          DenseMap<uint64_t, RISCVConfigDataflowState> states;
+          SmallVector<uint64_t, 0> wl;
+          states[func->value] = entryState;
+          wl.push_back(func->value);
+          uint32_t iter = 0;
+          bool safe = true;
+          while (!wl.empty() && ++iter < 10000) {
+            uint64_t begin = wl.pop_back_val();
+            auto blockIt = blockByBegin.find(begin);
+            if (blockIt == blockByBegin.end()) {
+              if (functionReason == "none")
+                functionReason = "missing-basic-block";
+              safe = false;
               continue;
-            uint32_t opcode = insn.raw & 0x7f;
-            RISCVConfigDirectCallTarget directCall =
-                resolveRISCVConfigDirectCallTarget(*funcSec, insn, relocMap);
-            if (directCall.found) {
-              if (!directCall.ok) {
-                cfgSafe = false;
+            }
+            reachable.insert(begin);
+            RISCVConfigDataflowState state = states[begin];
+            const RISCVConfigBasicBlock &block = *blockIt->second;
+            SmallVector<std::pair<uint64_t, RISCVConfigDataflowState>, 2> succs;
+            uint64_t skipUntil = 0;
+            bool noFallthrough = false;
+            for (const RISCVConfigInsn &insn : block.insns) {
+              if (insn.off < skipUntil)
+                continue;
+              uint32_t opcode = insn.raw & 0x7f;
+              RISCVConfigDirectCallTarget directCall =
+                  resolveRISCVConfigDirectCallTarget(*funcSec, insn, relocMap);
+              if (directCall.found) {
+                if (!directCall.ok) {
+                  if (functionReason == "none")
+                    functionReason = directCall.reason;
+                  safe = false;
+                  break;
+                }
+                if (directCall.tail) {
+                  noFallthrough = true;
+                  break;
+                }
+                constexpr int callerSaved[] = {1,  5,  6,  7,  10, 11,
+                                               12, 13, 14, 15, 16, 17,
+                                               28, 29, 30, 31};
+                for (int r : callerSaved)
+                  state.regs[r] = {};
+                state.regs[0] = riscvConfigInteger(0);
+                skipUntil = insn.off + directCall.size;
+                continue;
+              }
+              if (insn.size == 4 && opcode == 0x63) {
+                RISCVConfigBranchTarget target =
+                    resolveRISCVConfigBranchTarget(*funcSec, insn, relocMap);
+                if (!target.ok) {
+                  if (functionReason == "none")
+                    functionReason = target.reason;
+                  safe = false;
+                  break;
+                }
+                uint64_t fallthrough = insn.off + insn.size;
+                bool known = state.regs[insn.rs1].kind ==
+                                 RISCVConfigValueKind::Integer &&
+                             state.regs[insn.rs2].kind ==
+                                 RISCVConfigValueKind::Integer;
+                if (known) {
+                  bool taken = false;
+                  if (!evaluateRISCVConfigBranch(insn.raw,
+                                                 state.regs[insn.rs1].value,
+                                                 state.regs[insn.rs2].value,
+                                                 taken)) {
+                    if (functionReason == "none")
+                      functionReason = "unsupported-branch-kind";
+                    safe = false;
+                    break;
+                  }
+                  auto it = branchResults.find(insn.off);
+                  if (it == branchResults.end())
+                    branchResults[insn.off] = taken;
+                  else if (!it->second || *it->second != taken)
+                    branchResults[insn.off] = std::nullopt;
+                  succs.push_back({taken ? target.target : fallthrough, state});
+                } else {
+                  branchResults[insn.off] = std::nullopt;
+                  succs.push_back({target.target, state});
+                  succs.push_back({fallthrough, state});
+                }
                 break;
               }
-              if (directCall.tail) {
+              if (insn.size == 4 && opcode == 0x6f && insn.rd == 0) {
+                RISCVConfigBranchTarget target =
+                    resolveRISCVConfigJalTarget(*funcSec, insn, relocMap);
+                if (!target.ok) {
+                  if (functionReason == "none")
+                    functionReason = target.reason;
+                  safe = false;
+                  break;
+                }
+                succs.push_back({target.target, state});
                 noFallthrough = true;
                 break;
               }
-              constexpr int callerSaved[] = {1,  5,  6,  7,  10, 11,
-                                             12, 13, 14, 15, 16, 17,
-                                             28, 29, 30, 31};
-              for (int r : callerSaved)
-                state.regs[r] = {};
-              state.regs[0] = riscvConfigInteger(0);
-              skipUntil = insn.off + directCall.size;
-              continue;
-            }
-            if (insn.size == 4 && opcode == 0x63) {
-              bool known = state.regs[insn.rs1].kind ==
-                               RISCVConfigValueKind::Integer &&
-                           state.regs[insn.rs2].kind ==
-                               RISCVConfigValueKind::Integer;
-              RISCVConfigBranchTarget target =
-                  resolveRISCVConfigBranchTarget(*funcSec, insn, relocMap);
-              if (!target.ok) {
-                cfgSafe = false;
+              if (opcode == 0x67 || isRISCVConfigReturn(insn)) {
+                noFallthrough = true;
                 break;
               }
-              uint64_t fallthrough = insn.off + insn.size;
-              if (known) {
-                bool taken = false;
-                if (!evaluateRISCVConfigBranch(insn.raw,
-                                               state.regs[insn.rs1].value,
-                                               state.regs[insn.rs2].value,
-                                               taken)) {
-                  cfgSafe = false;
-                  break;
+              if (insn.size == 4 && opcode == 0x03 &&
+                  bits(insn.raw, 14, 12) == 4 && insn.rd > 0) {
+                bool loadedTracked = false;
+                RISCVConfigValue base = state.regs[insn.rs1];
+                auto relIt = relocMap.find(insn.off);
+                if (relIt != relocMap.end()) {
+                  const RISCVConfigRelocInfo *lo =
+                      findRISCVConfigReloc(relIt->second, {R_RISCV_LO12_I});
+                  if (lo && lo->target)
+                    base = riscvConfigSymbolAddress(lo->target, lo->addend);
                 }
-                ++out.constantBranches;
-                if (taken)
-                  ++out.alwaysTakenBranches;
-                else
-                  ++out.neverTakenBranches;
-                message(Twine("riscv-config-constant-branch: function=") +
-                        func->getName() +
-                        " offset=0x" + Twine::utohexstr(insn.off) +
-                        " kind=0x" + Twine::utohexstr(bits(insn.raw, 14, 12)) +
-                        " lhs=" + Twine(state.regs[insn.rs1].value) +
-                        " rhs=" + Twine(state.regs[insn.rs2].value) +
-                        " result=" + (taken ? Twine("taken")
-                                             : Twine("not-taken")) +
-                        " target=0x" + Twine::utohexstr(target.target) +
-                        " fallthrough=0x" + Twine::utohexstr(fallthrough) +
-                        " source_globals=unknown");
-                succs.push_back({taken ? target.target : fallthrough, state});
-              } else {
-                succs.push_back({target.target, state});
-                succs.push_back({fallthrough, state});
-              }
-              break;
-            }
-            if (insn.size == 4 && opcode == 0x6f && insn.rd == 0) {
-              RISCVConfigBranchTarget target =
-                  resolveRISCVConfigJalTarget(*funcSec, insn, relocMap);
-              if (!target.ok) {
-                cfgSafe = false;
-                break;
-              }
-              succs.push_back({target.target, state});
-              noFallthrough = true;
-              break;
-            }
-            if (opcode == 0x67 || isRISCVConfigReturn(insn)) {
-              noFallthrough = true;
-              break;
-            }
-            if (insn.size == 4 && opcode == 0x03 && bits(insn.raw, 14, 12) == 4 &&
-                insn.rd > 0) {
-              bool loadedTracked = false;
-              RISCVConfigValue base = state.regs[insn.rs1];
-              auto relIt = relocMap.find(insn.off);
-              if (relIt != relocMap.end()) {
-                const RISCVConfigRelocInfo *lo =
-                    findRISCVConfigReloc(relIt->second, {R_RISCV_LO12_I});
-                if (lo && lo->target)
-                  base = riscvConfigSymbolAddress(lo->target, lo->addend);
-              }
-              if (base.kind == RISCVConfigValueKind::SymbolAddress) {
-                for (auto [sym, value] : provenValues) {
-                  int64_t objectOff = 0;
-                  if (resolveRISCVConfigObjectOffset(
-                          base.symbol, base.offset + insn.imm, *sym,
-                          objectOff) &&
-                      objectOff == 0) {
-                    state.regs[insn.rd] = riscvConfigInteger(value);
-                    ++out.constantLoads;
-                    loadedTracked = true;
-                    message(Twine("riscv-config-constant-load: function=") +
-                            func->getName() +
-                            " offset=0x" + Twine::utohexstr(insn.off) +
-                            " symbol=" + sym->getName() +
-                            " value=" + Twine(value) +
-                            " safe=1 reason=tracked-global");
-                    break;
+                if (base.kind == RISCVConfigValueKind::SymbolAddress) {
+                  for (auto [sym, value] : provenValues) {
+                    int64_t objectOff = 0;
+                    if (resolveRISCVConfigObjectOffset(
+                            base.symbol, base.offset + insn.imm, *sym,
+                            objectOff) &&
+                        objectOff == 0) {
+                      if (specialize) {
+                        state.regs[insn.rd] = riscvConfigInteger(value);
+                        if (loadSites) {
+                          loadSites->insert(insn.off);
+                          loadSiteSymbols[insn.off] = sym;
+                        }
+                      } else {
+                        state.regs[insn.rd] = {};
+                      }
+                      loadedTracked = true;
+                      break;
+                    }
                   }
                 }
+                if (loadedTracked)
+                  continue;
               }
-              if (loadedTracked)
+              std::string evalReason;
+              if (!evalRISCVConfigIntegerInsn(insn, state, evalReason)) {
+                if (functionReason == "none")
+                  functionReason = evalReason;
+                safe = false;
+                break;
+              }
+              if (insn.size == 4 && (opcode == 0x37 || opcode == 0x17) &&
+                  insn.rd > 0) {
+                auto it = relocMap.find(insn.off);
+                if (it != relocMap.end()) {
+                  const RISCVConfigRelocInfo *hi = findRISCVConfigReloc(
+                      it->second, {R_RISCV_HI20, R_RISCV_PCREL_HI20});
+                  if (hi && hi->target)
+                    state.regs[insn.rd] =
+                        riscvConfigSymbolAddress(hi->target, hi->addend);
+                }
+              } else if (insn.size == 4 && opcode == 0x13 && insn.rd > 0) {
+                auto it = relocMap.find(insn.off);
+                if (it != relocMap.end()) {
+                  const RISCVConfigRelocInfo *lo = findRISCVConfigReloc(
+                      it->second, {R_RISCV_LO12_I, R_RISCV_PCREL_LO12_I});
+                  if (lo && lo->target)
+                    state.regs[insn.rd] =
+                        riscvConfigSymbolAddress(lo->target, lo->addend);
+                }
+              }
+            }
+            if (succs.empty() && !noFallthrough &&
+                block.end < func->value + func->size)
+              succs.push_back({block.end, state});
+            for (auto &[target, succState] : succs) {
+              if (blockByBegin.find(target) == blockByBegin.end())
                 continue;
-            }
-            std::string evalReason;
-            if (!evalRISCVConfigIntegerInsn(insn, state, evalReason)) {
-              cfgSafe = false;
-              break;
-            }
-            if (insn.size == 4 && (opcode == 0x37 || opcode == 0x17) &&
-                insn.rd > 0) {
-              auto it = relocMap.find(insn.off);
-              if (it != relocMap.end()) {
-                const RISCVConfigRelocInfo *hi = findRISCVConfigReloc(
-                    it->second, {R_RISCV_HI20, R_RISCV_PCREL_HI20});
-                if (hi && hi->target)
-                  state.regs[insn.rd] =
-                      riscvConfigSymbolAddress(hi->target, hi->addend);
-              }
-            } else if (insn.size == 4 && opcode == 0x13 && insn.rd > 0) {
-              auto it = relocMap.find(insn.off);
-              if (it != relocMap.end()) {
-                const RISCVConfigRelocInfo *lo = findRISCVConfigReloc(
-                    it->second, {R_RISCV_LO12_I, R_RISCV_PCREL_LO12_I});
-                if (lo && lo->target)
-                  state.regs[insn.rd] =
-                      riscvConfigSymbolAddress(lo->target, lo->addend);
-              }
+              if (mergeRISCVConfigState(states[target], succState))
+                wl.push_back(target);
             }
           }
+          if (iter >= 10000 && functionReason == "none")
+            functionReason = "dataflow-iteration-limit";
+          return safe && iter < 10000;
+        };
 
-          if (succs.empty() && !noFallthrough &&
-              block.end < func->value + func->size)
-            succs.push_back({block.end, state});
-          for (auto &[target, succState] : succs) {
-            if (blockByBegin.find(target) == blockByBegin.end())
-              continue;
-            if (mergeRISCVConfigState(in[target], succState))
-              worklist.push_back(target);
-          }
-        }
-        if (iterations >= 10000)
-          cfgSafe = false;
+        DenseMap<uint64_t, std::optional<bool>> baselineBranchResults;
+        DenseMap<uint64_t, std::optional<bool>> specializedBranchResults;
+        DenseSet<uint64_t> specializedLoadSites;
+        cfgSafe &= runDataflow(false, baselineReachable, baselineBranchResults,
+                               nullptr);
+        cfgSafe &= runDataflow(true, specializedReachable,
+                               specializedBranchResults,
+                               &specializedLoadSites);
+        if (!cfgSafe && functionReason == "none")
+          functionReason = "dataflow-unsafe";
         if (cfgSafe)
           ++out.cfgSafeFunctions;
+
+        out.constantLoads += specializedLoadSites.size();
+        for (uint64_t off : specializedLoadSites) {
+          Defined *sym = loadSiteSymbols.lookup(off);
+          ++out.unsafeOrUnknownReadSites;
+          message(Twine("riscv-config-constant-load: function=") +
+                  func->getName() +
+                  " offset=0x" + Twine::utohexstr(off) +
+                  " symbol=" + (sym ? Twine(sym->getName()) : Twine("unknown")) +
+                  " value=" +
+                  (sym && provenValues.find(sym) != provenValues.end()
+                       ? Twine(provenValues.lookup(sym))
+                       : Twine("unknown")) +
+                  " safe=1 reason=tracked-global");
+          message(Twine("riscv-config-init-order: read_function=") +
+                  func->getName() +
+                  " read_offset=0x" + Twine::utohexstr(off) +
+                  " incoming_state=maybe safe=0");
+        }
+
+        for (const auto &kv : specializedBranchResults) {
+          uint64_t off = kv.first;
+          std::optional<bool> specialized = kv.second;
+          if (!specialized)
+            continue;
+          ++out.constantBranches;
+          if (*specialized)
+            ++out.alwaysTakenBranches;
+          else
+            ++out.neverTakenBranches;
+          auto baseIt = baselineBranchResults.find(off);
+          std::optional<bool> baseline;
+          if (baseIt != baselineBranchResults.end())
+            baseline = baseIt->second;
+          bool dependent = !baseline || *baseline != *specialized;
+          if (dependent)
+            ++out.specializationDependentBranches;
+          message(Twine("riscv-config-constant-branch: function=") +
+                  func->getName() +
+                  " offset=0x" + Twine::utohexstr(off) +
+                  " kind=unknown lhs=unknown rhs=unknown result=" +
+                  (*specialized ? Twine("taken") : Twine("not-taken")) +
+                  " baseline_result=" +
+                  (baseline ? (*baseline ? Twine("taken") : Twine("not-taken"))
+                            : Twine("unknown")) +
+                  " specialized_result=" +
+                  (*specialized ? Twine("taken") : Twine("not-taken")) +
+                  " specialization_dependent=" + Twine(dependent ? 1 : 0) +
+                  " target=unknown fallthrough=unknown source_globals=unknown");
+        }
+
+        uint32_t functionDeadBlocks = 0;
+        uint64_t functionDeadBytes = 0;
 
         uint64_t candidateBytes = 0;
         for (const RISCVConfigBasicBlock &b : blocks) {
           if (baselineReachable.contains(b.begin) &&
               !specializedReachable.contains(b.begin) && b.begin != func->value) {
             ++out.candidateDeadRegions;
+            ++functionDeadBlocks;
             candidateBytes += b.end - b.begin;
+            functionDeadBytes += b.end - b.begin;
             for (const auto &kv : relocMap) {
               if (kv.first < b.begin || kv.first >= b.end)
                 continue;
@@ -7008,6 +7046,20 @@ static RISCVConfigUseAuditResult auditRISCVConfigConstantUses(
           }
         }
         out.potentialDeadTextBytes += candidateBytes;
+        message(Twine("riscv-config-differential-function: function=") +
+                func->getName() +
+                " baseline_reachable_blocks=" +
+                Twine(baselineReachable.size()) +
+                " specialized_reachable_blocks=" +
+                Twine(specializedReachable.size()) +
+                " specialization_dead_blocks=" + Twine(functionDeadBlocks) +
+                " specialization_dead_bytes=" + Twine(functionDeadBytes) +
+                " cfg_safe=" + Twine(cfgSafe ? 1 : 0) +
+                " reason=" + functionReason);
+        message(Twine("riscv-config-function-audit: function=") +
+                func->getName() +
+                " cfg_safe=" + Twine(cfgSafe ? 1 : 0) +
+                " reason=" + functionReason);
       }
     }
   }
@@ -7214,8 +7266,10 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
   useAudit.conservativeDeadRodataBytes = 0;
   message(Twine("riscv-config-constant-use-summary: proven_constant_globals=") +
           Twine(useAudit.provenConstantGlobals) +
-          " constant_loads=" + Twine(useAudit.constantLoads) +
-          " constant_branches=" + Twine(useAudit.constantBranches) +
+          " unique_constant_loads=" + Twine(useAudit.constantLoads) +
+          " unique_constant_branches=" + Twine(useAudit.constantBranches) +
+          " specialization_dependent_branches=" +
+          Twine(useAudit.specializationDependentBranches) +
           " always_taken_branches=" + Twine(useAudit.alwaysTakenBranches) +
           " never_taken_branches=" + Twine(useAudit.neverTakenBranches) +
           " functions_analyzed=" + Twine(useAudit.functionsAnalyzed) +
@@ -7233,7 +7287,9 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " candidate_initialization_rodata_bytes=" +
           Twine(useAudit.candidateInitializationRodataBytes) +
           " initialization_order_proven=" +
-          Twine(useAudit.initializationOrderProven ? 1 : 0));
+          Twine(useAudit.initializationOrderProven ? 1 : 0) +
+          " unsafe_or_unknown_read_sites=" +
+          Twine(useAudit.unsafeOrUnknownReadSites));
 
   message(Twine("riscv-config-specialization-summary: candidate_entry=initeccsize") +
           " live_calls=" + Twine(calls.size()) +
@@ -7244,8 +7300,10 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           Twine(candidateSafeGlobals) +
           " proven_constant_globals=" +
           Twine(useAudit.provenConstantGlobals) +
-          " constant_loads=" + Twine(useAudit.constantLoads) +
-          " constant_branches=" + Twine(useAudit.constantBranches) +
+          " unique_constant_loads=" + Twine(useAudit.constantLoads) +
+          " unique_constant_branches=" + Twine(useAudit.constantBranches) +
+          " specialization_dependent_branches=" +
+          Twine(useAudit.specializationDependentBranches) +
           " always_taken_branches=" + Twine(useAudit.alwaysTakenBranches) +
           " never_taken_branches=" + Twine(useAudit.neverTakenBranches) +
           " safe_dead_regions=" + Twine(useAudit.safeDeadRegions) +
@@ -7262,6 +7320,10 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " conservative_total_opportunity_bytes=" +
           Twine(useAudit.conservativeDeadTextBytes +
                 useAudit.conservativeDeadRodataBytes) +
+          " initialization_order_proven=" +
+          Twine(useAudit.initializationOrderProven ? 1 : 0) +
+          " unsafe_or_unknown_read_sites=" +
+          Twine(useAudit.unsafeOrUnknownReadSites) +
           " eccblocks_fully_dead_candidate=" +
           Twine(eccblocksDead ? 1 : 0) +
           " vpat_fully_dead_candidate=" + Twine(vpatDead ? 1 : 0) +
