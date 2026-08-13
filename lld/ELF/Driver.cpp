@@ -4294,6 +4294,8 @@ enum class RISCVConfigInsnKind {
   CLui,
   CMv,
   CAdd,
+  CLwsp,
+  CSwsp,
   CControlFlow,
   Addi,
   Lui,
@@ -4318,6 +4320,10 @@ static StringRef riscvConfigInsnKindName(RISCVConfigInsnKind kind) {
     return "c.mv";
   case RISCVConfigInsnKind::CAdd:
     return "c.add";
+  case RISCVConfigInsnKind::CLwsp:
+    return "c.lwsp";
+  case RISCVConfigInsnKind::CSwsp:
+    return "c.swsp";
   case RISCVConfigInsnKind::CControlFlow:
     return "c.control-flow";
   case RISCVConfigInsnKind::Addi:
@@ -4378,11 +4384,20 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
       insn.imm =
           SignExtend64<6>((bits(half, 12, 12) << 5) | bits(half, 6, 2));
     } else if (quadrant == 1 && funct3 == 3) {
-      insn.kind = RISCVConfigInsnKind::CLui;
       insn.rd = bits(half, 11, 7);
-      if (insn.rd != 2)
+      if (insn.rd == 2) {
+        insn.kind = RISCVConfigInsnKind::CAddi;
+        insn.rs1 = 2;
+        insn.imm = SignExtend64<10>((bits(half, 12, 12) << 9) |
+                                    (bits(half, 4, 3) << 7) |
+                                    (bits(half, 5, 5) << 6) |
+                                    (bits(half, 2, 2) << 5) |
+                                    (bits(half, 6, 6) << 4));
+      } else {
+        insn.kind = RISCVConfigInsnKind::CLui;
         insn.imm = SignExtend64<18>((bits(half, 12, 12) << 17) |
                                     (bits(half, 6, 2) << 12));
+      }
     } else if (quadrant == 2 && funct3 == 4) {
       insn.rd = bits(half, 11, 7);
       insn.rs1 = insn.rd;
@@ -4396,6 +4411,19 @@ static RISCVConfigInsn decodeRISCVConfigInsn(ArrayRef<uint8_t> data,
         insn.kind = RISCVConfigInsnKind::CControlFlow;
         insn.controlFlow = true;
       }
+    } else if (quadrant == 2 && funct3 == 2) {
+      insn.kind = RISCVConfigInsnKind::CLwsp;
+      insn.load = true;
+      insn.rd = bits(half, 11, 7);
+      insn.rs1 = 2;
+      insn.imm = (bits(half, 3, 2) << 6) | (bits(half, 12, 12) << 5) |
+                 (bits(half, 6, 4) << 2);
+    } else if (quadrant == 2 && funct3 == 6) {
+      insn.kind = RISCVConfigInsnKind::CSwsp;
+      insn.store = true;
+      insn.rs1 = 2;
+      insn.rs2 = bits(half, 6, 2);
+      insn.imm = (bits(half, 8, 7) << 6) | (bits(half, 12, 9) << 2);
     } else if (quadrant == 1 &&
                (funct3 == 1 || funct3 == 5 || funct3 == 6 || funct3 == 7)) {
       insn.kind = RISCVConfigInsnKind::CControlFlow;
@@ -4850,6 +4878,12 @@ struct RISCVConfigGlobalAudit {
   bool externalReferenceKnown = false;
 };
 
+struct RISCVConfigTrackedGlobal {
+  Defined *sym = nullptr;
+  std::string name;
+  RISCVConfigGlobalAudit audit;
+};
+
 template <class ELFT>
 static void auditRISCVConfigGlobal(StringRef name,
                                    RISCVConfigGlobalAudit &audit) {
@@ -4949,6 +4983,9 @@ struct RISCVConfigProofResult {
   uint32_t loopIterations = 0;
   uint32_t readonlyLoads = 0;
   uint32_t directCalls = 0;
+  uint32_t abstractCalls = 0;
+  uint32_t trackedStores = 0;
+  uint32_t functionsEvaluated = 0;
   uint32_t constantBranches = 0;
   uint32_t alwaysTakenBranches = 0;
   uint32_t neverTakenBranches = 0;
@@ -4960,6 +4997,7 @@ enum class RISCVConfigValueKind {
   Unknown,
   Integer,
   SymbolAddress,
+  StackAddress,
 };
 
 struct RISCVConfigValue {
@@ -4971,6 +5009,8 @@ struct RISCVConfigValue {
 
 struct RISCVConfigEvalState {
   std::array<RISCVConfigValue, 32> regs;
+  DenseMap<int64_t, RISCVConfigValue> stackSlots;
+  DenseMap<Defined *, RISCVConfigValue> trackedGlobals;
 };
 
 static RISCVConfigValue riscvConfigInteger(int64_t v) {
@@ -4984,6 +5024,13 @@ static RISCVConfigValue riscvConfigSymbolAddress(Defined *sym, int64_t off) {
   RISCVConfigValue value;
   value.kind = RISCVConfigValueKind::SymbolAddress;
   value.symbol = sym;
+  value.offset = off;
+  return value;
+}
+
+static RISCVConfigValue riscvConfigStackAddress(int64_t off) {
+  RISCVConfigValue value;
+  value.kind = RISCVConfigValueKind::StackAddress;
   value.offset = off;
   return value;
 }
@@ -5006,6 +5053,16 @@ static bool riscvConfigAddValues(const RISCVConfigValue &a,
     out = riscvConfigSymbolAddress(b.symbol, b.offset + a.value);
     return true;
   }
+  if (a.kind == RISCVConfigValueKind::StackAddress &&
+      b.kind == RISCVConfigValueKind::Integer) {
+    out = riscvConfigStackAddress(a.offset + b.value);
+    return true;
+  }
+  if (a.kind == RISCVConfigValueKind::Integer &&
+      b.kind == RISCVConfigValueKind::StackAddress) {
+    out = riscvConfigStackAddress(b.offset + a.value);
+    return true;
+  }
   return false;
 }
 
@@ -5017,6 +5074,10 @@ static bool riscvConfigSubInteger(const RISCVConfigValue &a, int64_t b,
   }
   if (a.kind == RISCVConfigValueKind::SymbolAddress) {
     out = riscvConfigSymbolAddress(a.symbol, a.offset - b);
+    return true;
+  }
+  if (a.kind == RISCVConfigValueKind::StackAddress) {
+    out = riscvConfigStackAddress(a.offset - b);
     return true;
   }
   return false;
@@ -5096,6 +5157,97 @@ static bool readRISCVConfigReadonlyByte(Defined *sym, int64_t offset,
   return true;
 }
 
+static bool isRISCVConfigTrackedObject(
+    Defined *sym, ArrayRef<RISCVConfigTrackedGlobal> globals,
+    const RISCVConfigTrackedGlobal **tracked = nullptr) {
+  for (const RISCVConfigTrackedGlobal &g : globals) {
+    if (g.sym != sym)
+      continue;
+    if (tracked)
+      *tracked = &g;
+    return true;
+  }
+  return false;
+}
+
+static bool resolveRISCVConfigObjectOffset(Defined *addrSym, int64_t addrOff,
+                                           Defined &object,
+                                           int64_t &objectOff) {
+  if (!addrSym || !addrSym->section || addrSym->section != object.section)
+    return false;
+  uint64_t targetOff = 0;
+  if (!checkedAddend(addrSym->value, addrOff, targetOff))
+    return false;
+  uint64_t objectEnd = object.size ? object.value + object.size : object.value + 1;
+  if (targetOff < object.value || targetOff >= objectEnd)
+    return false;
+  objectOff = static_cast<int64_t>(targetOff - object.value);
+  return true;
+}
+
+static bool resolveRISCVConfigTrackedAddress(
+    Defined *addrSym, int64_t addrOff,
+    ArrayRef<RISCVConfigTrackedGlobal> globals,
+    const RISCVConfigTrackedGlobal *&tracked, int64_t &objectOff) {
+  for (const RISCVConfigTrackedGlobal &g : globals) {
+    if (!g.sym)
+      continue;
+    if (resolveRISCVConfigObjectOffset(addrSym, addrOff, *g.sym, objectOff)) {
+      tracked = &g;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool riscvConfigTrackedGlobalsSafe(
+    ArrayRef<RISCVConfigTrackedGlobal> globals) {
+  return llvm::all_of(globals, [](const RISCVConfigTrackedGlobal &g) {
+    return g.sym && !g.audit.addressTaken && !g.audit.unknownPointerUse &&
+           !g.audit.writerFunctions.empty() &&
+           g.audit.writerFunctions.count("unresolved-function") == 0 &&
+           g.audit.writerFunctions.count("ambiguous-function") == 0;
+  });
+}
+
+static bool riscvConfigAllTrackedKnown(
+    const RISCVConfigEvalState &state,
+    ArrayRef<RISCVConfigTrackedGlobal> globals) {
+  return llvm::all_of(globals, [&](const RISCVConfigTrackedGlobal &g) {
+    auto it = state.trackedGlobals.find(g.sym);
+    return it != state.trackedGlobals.end() &&
+           it->second.kind == RISCVConfigValueKind::Integer;
+  });
+}
+
+static bool riscvConfigWriterFunctionsCovered(
+    ArrayRef<RISCVConfigTrackedGlobal> globals,
+    const std::set<std::string> &evaluatedFunctions) {
+  return llvm::all_of(globals, [&](const RISCVConfigTrackedGlobal &g) {
+    return llvm::all_of(g.audit.writerFunctions, [&](const std::string &name) {
+      return evaluatedFunctions.count(name) != 0;
+    });
+  });
+}
+
+static bool riscvConfigFunctionMayWriteTrackedGlobals(
+    Defined *callee, ArrayRef<RISCVConfigTrackedGlobal> globals) {
+  if (!callee)
+    return true;
+  std::string name = callee->getName().str();
+  return llvm::any_of(globals, [&](const RISCVConfigTrackedGlobal &g) {
+    return g.audit.writerFunctions.count(name) != 0;
+  });
+}
+
+static void riscvConfigClobberCallerSaved(RISCVConfigEvalState &state) {
+  constexpr int regs[] = {1,  5,  6,  7,  10, 11, 12, 13,
+                          14, 15, 16, 17, 28, 29, 30, 31};
+  for (int r : regs)
+    state.regs[r] = {};
+  state.regs[0] = riscvConfigInteger(0);
+}
+
 static bool isRISCVConfigReturn(const RISCVConfigInsn &insn) {
   if (insn.size == 4 && (insn.raw & 0x7f) == 0x67)
     return insn.rd == 0 && insn.rs1 == 1 && bits(insn.raw, 31, 20) == 0;
@@ -5141,6 +5293,14 @@ static int64_t decodeRISCVConfigBImm(uint32_t insn) {
   return SignExtend64<13>(imm);
 }
 
+static int64_t decodeRISCVConfigJImm(uint32_t insn) {
+  uint32_t imm = (bits(insn, 31, 31) << 20) |
+                 (bits(insn, 19, 12) << 12) |
+                 (bits(insn, 20, 20) << 11) |
+                 (bits(insn, 30, 21) << 1);
+  return SignExtend64<21>(imm);
+}
+
 struct RISCVConfigBranchTarget {
   bool ok = false;
   uint64_t target = 0;
@@ -5149,6 +5309,15 @@ struct RISCVConfigBranchTarget {
   std::string relocSymbol = "none";
   std::string relocSection = "none";
   int64_t relocAddend = 0;
+};
+
+struct RISCVConfigDirectCallTarget {
+  bool found = false;
+  bool ok = false;
+  Defined *target = nullptr;
+  bool tail = false;
+  uint64_t size = 0;
+  std::string reason;
 };
 
 static bool
@@ -5249,6 +5418,148 @@ static RISCVConfigBranchTarget resolveRISCVConfigBranchTarget(
   return result;
 }
 
+static RISCVConfigBranchTarget resolveRISCVConfigJalTarget(
+    InputSectionBase &sec, const RISCVConfigInsn &insn,
+    const DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> &relocMap) {
+  RISCVConfigBranchTarget result;
+  auto it = relocMap.find(insn.off);
+  const RISCVConfigRelocInfo *jalReloc = nullptr;
+  if (it != relocMap.end()) {
+    for (const RISCVConfigRelocInfo &r : it->second) {
+      if (r.type != R_RISCV_JAL)
+        continue;
+      if (jalReloc) {
+        result.reason = "ambiguous-jal-relocation";
+        return result;
+      }
+      jalReloc = &r;
+    }
+  }
+  if (jalReloc) {
+    result.source = "relocation";
+    result.relocAddend = jalReloc->addend;
+    if (!jalReloc->target) {
+      result.reason = "jal-relocation-target-unresolved";
+      return result;
+    }
+    result.relocSymbol = jalReloc->target->getName().str();
+    auto *targetSec =
+        dyn_cast_or_null<InputSectionBase>(jalReloc->target->section);
+    if (!targetSec) {
+      result.reason = "jal-relocation-target-section-unresolved";
+      return result;
+    }
+    result.relocSection = targetSec->name.str();
+    uint64_t targetOff = 0;
+    if (!checkedAddend(jalReloc->target->value, jalReloc->addend, targetOff)) {
+      result.reason = "jal-relocation-target-overflow";
+      return result;
+    }
+    if (!convertRISCVConfigTargetOffset(sec, *targetSec, targetOff,
+                                        result.target)) {
+      result.reason = "jal-relocation-target-out-of-section";
+      return result;
+    }
+    result.ok = true;
+    return result;
+  }
+  int64_t signedTarget =
+      static_cast<int64_t>(insn.off) + decodeRISCVConfigJImm(insn.raw);
+  if (signedTarget < 0) {
+    result.reason = "jal-target-out-of-range";
+    return result;
+  }
+  result.target = static_cast<uint64_t>(signedTarget);
+  result.ok = true;
+  return result;
+}
+
+static RISCVConfigDirectCallTarget resolveRISCVConfigDirectCallTarget(
+    InputSectionBase &sec, const RISCVConfigInsn &insn,
+    const DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> &relocMap) {
+  RISCVConfigDirectCallTarget result;
+  auto it = relocMap.find(insn.off);
+  const RISCVConfigRelocInfo *callReloc = nullptr;
+  if (it != relocMap.end()) {
+    for (const RISCVConfigRelocInfo &r : it->second) {
+      if (!isRISCVConfigDirectCallRel(r.type))
+        continue;
+      if (callReloc) {
+        result.found = true;
+        result.reason = "ambiguous-direct-call-relocation";
+        return result;
+      }
+      callReloc = &r;
+    }
+  }
+  if (!callReloc)
+    return result;
+  result.found = true;
+  result.target = callReloc->target;
+  if (callReloc->type == R_RISCV_JAL && insn.size == 4 &&
+      (insn.raw & 0x7f) == 0x6f && insn.rd == 0 &&
+      (!result.target || result.target->type != STT_FUNC)) {
+    result.found = false;
+    return result;
+  }
+  if (!result.target || result.target->type != STT_FUNC) {
+    result.reason = "direct-call-target-not-function";
+    return result;
+  }
+  if (callReloc->type == R_RISCV_CALL || callReloc->type == R_RISCV_CALL_PLT) {
+    ArrayRef<uint8_t> data = sec.content();
+    if (insn.off + 8 > data.size()) {
+      result.reason = "direct-call-pair-out-of-section";
+      return result;
+    }
+    uint32_t jalr = llvm::support::endian::read32le(data.data() + insn.off + 4);
+    if ((jalr & 0x7f) != 0x67) {
+      result.reason = "direct-call-pair-not-jalr";
+      return result;
+    }
+    uint32_t rd = bits(jalr, 11, 7);
+    if (rd == 0)
+      result.tail = true;
+    else if (rd == 1 || rd == 5)
+      result.tail = false;
+    else {
+      result.reason = "direct-call-link-register-unsupported";
+      return result;
+    }
+    result.size = 8;
+    result.ok = true;
+    return result;
+  }
+  if (callReloc->type == R_RISCV_JAL) {
+    if (insn.size != 4 || (insn.raw & 0x7f) != 0x6f) {
+      result.reason = "jal-call-relocation-not-jal";
+      return result;
+    }
+    if (insn.rd == 0)
+      result.tail = true;
+    else if (insn.rd == 1 || insn.rd == 5)
+      result.tail = false;
+    else {
+      result.reason = "jal-call-link-register-unsupported";
+      return result;
+    }
+    result.size = 4;
+    result.ok = true;
+    return result;
+  }
+  result.reason = "unsupported-direct-call-relocation";
+  return result;
+}
+
+static bool riscvConfigValueTargetsObject(const RISCVConfigValue &addr,
+                                          Defined *&sym, int64_t &offset) {
+  if (addr.kind != RISCVConfigValueKind::SymbolAddress || !addr.symbol)
+    return false;
+  sym = addr.symbol;
+  offset = addr.offset;
+  return true;
+}
+
 template <class ELFT>
 static SmallVector<RISCVConfigBasicBlock, 0>
 buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
@@ -5269,6 +5580,19 @@ buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
     if (insn.size == 4 && (insn.raw & 0x7f) == 0x63) {
       RISCVConfigBranchTarget target =
           resolveRISCVConfigBranchTarget(sec, insn, relocMap);
+      if (!target.ok) {
+        reason = target.reason;
+        return {};
+      }
+      uint64_t fallthrough = off + insn.size;
+      if (target.target >= func.value && target.target < func.value + func.size)
+        boundaries.insert(target.target);
+      if (fallthrough < func.value + func.size)
+        boundaries.insert(fallthrough);
+    }
+    if (insn.size == 4 && (insn.raw & 0x7f) == 0x6f) {
+      RISCVConfigBranchTarget target =
+          resolveRISCVConfigJalTarget(sec, insn, relocMap);
       if (!target.ok) {
         reason = target.reason;
         return {};
@@ -5335,16 +5659,19 @@ buildRISCVConfigCFG(InputSectionBase &sec, Defined &func,
 
 template <class ELFT>
 static RISCVConfigProofResult
-tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
+tryEvaluateRISCVConfigInitialization(
+    ArrayRef<RISCVConfigCallRecord> calls,
+    ArrayRef<RISCVConfigTrackedGlobal> trackedGlobals) {
   RISCVConfigProofResult result;
-  constexpr StringLiteral globals[] = {
-      "VERSION", "WD",       "WDB",      "ECCLEVEL",
-      "neccblk1", "neccblk2", "datablkw", "eccblkwid"};
-  for (StringRef name : globals)
-    result.values[name.str()] = std::nullopt;
+  for (const RISCVConfigTrackedGlobal &g : trackedGlobals)
+    result.values[g.name] = std::nullopt;
 
   if (calls.empty()) {
     result.reason = "no-entry-call";
+    return result;
+  }
+  if (!riscvConfigTrackedGlobalsSafe(trackedGlobals)) {
+    result.reason = "tracked-global-safety-not-proven";
     return result;
   }
   if (llvm::any_of(calls, [](const RISCVConfigCallRecord &rec) {
@@ -5368,56 +5695,113 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
     result.reason = ambiguous ? "ambiguous-entry-symbol" : "entry-not-found";
     return result;
   }
-  if (!entry->section || !isa<InputSectionBase>(entry->section)) {
-    result.reason = "entry-section-not-input";
-    return result;
-  }
-  auto *entrySec = cast<InputSectionBase>(entry->section);
-  std::string cfgReason;
-  SmallVector<RISCVConfigBasicBlock, 0> blocks =
-      buildRISCVConfigCFG<ELFT>(*entrySec, *entry, cfgReason);
-  if (blocks.empty()) {
-    result.reason = cfgReason.empty() ? "empty-cfg" : cfgReason;
-    result.failFunction = entry->getName().str();
-    return result;
-  }
+  struct Frame {
+    Defined *func = nullptr;
+    InputSectionBase *sec = nullptr;
+    SmallVector<RISCVConfigBasicBlock, 0> blocks;
+    DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap;
+    DenseSet<uint64_t> blockBoundaries;
+    DenseSet<uint64_t> visited;
+    uint64_t current = 0;
+    uint64_t skipUntil = 0;
+  };
+
+  auto buildFrame = [&](Defined *func, Frame &frame,
+                        std::string &reason) -> bool {
+    if (!func || !func->section || !isa<InputSectionBase>(func->section)) {
+      reason = "function-section-not-input";
+      return false;
+    }
+    frame = {};
+    frame.func = func;
+    frame.sec = cast<InputSectionBase>(func->section);
+    frame.blocks = buildRISCVConfigCFG<ELFT>(*frame.sec, *func, reason);
+    if (frame.blocks.empty()) {
+      if (reason.empty())
+        reason = "empty-cfg";
+      return false;
+    }
+    frame.relocMap = getRISCVConfigRelocs<ELFT>(*frame.sec);
+    for (const RISCVConfigBasicBlock &block : frame.blocks)
+      frame.blockBoundaries.insert(block.begin);
+    frame.current = func->value;
+    return true;
+  };
 
   RISCVConfigEvalState state;
   for (auto &r : state.regs)
     r = {};
   state.regs[0] = riscvConfigInteger(0);
+  state.regs[2] = riscvConfigStackAddress(0);
   auto [arg0, arg1] = *argSets.begin();
   state.regs[10] = riscvConfigInteger(arg0);
   state.regs[11] = riscvConfigInteger(arg1);
-  DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap =
-      getRISCVConfigRelocs<ELFT>(*entrySec);
-  DenseSet<uint64_t> blockBoundaries;
-  for (const RISCVConfigBasicBlock &block : blocks)
-    blockBoundaries.insert(block.begin);
+  for (const RISCVConfigTrackedGlobal &g : trackedGlobals)
+    state.trackedGlobals[g.sym] = {};
 
-  DenseSet<uint64_t> visited;
-  uint64_t current = entry->value;
+  std::set<std::string> evaluatedFunctions;
+
+  auto hasRemainingTrackedStore = [&](const Frame &f, uint64_t after) {
+    for (const auto &kv : f.relocMap) {
+      uint64_t off = kv.first;
+      if (off <= after || off < f.func->value || off >= f.func->value + f.func->size)
+        continue;
+      const RISCVConfigRelocInfo *lo =
+          findRISCVConfigReloc(kv.second, {R_RISCV_LO12_S});
+      if (lo && lo->target) {
+        const RISCVConfigTrackedGlobal *tracked = nullptr;
+        int64_t trackedOff = 0;
+        if (resolveRISCVConfigTrackedAddress(lo->target, lo->addend,
+                                             trackedGlobals, tracked,
+                                             trackedOff))
+          return true;
+      }
+    }
+    return false;
+  };
+
+  auto proofCanStop = [&](const Frame &f, uint64_t after) {
+    return riscvConfigAllTrackedKnown(state, trackedGlobals) &&
+           riscvConfigWriterFunctionsCovered(trackedGlobals,
+                                             evaluatedFunctions) &&
+           !hasRemainingTrackedStore(f, after);
+  };
+  Frame frame;
+  std::string cfgReason;
+  if (!buildFrame(entry, frame, cfgReason)) {
+    result.reason = cfgReason;
+    result.failFunction = entry->getName().str();
+    return result;
+  }
+  ++result.functionsEvaluated;
+  evaluatedFunctions.insert(entry->getName().str());
+
   for (uint32_t steps = 0; steps < 4096;) {
-    auto blockIt = llvm::find_if(blocks, [&](const RISCVConfigBasicBlock &b) {
-      return b.begin == current;
+    auto blockIt = llvm::find_if(frame.blocks, [&](const RISCVConfigBasicBlock &b) {
+      return b.begin == frame.current;
     });
-    if (blockIt == blocks.end()) {
+    if (blockIt == frame.blocks.end()) {
       result.reason = "missing-basic-block";
-      result.failFunction = entry->getName().str();
-      result.failOffset = current;
+      result.failFunction = frame.func->getName().str();
+      result.failOffset = frame.current;
       return result;
     }
-    if (!visited.insert(current).second)
+    if (!frame.visited.insert(frame.current).second)
       ++result.loopIterations;
     ++result.visitedBlocks;
     const RISCVConfigBasicBlock &block = *blockIt;
     bool transferred = false;
     for (const RISCVConfigInsn &insn : block.insns) {
+      if (insn.off < frame.skipUntil) {
+        if (insn.off + insn.size >= frame.skipUntil)
+          frame.skipUntil = 0;
+        continue;
+      }
       ++steps;
       ++result.executedInstructions;
       result.failOffset = insn.off;
       result.failOpcode = insn.raw & 0x7f;
-      result.failFunction = entry->getName().str();
+      result.failFunction = frame.func->getName().str();
       result.failKind = insn.kind;
       if (insn.size == 2) {
         result.failRaw16 = static_cast<uint16_t>(insn.raw);
@@ -5439,9 +5823,65 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         return result;
       }
       state.regs[0] = riscvConfigInteger(0);
+      RISCVConfigDirectCallTarget directCall =
+          resolveRISCVConfigDirectCallTarget(*frame.sec, insn, frame.relocMap);
+      if (directCall.found) {
+        if (!directCall.ok) {
+          result.reason = directCall.reason;
+          return result;
+        }
+        ++result.directCalls;
+        message(Twine("riscv-config-call: caller=") +
+                frame.func->getName() +
+                " callee=" + directCall.target->getName() +
+                " kind=" + (directCall.tail ? Twine("tail") : Twine("regular")) +
+                " action=" +
+                (directCall.tail ? Twine("enter") : Twine("abstract")) +
+                " args_known=" +
+                Twine((state.regs[10].kind == RISCVConfigValueKind::Integer &&
+                       state.regs[11].kind == RISCVConfigValueKind::Integer)
+                          ? 1
+                          : 0));
+        if (directCall.tail) {
+          std::array<RISCVConfigValue, 32> oldRegs = state.regs;
+          for (auto &r : state.regs)
+            r = {};
+          state.regs[0] = riscvConfigInteger(0);
+          state.regs[2] = oldRegs[2];
+          for (int r = 10; r <= 17; ++r)
+            state.regs[r] = oldRegs[r];
+          std::string callReason;
+          if (!buildFrame(directCall.target, frame, callReason)) {
+            result.reason = callReason;
+            result.failFunction = directCall.target->getName().str();
+            return result;
+          }
+          ++result.functionsEvaluated;
+          evaluatedFunctions.insert(directCall.target->getName().str());
+          transferred = true;
+          break;
+        }
+        if (riscvConfigFunctionMayWriteTrackedGlobals(directCall.target,
+                                                      trackedGlobals)) {
+          result.reason = "abstract-call-may-write-tracked-global";
+          return result;
+        }
+        if (!riscvConfigTrackedGlobalsSafe(trackedGlobals)) {
+          result.reason = "abstract-call-global-safety-not-proven";
+          return result;
+        }
+        ++result.abstractCalls;
+        riscvConfigClobberCallerSaved(state);
+        frame.skipUntil = insn.off + directCall.size;
+        continue;
+      }
       uint32_t opcode = insn.raw & 0x7f;
       if (insn.size == 2) {
         if (insn.kind == RISCVConfigInsnKind::CLi && insn.rd > 0) {
+          state.regs[insn.rd] = riscvConfigInteger(insn.imm);
+          continue;
+        }
+        if (insn.kind == RISCVConfigInsnKind::CLui && insn.rd > 0) {
           state.regs[insn.rd] = riscvConfigInteger(insn.imm);
           continue;
         }
@@ -5479,7 +5919,40 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
           state.regs[insn.rd] = out;
           continue;
         }
+        if (insn.kind == RISCVConfigInsnKind::CSwsp) {
+          if (state.regs[2].kind != RISCVConfigValueKind::StackAddress) {
+            result.reason = "c-swsp-sp-not-stack";
+            return result;
+          }
+          state.stackSlots[state.regs[2].offset + insn.imm] =
+              state.regs[insn.rs2];
+          message(Twine("riscv-config-store: function=") +
+                  frame.func->getName() +
+                  " offset=0x" + Twine::utohexstr(insn.off) +
+                  " target=stack" +
+                  " value=" +
+                  (state.regs[insn.rs2].kind == RISCVConfigValueKind::Integer
+                       ? Twine(state.regs[insn.rs2].value)
+                       : Twine("unknown")) +
+                  " target_source=symbolic tracked=0");
+          continue;
+        }
+        if (insn.kind == RISCVConfigInsnKind::CLwsp && insn.rd > 0) {
+          if (state.regs[2].kind != RISCVConfigValueKind::StackAddress) {
+            result.reason = "c-lwsp-sp-not-stack";
+            return result;
+          }
+          auto slot = state.stackSlots.find(state.regs[2].offset + insn.imm);
+          state.regs[insn.rd] =
+              slot == state.stackSlots.end() ? RISCVConfigValue{} : slot->second;
+          continue;
+        }
         if (isRISCVConfigReturn(insn)) {
+          if (proofCanStop(frame, insn.off)) {
+            result.complete = true;
+            result.reason = "complete";
+            return result;
+          }
           result.reason = "return-before-complete";
           return result;
         }
@@ -5499,8 +5972,8 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
             result.reason = "unsupported-addi-address-arithmetic";
             return result;
           }
-          auto it = relocMap.find(insn.off);
-          if (it != relocMap.end()) {
+          auto it = frame.relocMap.find(insn.off);
+          if (it != frame.relocMap.end()) {
             const RISCVConfigRelocInfo *lo = findRISCVConfigReloc(
                 it->second, {R_RISCV_LO12_I, R_RISCV_PCREL_LO12_I});
             if (lo && lo->target)
@@ -5526,9 +5999,9 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         }
         continue;
       }
-      if (opcode == 0x37 && insn.rd > 0) {
-        auto it = relocMap.find(insn.off);
-        if (it != relocMap.end()) {
+      if ((opcode == 0x37 || opcode == 0x17) && insn.rd > 0) {
+        auto it = frame.relocMap.find(insn.off);
+        if (it != frame.relocMap.end()) {
           const RISCVConfigRelocInfo *hi =
               findRISCVConfigReloc(it->second, {R_RISCV_HI20, R_RISCV_PCREL_HI20});
           if (hi && hi->target) {
@@ -5579,19 +6052,51 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         continue;
       }
       if (opcode == 0x03) {
-        if (bits(insn.raw, 14, 12) != 4) {
+        uint32_t loadKind = bits(insn.raw, 14, 12);
+        if (loadKind != 2 && loadKind != 4) {
           result.reason = "unsupported-load-kind";
           return result;
         }
         RISCVConfigValue base = state.regs[insn.rs1];
+        if (base.kind == RISCVConfigValueKind::StackAddress) {
+          auto slot = state.stackSlots.find(base.offset + insn.imm);
+          if (slot == state.stackSlots.end()) {
+            state.regs[insn.rd] = {};
+            continue;
+          }
+          state.regs[insn.rd] = slot->second;
+          continue;
+        }
+        if (loadKind != 4) {
+          result.reason = "non-byte-load-from-non-stack";
+          return result;
+        }
         if (base.kind != RISCVConfigValueKind::SymbolAddress) {
           result.reason = "readonly-load-base-not-symbol";
           return result;
         }
+        Defined *loadSym = base.symbol;
+        int64_t loadOff = base.offset + insn.imm;
+        const RISCVConfigTrackedGlobal *trackedLoad = nullptr;
+        int64_t trackedLoadOff = 0;
+        if (resolveRISCVConfigTrackedAddress(loadSym, loadOff, trackedGlobals,
+                                             trackedLoad, trackedLoadOff)) {
+          auto val = state.trackedGlobals.find(trackedLoad->sym);
+          if (val == state.trackedGlobals.end() ||
+              val->second.kind != RISCVConfigValueKind::Integer) {
+            result.reason = "tracked-global-load-unknown";
+            return result;
+          }
+          if (trackedLoadOff != 0) {
+            result.reason = "tracked-global-load-offset";
+            return result;
+          }
+          state.regs[insn.rd] = val->second;
+          continue;
+        }
         uint8_t byte = 0;
         std::string loadReason;
-        if (!readRISCVConfigReadonlyByte(base.symbol, base.offset + insn.imm,
-                                         byte, loadReason)) {
+        if (!readRISCVConfigReadonlyByte(loadSym, loadOff, byte, loadReason)) {
           result.reason = loadReason;
           return result;
         }
@@ -5600,8 +6105,93 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         continue;
       }
       if (opcode == 0x23) {
-        result.reason = "config-store-evaluator-not-implemented";
-        return result;
+        uint32_t funct3 = bits(insn.raw, 14, 12);
+        if (funct3 != 0 && funct3 != 2) {
+          result.reason = "unsupported-store-kind";
+          return result;
+        }
+        RISCVConfigValue storeValue = state.regs[insn.rs2];
+        RISCVConfigValue addr = state.regs[insn.rs1];
+        std::string targetSource = "symbolic";
+        auto it = frame.relocMap.find(insn.off);
+        if (it != frame.relocMap.end()) {
+          const RISCVConfigRelocInfo *lo =
+              findRISCVConfigReloc(it->second, {R_RISCV_LO12_S});
+          if (lo && lo->target) {
+            addr = riscvConfigSymbolAddress(lo->target, lo->addend);
+            targetSource = "relocation";
+          } else {
+            result.reason = "store-relocation-unresolved";
+            return result;
+          }
+        } else {
+          RISCVConfigValue out;
+          if (!riscvConfigAddValues(addr, riscvConfigInteger(insn.imm), out)) {
+            result.reason = "unknown-store-target";
+            return result;
+          }
+          addr = out;
+        }
+
+        if (addr.kind == RISCVConfigValueKind::StackAddress) {
+          state.stackSlots[addr.offset] = storeValue;
+          message(Twine("riscv-config-store: function=") +
+                  frame.func->getName() +
+                  " offset=0x" + Twine::utohexstr(insn.off) +
+                  " target=stack" +
+                  " value=" +
+                  (storeValue.kind == RISCVConfigValueKind::Integer
+                       ? Twine(storeValue.value)
+                       : Twine("unknown")) +
+                  " target_source=" + targetSource +
+                  " tracked=0");
+          continue;
+        }
+
+        Defined *storeSym = nullptr;
+        int64_t storeOff = 0;
+        if (!riscvConfigValueTargetsObject(addr, storeSym, storeOff)) {
+          result.reason = "unknown-store-target";
+          return result;
+        }
+        const RISCVConfigTrackedGlobal *tracked = nullptr;
+        int64_t trackedOff = 0;
+        bool isTracked = resolveRISCVConfigTrackedAddress(
+            storeSym, storeOff, trackedGlobals, tracked, trackedOff);
+        if (isTracked) {
+          if (trackedOff != 0) {
+            result.reason = "tracked-store-offset";
+            return result;
+          }
+          if (storeValue.kind != RISCVConfigValueKind::Integer) {
+            result.reason = "tracked-store-value-unknown";
+            return result;
+          }
+          int64_t byteValue = static_cast<uint8_t>(storeValue.value);
+          state.trackedGlobals[tracked->sym] = riscvConfigInteger(byteValue);
+          result.values[tracked->name] = byteValue;
+          ++result.trackedStores;
+        }
+        if (!isTracked && (!storeSym || storeSym->type != STT_OBJECT)) {
+          result.reason = "non-object-store-target";
+          return result;
+        }
+        message(Twine("riscv-config-store: function=") +
+                frame.func->getName() +
+                " offset=0x" + Twine::utohexstr(insn.off) +
+                " target=" +
+                (storeSym ? Twine(storeSym->getName()) : Twine("unknown")) +
+                " value=" +
+                (storeValue.kind == RISCVConfigValueKind::Integer
+                     ? Twine(unsigned(static_cast<uint8_t>(storeValue.value)))
+                     : Twine("unknown")) +
+                " target_source=" + targetSource +
+                " tracked=" + Twine(isTracked ? 1 : 0));
+        if (!isTracked && !riscvConfigTrackedGlobalsSafe(trackedGlobals)) {
+          result.reason = "unrelated-store-global-safety-not-proven";
+          return result;
+        }
+        continue;
       }
       if (opcode == 0x63) {
         if (state.regs[insn.rs1].kind != RISCVConfigValueKind::Integer ||
@@ -5621,7 +6211,7 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         else
           ++result.neverTakenBranches;
         RISCVConfigBranchTarget branchTarget =
-            resolveRISCVConfigBranchTarget(*entrySec, insn, relocMap);
+            resolveRISCVConfigBranchTarget(*frame.sec, insn, frame.relocMap);
         if (!branchTarget.ok) {
           result.reason = branchTarget.reason;
           return result;
@@ -5633,7 +6223,7 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         if (result.branchTraceEmitted < 48) {
           ++result.branchTraceEmitted;
           message(Twine("riscv-config-branch-trace: function=") +
-                  entry->getName() +
+                  frame.func->getName() +
                   " offset=0x" + Twine::utohexstr(insn.off) +
                   " raw=0x" + Twine::utohexstr(insn.raw) +
                   " funct3=" + Twine(bits(insn.raw, 14, 12)) +
@@ -5651,26 +6241,54 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
                   " fallthrough=0x" + Twine::utohexstr(fallthrough) +
                   " current_block=0x" + Twine::utohexstr(block.begin));
         }
-        if (successor < entry->value || successor >= entry->value + entry->size) {
+        if (successor < frame.func->value ||
+            successor >= frame.func->value + frame.func->size) {
           result.reason = "branch-target-out-of-function";
           return result;
         }
-        if (!blockBoundaries.contains(successor)) {
+        if (!frame.blockBoundaries.contains(successor)) {
           result.reason = "branch-target-not-basic-block";
           result.failOffset = successor;
           return result;
         }
-        current = successor;
+        frame.current = successor;
         transferred = true;
         break;
       }
-      if (opcode == 0x6f || opcode == 0x67) {
-        ++result.directCalls;
-        result.reason = "interprocedural-evaluator-not-implemented";
+      if (isRISCVConfigReturn(insn)) {
+        if (proofCanStop(frame, insn.off)) {
+          result.complete = true;
+          result.reason = "complete";
+          return result;
+        }
+        result.reason = "return-before-complete";
         return result;
       }
-      if (isRISCVConfigReturn(insn)) {
-        result.reason = "return-before-complete";
+      if (opcode == 0x6f || opcode == 0x67) {
+        if (opcode == 0x6f && insn.rd == 0) {
+          RISCVConfigBranchTarget jalTarget =
+              resolveRISCVConfigJalTarget(*frame.sec, insn, frame.relocMap);
+          if (!jalTarget.ok) {
+            result.reason = jalTarget.reason;
+            return result;
+          }
+          uint64_t target = jalTarget.target;
+          if (target < frame.func->value ||
+              target >= frame.func->value + frame.func->size) {
+            result.reason = "jal-target-out-of-function";
+            return result;
+          }
+          if (!frame.blockBoundaries.contains(target)) {
+            result.reason = "jal-target-not-basic-block";
+            result.failOffset = target;
+            return result;
+          }
+          frame.current = target;
+          transferred = true;
+          break;
+        }
+        ++result.directCalls;
+        result.reason = "interprocedural-evaluator-not-implemented";
         return result;
       }
       result.reason = "unsupported-instruction";
@@ -5678,11 +6296,21 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
     }
     if (!transferred) {
       uint64_t next = block.end;
-      if (next >= entry->value + entry->size) {
-        result.reason = "fallthrough-out-of-function";
+      if (next >= frame.func->value + frame.func->size) {
+        if (proofCanStop(frame, block.end)) {
+          result.complete = true;
+          result.reason = "complete";
+          return result;
+        }
+        result.reason = "fallthrough-out-of-function-before-complete";
         return result;
       }
-      current = next;
+      frame.current = next;
+    }
+    if (proofCanStop(frame, block.end)) {
+      result.complete = true;
+      result.reason = "complete";
+      return result;
     }
   }
   result.reason = "evaluator-step-limit";
@@ -5774,9 +6402,15 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
       "neccblk1", "neccblk2", "datablkw", "eccblkwid"};
   constexpr size_t globalCount = sizeof(globals) / sizeof(globals[0]);
   uint32_t candidateSafeGlobals = 0;
+  SmallVector<RISCVConfigTrackedGlobal, 0> trackedGlobals;
   for (StringRef name : globals) {
     RISCVConfigGlobalAudit audit;
     auditRISCVConfigGlobal<ELFT>(name, audit);
+    bool ambiguous = false;
+    Defined *sym =
+        findUniqueRISCVConfigDefinedByName<ELFT>(name, STT_OBJECT, ambiguous);
+    if (sym && !ambiguous)
+      trackedGlobals.push_back({sym, name.str(), audit});
     if (!audit.name.empty() && !audit.addressTaken && !audit.unknownPointerUse &&
         !audit.writerFunctions.empty() && audit.writerFunctions.size() <= 2)
       ++candidateSafeGlobals;
@@ -5800,7 +6434,7 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
 
   bool phaseSafe = false;
   RISCVConfigProofResult proof =
-      tryEvaluateRISCVConfigInitialization<ELFT>(calls);
+      tryEvaluateRISCVConfigInitialization<ELFT>(calls, trackedGlobals);
   auto valueOrUnknown = [&](StringRef name) -> Twine {
     auto it = proof.values.find(name.str());
     if (it == proof.values.end() || !it->second)
@@ -5824,10 +6458,13 @@ template <class ELFT> static void printRISCVConfigSpecializationAudit() {
           " executed_instructions=" + Twine(proof.executedInstructions) +
           " loop_iterations=" + Twine(proof.loopIterations) +
           " readonly_loads=" + Twine(proof.readonlyLoads) +
+          " tracked_stores=" + Twine(proof.trackedStores) +
           " evaluator_constant_branches=" + Twine(proof.constantBranches) +
           " evaluator_always_taken=" + Twine(proof.alwaysTakenBranches) +
           " evaluator_never_taken=" + Twine(proof.neverTakenBranches) +
           " direct_calls=" + Twine(proof.directCalls) +
+          " abstract_calls=" + Twine(proof.abstractCalls) +
+          " functions_evaluated=" + Twine(proof.functionsEvaluated) +
           " final_status=" + (proof.complete ? Twine("complete")
                                              : Twine("failed")) +
           " rejection_reason=" + proof.reason +
