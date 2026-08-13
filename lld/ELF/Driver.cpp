@@ -4582,6 +4582,55 @@ resolveRISCVFunctionForLocation(InputSectionBase &sec, uint64_t off) {
     parentOff = storageIt->second.originalBegin + off;
   }
 
+  auto tryChild = [&](InputSectionBase *child,
+                      const RISCVFunctionSplitRelocStorage &storage)
+      -> std::optional<RISCVConfigFunctionRef> {
+    if (off < storage.originalBegin || off >= storage.originalEnd)
+      return std::nullopt;
+    uint64_t childOff = off - storage.originalBegin;
+    RISCVConfigFunctionRef childBest;
+    for (ELFFileBase *file : ctx.objectFiles) {
+      if (file != sec.file)
+        continue;
+      for (Symbol *sym : file->getSymbols()) {
+        Defined *d = dyn_cast_or_null<Defined>(sym);
+        if (!d || d->type != STT_FUNC || d->isSection() ||
+            d->section != child)
+          continue;
+        uint64_t begin = d->value;
+        uint64_t end = d->size ? d->value + d->size : child->content().size();
+        if (childOff < begin || childOff >= end)
+          continue;
+        if (!childBest.sym || end - begin < childBest.end - childBest.begin)
+          childBest = {d, d->getName().str(), begin, end};
+      }
+    }
+    if (childBest.sym)
+      return childBest;
+    return std::nullopt;
+  };
+
+  auto childIt = riscvFunctionSplitChildren.find(&sec);
+  if (childIt != riscvFunctionSplitChildren.end()) {
+    std::optional<RISCVConfigFunctionRef> childBest;
+    bool ambiguous = false;
+    for (InputSectionBase *child : childIt->second) {
+      auto st = riscvFunctionSplitRelocStorage.find(child);
+      if (st == riscvFunctionSplitRelocStorage.end())
+        continue;
+      std::optional<RISCVConfigFunctionRef> r = tryChild(child, st->second);
+      if (!r)
+        continue;
+      if (childBest && childBest->sym != r->sym)
+        ambiguous = true;
+      childBest = r;
+    }
+    if (childBest && !ambiguous)
+      return *childBest;
+    if (ambiguous)
+      return {nullptr, "ambiguous-function", 0, sec.content().size()};
+  }
+
   SmallVector<Defined *, 0> funcs;
   for (ELFFileBase *file : ctx.objectFiles) {
     if (file != sec.file)
@@ -4903,20 +4952,145 @@ struct RISCVConfigProofResult {
   std::map<std::string, std::optional<int64_t>> values;
 };
 
+enum class RISCVConfigValueKind {
+  Unknown,
+  Integer,
+  SymbolAddress,
+};
+
 struct RISCVConfigValue {
-  bool known = false;
+  RISCVConfigValueKind kind = RISCVConfigValueKind::Unknown;
   int64_t value = 0;
+  Defined *symbol = nullptr;
+  int64_t offset = 0;
 };
 
 struct RISCVConfigEvalState {
   std::array<RISCVConfigValue, 32> regs;
 };
 
+static RISCVConfigValue riscvConfigInteger(int64_t v) {
+  RISCVConfigValue value;
+  value.kind = RISCVConfigValueKind::Integer;
+  value.value = v;
+  return value;
+}
+
+static RISCVConfigValue riscvConfigSymbolAddress(Defined *sym, int64_t off) {
+  RISCVConfigValue value;
+  value.kind = RISCVConfigValueKind::SymbolAddress;
+  value.symbol = sym;
+  value.offset = off;
+  return value;
+}
+
+static bool riscvConfigAddValues(const RISCVConfigValue &a,
+                                 const RISCVConfigValue &b,
+                                 RISCVConfigValue &out) {
+  if (a.kind == RISCVConfigValueKind::Integer &&
+      b.kind == RISCVConfigValueKind::Integer) {
+    out = riscvConfigInteger(a.value + b.value);
+    return true;
+  }
+  if (a.kind == RISCVConfigValueKind::SymbolAddress &&
+      b.kind == RISCVConfigValueKind::Integer) {
+    out = riscvConfigSymbolAddress(a.symbol, a.offset + b.value);
+    return true;
+  }
+  if (a.kind == RISCVConfigValueKind::Integer &&
+      b.kind == RISCVConfigValueKind::SymbolAddress) {
+    out = riscvConfigSymbolAddress(b.symbol, b.offset + a.value);
+    return true;
+  }
+  return false;
+}
+
+static bool riscvConfigSubInteger(const RISCVConfigValue &a, int64_t b,
+                                  RISCVConfigValue &out) {
+  if (a.kind == RISCVConfigValueKind::Integer) {
+    out = riscvConfigInteger(a.value - b);
+    return true;
+  }
+  if (a.kind == RISCVConfigValueKind::SymbolAddress) {
+    out = riscvConfigSymbolAddress(a.symbol, a.offset - b);
+    return true;
+  }
+  return false;
+}
+
 struct RISCVConfigBasicBlock {
   uint64_t begin = 0;
   uint64_t end = 0;
   SmallVector<RISCVConfigInsn, 0> insns;
 };
+
+struct RISCVConfigRelocInfo {
+  RelType type = static_cast<RelType>(0);
+  Defined *target = nullptr;
+  int64_t addend = 0;
+};
+
+template <class ELFT>
+static DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>>
+getRISCVConfigRelocs(InputSectionBase &sec) {
+  DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> result;
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  auto scan = [&](auto relRange) {
+    for (const auto &rel : relRange) {
+      RISCVConfigRelocInfo info;
+      info.type = rel.getType(config->isMips64EL);
+      info.target = getRISCVConfigRelocTarget<ELFT>(sec, rel);
+      info.addend = getRISCVFunctionSplitAddend(rel);
+      result[rel.r_offset].push_back(info);
+    }
+  };
+  scan(rels.rels);
+  scan(rels.relas);
+  return result;
+}
+
+static const RISCVConfigRelocInfo *
+findRISCVConfigReloc(ArrayRef<RISCVConfigRelocInfo> relocs,
+                     ArrayRef<RelType> types) {
+  const RISCVConfigRelocInfo *found = nullptr;
+  for (const RISCVConfigRelocInfo &r : relocs) {
+    if (!llvm::is_contained(types, r.type))
+      continue;
+    if (found)
+      return nullptr;
+    found = &r;
+  }
+  return found;
+}
+
+static bool readRISCVConfigReadonlyByte(Defined *sym, int64_t offset,
+                                        uint8_t &value,
+                                        std::string &reason) {
+  if (!sym || sym->type != STT_OBJECT) {
+    reason = "readonly-load-non-object";
+    return false;
+  }
+  auto *sec = dyn_cast_or_null<InputSectionBase>(sym->section);
+  if (!sec) {
+    reason = "readonly-load-no-section";
+    return false;
+  }
+  if (sec->flags & SHF_WRITE) {
+    reason = "readonly-load-writable";
+    return false;
+  }
+  if (offset < 0 || static_cast<uint64_t>(offset) >= sym->size) {
+    reason = "readonly-load-out-of-object";
+    return false;
+  }
+  uint64_t secOff = sym->value + static_cast<uint64_t>(offset);
+  if (secOff >= sec->content().size()) {
+    reason = "readonly-load-out-of-section";
+    return false;
+  }
+  value = sec->content()[secOff];
+  return true;
+}
 
 static bool isRISCVConfigReturn(const RISCVConfigInsn &insn) {
   if (insn.size == 4 && (insn.raw & 0x7f) == 0x67)
@@ -5046,11 +5220,13 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
 
   RISCVConfigEvalState state;
   for (auto &r : state.regs)
-    r = {false, 0};
-  state.regs[0] = {true, 0};
+    r = {};
+  state.regs[0] = riscvConfigInteger(0);
   auto [arg0, arg1] = *argSets.begin();
-  state.regs[10] = {true, arg0};
-  state.regs[11] = {true, arg1};
+  state.regs[10] = riscvConfigInteger(arg0);
+  state.regs[11] = riscvConfigInteger(arg1);
+  DenseMap<uint64_t, SmallVector<RISCVConfigRelocInfo, 0>> relocMap =
+      getRISCVConfigRelocs<ELFT>(*entrySec);
 
   DenseSet<uint64_t> visited;
   uint64_t current = entry->value;
@@ -5095,20 +5271,26 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         result.reason = "evaluator-step-limit";
         return result;
       }
-      state.regs[0] = {true, 0};
+      state.regs[0] = riscvConfigInteger(0);
       uint32_t opcode = insn.raw & 0x7f;
       if (insn.size == 2) {
         if (insn.kind == RISCVConfigInsnKind::CLi && insn.rd > 0) {
-          state.regs[insn.rd] = {true, insn.imm};
+          state.regs[insn.rd] = riscvConfigInteger(insn.imm);
           continue;
         }
         if (insn.kind == RISCVConfigInsnKind::CAddi && insn.rd > 0 &&
-            state.regs[insn.rd].known) {
-          state.regs[insn.rd].value += insn.imm;
+            state.regs[insn.rd].kind != RISCVConfigValueKind::Unknown) {
+          RISCVConfigValue imm = riscvConfigInteger(insn.imm);
+          RISCVConfigValue out;
+          if (!riscvConfigAddValues(state.regs[insn.rd], imm, out)) {
+            result.reason = "unsupported-c-addi-address-arithmetic";
+            return result;
+          }
+          state.regs[insn.rd] = out;
           continue;
         }
         if (insn.kind == RISCVConfigInsnKind::CMv && insn.rd > 0) {
-          if (!state.regs[insn.rs2].known) {
+          if (state.regs[insn.rs2].kind == RISCVConfigValueKind::Unknown) {
             result.reason = "unknown-c-mv-source";
             return result;
           }
@@ -5116,11 +5298,18 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
           continue;
         }
         if (insn.kind == RISCVConfigInsnKind::CAdd && insn.rd > 0) {
-          if (!state.regs[insn.rd].known || !state.regs[insn.rs2].known) {
+          if (state.regs[insn.rd].kind == RISCVConfigValueKind::Unknown ||
+              state.regs[insn.rs2].kind == RISCVConfigValueKind::Unknown) {
             result.reason = "unknown-c-add-source";
             return result;
           }
-          state.regs[insn.rd].value += state.regs[insn.rs2].value;
+          RISCVConfigValue out;
+          if (!riscvConfigAddValues(state.regs[insn.rd], state.regs[insn.rs2],
+                                    out)) {
+            result.reason = "unsupported-c-add-address-arithmetic";
+            return result;
+          }
+          state.regs[insn.rd] = out;
           continue;
         }
         if (isRISCVConfigReturn(insn)) {
@@ -5132,48 +5321,90 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
       }
       if (opcode == 0x13 && insn.rd > 0) {
         uint32_t funct3 = bits(insn.raw, 14, 12);
-        if (!state.regs[insn.rs1].known) {
+        if (state.regs[insn.rs1].kind == RISCVConfigValueKind::Unknown) {
           result.reason = "unknown-op-imm-source";
           return result;
         }
-        if (funct3 == 0)
-          state.regs[insn.rd] = {true, state.regs[insn.rs1].value + insn.imm};
-        else if (funct3 == 7)
-          state.regs[insn.rd] = {true, state.regs[insn.rs1].value & insn.imm};
-        else if (funct3 == 1 && bits(insn.raw, 31, 25) == 0)
-          state.regs[insn.rd] = {true, state.regs[insn.rs1].value
-                                           << bits(insn.raw, 24, 20)};
-        else if (funct3 == 5 && bits(insn.raw, 31, 25) == 0)
-          state.regs[insn.rd] = {
-              true, static_cast<int64_t>(
-                        static_cast<uint32_t>(state.regs[insn.rs1].value) >>
-                        bits(insn.raw, 24, 20))};
-        else {
+        if (funct3 == 0) {
+          RISCVConfigValue out;
+          if (!riscvConfigAddValues(state.regs[insn.rs1],
+                                    riscvConfigInteger(insn.imm), out)) {
+            result.reason = "unsupported-addi-address-arithmetic";
+            return result;
+          }
+          auto it = relocMap.find(insn.off);
+          if (it != relocMap.end()) {
+            const RISCVConfigRelocInfo *lo = findRISCVConfigReloc(
+                it->second, {R_RISCV_LO12_I, R_RISCV_PCREL_LO12_I});
+            if (lo && lo->target)
+              out = riscvConfigSymbolAddress(lo->target, lo->addend);
+          }
+          state.regs[insn.rd] = out;
+        } else if (funct3 == 7 &&
+                   state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
+          state.regs[insn.rd] =
+              riscvConfigInteger(state.regs[insn.rs1].value & insn.imm);
+        } else if (funct3 == 1 && bits(insn.raw, 31, 25) == 0 &&
+                   state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
+          state.regs[insn.rd] = riscvConfigInteger(
+              state.regs[insn.rs1].value << bits(insn.raw, 24, 20));
+        } else if (funct3 == 5 && bits(insn.raw, 31, 25) == 0 &&
+                   state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer) {
+          state.regs[insn.rd] = riscvConfigInteger(static_cast<int64_t>(
+              static_cast<uint32_t>(state.regs[insn.rs1].value) >>
+              bits(insn.raw, 24, 20)));
+        } else {
           result.reason = "unsupported-op-imm";
           return result;
         }
         continue;
       }
       if (opcode == 0x37 && insn.rd > 0) {
-        state.regs[insn.rd] = {true, insn.imm};
+        auto it = relocMap.find(insn.off);
+        if (it != relocMap.end()) {
+          const RISCVConfigRelocInfo *hi =
+              findRISCVConfigReloc(it->second, {R_RISCV_HI20, R_RISCV_PCREL_HI20});
+          if (hi && hi->target) {
+            state.regs[insn.rd] = riscvConfigSymbolAddress(hi->target,
+                                                            hi->addend);
+            continue;
+          }
+          result.reason = "symbolic-address-reloc-unresolved";
+          return result;
+        }
+        state.regs[insn.rd] = riscvConfigInteger(insn.imm);
         continue;
       }
       if (opcode == 0x33) {
         uint32_t funct3 = bits(insn.raw, 14, 12);
         uint32_t funct7 = bits(insn.raw, 31, 25);
-        if (!state.regs[insn.rs1].known || !state.regs[insn.rs2].known) {
+        if (state.regs[insn.rs1].kind == RISCVConfigValueKind::Unknown ||
+            state.regs[insn.rs2].kind == RISCVConfigValueKind::Unknown) {
           result.reason = "unknown-op-source";
           return result;
         }
-        if (funct3 == 0 && funct7 == 0)
-          state.regs[insn.rd] = {true, state.regs[insn.rs1].value +
-                                           state.regs[insn.rs2].value};
-        else if (funct3 == 0 && funct7 == 0x20)
-          state.regs[insn.rd] = {true, state.regs[insn.rs1].value -
-                                           state.regs[insn.rs2].value};
-        else if (funct3 == 0 && funct7 == 1)
-          state.regs[insn.rd] = {true, state.regs[insn.rs1].value *
-                                           state.regs[insn.rs2].value};
+        if (funct3 == 0 && funct7 == 0) {
+          RISCVConfigValue out;
+          if (!riscvConfigAddValues(state.regs[insn.rs1], state.regs[insn.rs2],
+                                    out)) {
+            result.reason = "unsupported-add-address-arithmetic";
+            return result;
+          }
+          state.regs[insn.rd] = out;
+        } else if (funct3 == 0 && funct7 == 0x20 &&
+                   state.regs[insn.rs2].kind == RISCVConfigValueKind::Integer) {
+          RISCVConfigValue out;
+          if (!riscvConfigSubInteger(state.regs[insn.rs1],
+                                     state.regs[insn.rs2].value, out)) {
+            result.reason = "unsupported-sub-address-arithmetic";
+            return result;
+          }
+          state.regs[insn.rd] = out;
+        } else if (funct3 == 0 && funct7 == 1 &&
+                   state.regs[insn.rs1].kind == RISCVConfigValueKind::Integer &&
+                   state.regs[insn.rs2].kind == RISCVConfigValueKind::Integer)
+          state.regs[insn.rd] = riscvConfigInteger(
+              state.regs[insn.rs1].value * state.regs[insn.rs2].value);
         else {
           result.reason = "unsupported-op";
           return result;
@@ -5181,8 +5412,25 @@ tryEvaluateRISCVConfigInitialization(ArrayRef<RISCVConfigCallRecord> calls) {
         continue;
       }
       if (opcode == 0x03) {
-        result.reason = "readonly-load-evaluator-not-implemented";
-        return result;
+        if (bits(insn.raw, 14, 12) != 4) {
+          result.reason = "unsupported-load-kind";
+          return result;
+        }
+        RISCVConfigValue base = state.regs[insn.rs1];
+        if (base.kind != RISCVConfigValueKind::SymbolAddress) {
+          result.reason = "readonly-load-base-not-symbol";
+          return result;
+        }
+        uint8_t byte = 0;
+        std::string loadReason;
+        if (!readRISCVConfigReadonlyByte(base.symbol, base.offset + insn.imm,
+                                         byte, loadReason)) {
+          result.reason = loadReason;
+          return result;
+        }
+        state.regs[insn.rd] = riscvConfigInteger(byte);
+        ++result.readonlyLoads;
+        continue;
       }
       if (opcode == 0x23) {
         result.reason = "config-store-evaluator-not-implemented";
