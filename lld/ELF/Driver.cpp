@@ -4388,12 +4388,18 @@ struct RISCVPrintfInsn {
   int rd = -1;
   int rs1 = -1;
   int rs2 = -1;
+  int copySrc = -1;
+  int64_t stackOffset = 0;
   bool writesRd = false;
   bool lui = false;
   bool addi = false;
   bool copy = false;
   bool controlFlow = false;
   bool call = false;
+  bool stackLoad = false;
+  bool stackStore = false;
+  bool memoryStore = false;
+  bool supported = true;
 };
 
 static bool decodeRISCVPrintfInsn(ArrayRef<uint8_t> data, uint64_t off,
@@ -4406,26 +4412,89 @@ static bool decodeRISCVPrintfInsn(ArrayRef<uint8_t> data, uint64_t off,
   if ((half & 0x3) != 0x3) {
     insn.size = 2;
     insn.raw = half;
+    insn.supported = false;
     uint16_t quadrant = half & 0x3;
     uint16_t funct3 = (half >> 13) & 0x7;
-    if (quadrant == 1 && (funct3 == 5 || funct3 == 6 || funct3 == 7))
+    if (quadrant == 0 && funct3 == 0) {
+      insn.rd = 8 + ((half >> 2) & 0x7);
+      insn.rs1 = 2;
+      insn.writesRd = true;
+      insn.supported = true;
+    } else if (quadrant == 1 && funct3 == 0) {
+      insn.rd = (half >> 7) & 0x1f;
+      insn.rs1 = insn.rd;
+      insn.addi = true;
+      insn.writesRd = insn.rd != 0;
+      insn.supported = true;
+    } else if (quadrant == 1 && funct3 == 1) {
       insn.controlFlow = true;
-    else if (quadrant == 2 && funct3 == 4) {
+      insn.call = true;
+      insn.supported = true;
+    } else if (quadrant == 1 && funct3 == 2) {
+      insn.rd = (half >> 7) & 0x1f;
+      insn.writesRd = insn.rd != 0;
+      insn.supported = true;
+    } else if (quadrant == 1 && funct3 == 3) {
+      insn.rd = (half >> 7) & 0x1f;
+      insn.writesRd = insn.rd != 0;
+      insn.supported = true;
+    } else if (quadrant == 1 && (funct3 == 5 || funct3 == 6 || funct3 == 7)) {
+      insn.controlFlow = true;
+      insn.supported = true;
+    } else if (quadrant == 2 && funct3 == 0) {
+      insn.rd = (half >> 7) & 0x1f;
+      insn.rs1 = insn.rd;
+      insn.writesRd = insn.rd != 0;
+      insn.supported = true;
+    } else if (quadrant == 2 && funct3 == 2) {
+      insn.rd = (half >> 7) & 0x1f;
+      insn.rs1 = 2;
+      insn.stackOffset = (((half >> 4) & 0x7) << 2) |
+                         (((half >> 12) & 0x1) << 5) |
+                         (((half >> 2) & 0x3) << 6);
+      if (insn.rd != 0) {
+        insn.stackLoad = true;
+        insn.writesRd = true;
+      }
+      insn.supported = true;
+    } else if (quadrant == 2 && funct3 == 6) {
+      insn.rs1 = 2;
+      insn.rs2 = (half >> 2) & 0x1f;
+      insn.copySrc = insn.rs2;
+      insn.stackOffset = (((half >> 9) & 0xf) << 2) |
+                         (((half >> 7) & 0x3) << 6);
+      insn.stackStore = true;
+      insn.memoryStore = true;
+      insn.supported = true;
+    } else if (quadrant == 0 && funct3 == 2) {
+      insn.rd = 8 + ((half >> 2) & 0x7);
+      insn.rs1 = 8 + ((half >> 7) & 0x7);
+      insn.writesRd = true;
+      insn.supported = true;
+    } else if (quadrant == 0 && funct3 == 6) {
+      insn.rs1 = 8 + ((half >> 7) & 0x7);
+      insn.rs2 = 8 + ((half >> 2) & 0x7);
+      insn.copySrc = insn.rs2;
+      insn.memoryStore = true;
+      insn.supported = true;
+    } else if (quadrant == 2 && funct3 == 4) {
       int rs2 = (half >> 2) & 0x1f;
       bool bit12 = half & 0x1000;
       insn.rs1 = (half >> 7) & 0x1f;
       insn.rs2 = rs2;
+      insn.copySrc = rs2;
       if (rs2 == 0) {
         insn.controlFlow = true;
         insn.call = bit12;
       } else if (bit12) {
-        insn.controlFlow = true;
-        insn.call = true;
+        insn.rd = insn.rs1;
+        insn.writesRd = true;
       } else {
         insn.rd = insn.rs1;
         insn.copy = true;
         insn.writesRd = true;
       }
+      insn.supported = true;
     }
     return true;
   }
@@ -4438,18 +4507,35 @@ static bool decodeRISCVPrintfInsn(ArrayRef<uint8_t> data, uint64_t off,
   insn.rd = (raw >> 7) & 0x1f;
   insn.rs1 = (raw >> 15) & 0x1f;
   insn.rs2 = (raw >> 20) & 0x1f;
-  if (opcode == 0x37) {
+  if (opcode == 0x37 || opcode == 0x17) {
     insn.lui = true;
     insn.writesRd = true;
-  } else if (opcode == 0x13 && ((raw >> 12) & 0x7) == 0) {
-    insn.addi = true;
+  } else if (opcode == 0x13) {
+    insn.addi = ((raw >> 12) & 0x7) == 0;
     insn.copy = (static_cast<int32_t>(raw) >> 20) == 0;
+    insn.copySrc = insn.rs1;
     insn.writesRd = true;
+  } else if (opcode == 0x03) {
+    insn.stackOffset = static_cast<int32_t>(raw) >> 20;
+    if (insn.rs1 == 2)
+      insn.stackLoad = true;
+    insn.writesRd = true;
+  } else if (opcode == 0x23) {
+    int32_t imm = (((raw >> 25) & 0x7f) << 5) | ((raw >> 7) & 0x1f);
+    if (imm & 0x800)
+      imm |= ~0xfff;
+    insn.stackOffset = imm;
+    insn.copySrc = insn.rs2;
+    if (insn.rs1 == 2)
+      insn.stackStore = true;
+    insn.memoryStore = true;
   } else if (opcode == 0x6f || opcode == 0x67) {
     insn.controlFlow = true;
     insn.call = insn.rd == 1 || insn.rd == 5;
   } else if (opcode == 0x63) {
     insn.controlFlow = true;
+  } else if (opcode == 0x33) {
+    insn.writesRd = true;
   }
   return true;
 }
@@ -4460,6 +4546,64 @@ static bool isRISCVIntegerCalleeSavedReg(int reg) {
 
 static bool riscvPrintfInsnWritesReg(const RISCVPrintfInsn &insn, int reg) {
   return reg >= 0 && insn.writesRd && insn.rd == reg;
+}
+
+static bool riscvPrintfInsnMayModifySP(const RISCVPrintfInsn &insn) {
+  return riscvPrintfInsnWritesReg(insn, 2);
+}
+
+struct RISCVPrintfFunctionDecode {
+  uint64_t start = 0;
+  uint64_t end = 0;
+  uint64_t decodedEnd = 0;
+  SmallVector<RISCVPrintfInsn, 0> instructions;
+  bool ok = true;
+};
+
+static bool decodeRISCVPrintfFunction(InputSectionBase &sec, Defined &func,
+                                      RISCVPrintfFunctionDecode &decoded) {
+  ArrayRef<uint8_t> data = sec.content();
+  if (func.value > data.size())
+    return false;
+  decoded.start = func.value;
+  decoded.end = data.size();
+  decoded.decodedEnd = decoded.start;
+  if (func.size != 0 && func.value + func.size >= func.value &&
+      func.value + func.size < decoded.end)
+    decoded.end = func.value + func.size;
+  for (uint64_t off = decoded.start; off < decoded.end;) {
+    RISCVPrintfInsn insn;
+    if (!decodeRISCVPrintfInsn(data, off, insn) || off + insn.size > decoded.end) {
+      decoded.ok = false;
+      return false;
+    }
+    decoded.instructions.push_back(insn);
+    off += insn.size;
+    decoded.decodedEnd = off;
+  }
+  return true;
+}
+
+static bool collectRISCVPrintfInsnsBeforeCall(
+    const RISCVPrintfFunctionDecode &decoded, uint64_t callOff,
+    SmallVectorImpl<RISCVPrintfInsn> &insns, uint32_t maxInsns = 0) {
+  bool reachedCall = decoded.start == callOff;
+  for (const RISCVPrintfInsn &insn : decoded.instructions) {
+    if (insn.offset == callOff) {
+      reachedCall = true;
+      break;
+    }
+    if (insn.offset > callOff || insn.offset + insn.size > callOff)
+      return false;
+    insns.push_back(insn);
+    if (maxInsns != 0 && insns.size() > maxInsns)
+      insns.erase(insns.begin());
+    if (insn.offset + insn.size == callOff) {
+      reachedCall = true;
+      break;
+    }
+  }
+  return reachedCall;
 }
 
 template <class ELFT>
@@ -4475,6 +4619,497 @@ static bool findRISCVPrintfAbsRel(InputSectionBase &sec, uint64_t off,
     return sym != nullptr;
   }
   return false;
+}
+
+struct RISCVPrintfControlFlowReloc {
+  RelType type = R_RISCV_NONE;
+  InputSectionBase *targetSection = nullptr;
+  uint64_t targetOffset = 0;
+  bool hasTarget = false;
+};
+
+static bool isRISCVPrintfDirectBranchOrJumpReloc(RelType type) {
+  return type == R_RISCV_BRANCH || type == R_RISCV_JAL ||
+         type == R_RISCV_RVC_BRANCH || type == R_RISCV_RVC_JUMP;
+}
+
+template <class ELFT, class RelTy>
+static void recordRISCVPrintfControlFlowReloc(
+    InputSectionBase &sec, const RelTy &rel,
+    DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>> &targets) {
+  RelType type = rel.getType(config->isMips64EL);
+  if (!isRISCVPrintfDirectBranchOrJumpReloc(type) && type != R_RISCV_CALL &&
+      type != R_RISCV_CALL_PLT)
+    return;
+  RISCVPrintfControlFlowReloc info;
+  info.type = type;
+  Symbol &sym = sec.getFile<ELFT>()->getRelocTargetSym(rel);
+  if (Defined *d = dyn_cast<Defined>(&sym)) {
+    info.targetSection = dyn_cast_or_null<InputSectionBase>(d->section);
+    int64_t target =
+        static_cast<int64_t>(d->value) + getRISCVFunctionSplitAddend(rel);
+    if (info.targetSection && target >= 0) {
+      info.targetOffset = target;
+      info.hasTarget = true;
+    }
+  }
+  targets[rel.r_offset].push_back(info);
+}
+
+template <class ELFT>
+static DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>>
+getRISCVPrintfControlFlowRelocs(InputSectionBase &sec) {
+  DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>> targets;
+  RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
+  for (const auto &rel : rels.rels)
+    recordRISCVPrintfControlFlowReloc<ELFT>(sec, rel, targets);
+  for (const auto &rel : rels.relas)
+    recordRISCVPrintfControlFlowReloc<ELFT>(sec, rel, targets);
+  return targets;
+}
+
+static bool isRISCVPrintfNormalDirectCall(
+    const DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>> &relocs,
+    const RISCVPrintfInsn &insn) {
+  if (!insn.controlFlow || !insn.call)
+    return false;
+  if (insn.size == 4 && (insn.raw & 0x7f) == 0x67 && insn.offset >= 4) {
+    auto it = relocs.find(insn.offset - 4);
+    if (it == relocs.end())
+      return false;
+    return llvm::any_of(it->second, [](const RISCVPrintfControlFlowReloc &r) {
+      return r.type == R_RISCV_CALL || r.type == R_RISCV_CALL_PLT;
+    });
+  }
+  auto it = relocs.find(insn.offset);
+  if (it == relocs.end())
+    return false;
+  return llvm::any_of(it->second, [](const RISCVPrintfControlFlowReloc &r) {
+    return r.type == R_RISCV_CALL || r.type == R_RISCV_CALL_PLT ||
+           r.type == R_RISCV_JAL || r.type == R_RISCV_RVC_JUMP;
+  });
+}
+
+static bool isRISCVPrintfReturn(const RISCVPrintfInsn &insn) {
+  if (!insn.controlFlow || insn.call)
+    return false;
+  if (insn.size == 4 && (insn.raw & 0x7f) == 0x67)
+    return insn.rd == 0 && insn.rs1 == 1 &&
+           SignExtend64<12>(insn.raw >> 20) == 0;
+  if (insn.size != 2)
+    return false;
+  uint16_t half = static_cast<uint16_t>(insn.raw);
+  return (half & 0x3) == 2 && ((half >> 13) & 0x7) == 4 &&
+         !(half & 0x1000) && ((half >> 7) & 0x1f) == 1 &&
+         ((half >> 2) & 0x1f) == 0;
+}
+
+static const RISCVPrintfControlFlowReloc *getRISCVPrintfDirectBranchTarget(
+    const DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>> &relocs,
+    const RISCVPrintfInsn &insn) {
+  if (!insn.controlFlow || insn.call)
+    return nullptr;
+  auto it = relocs.find(insn.offset);
+  if (it == relocs.end())
+    return nullptr;
+  const RISCVPrintfControlFlowReloc *found = nullptr;
+  for (const RISCVPrintfControlFlowReloc &r : it->second) {
+    if (!isRISCVPrintfDirectBranchOrJumpReloc(r.type))
+      continue;
+    if (found)
+      return nullptr;
+    found = &r;
+  }
+  return found;
+}
+
+static bool hasRISCVPrintfExternalEntryToInterval(
+    InputSectionBase &sec,
+    const DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>> &relocs,
+    uint64_t begin, uint64_t end) {
+  for (const auto &entry : relocs) {
+    uint64_t source = entry.first;
+    for (const RISCVPrintfControlFlowReloc &r : entry.second) {
+      if (!isRISCVPrintfDirectBranchOrJumpReloc(r.type) &&
+          r.type != R_RISCV_CALL && r.type != R_RISCV_CALL_PLT)
+        continue;
+      if (!r.hasTarget || r.targetSection != &sec)
+        continue;
+      if (r.targetOffset > begin && r.targetOffset <= end &&
+          (source <= begin || source > end))
+        return true;
+    }
+  }
+  return false;
+}
+
+struct RISCVPrintfCalleeSavedCandidate {
+  size_t copyIndex = 0;
+  size_t hiIndex = 0;
+  size_t loIndex = 0;
+  int savedReg = -1;
+  std::string format;
+};
+
+template <class ELFT>
+static bool findRISCVPrintfCalleeSavedCandidate(
+    InputSectionBase &sec, int argReg, ArrayRef<RISCVPrintfInsn> windowInsns,
+    ArrayRef<RISCVPrintfInsn> allInsns,
+    RISCVPrintfCalleeSavedCandidate &candidate) {
+  const RISCVPrintfInsn *copyInsn = nullptr;
+  for (size_t i = windowInsns.size(); i > 0; --i) {
+    const RISCVPrintfInsn &insn = windowInsns[i - 1];
+    if (!insn.supported)
+      return false;
+    if (riscvPrintfInsnWritesReg(insn, argReg)) {
+      copyInsn = &insn;
+      break;
+    }
+  }
+  if (!copyInsn || !copyInsn->copy ||
+      !isRISCVIntegerCalleeSavedReg(copyInsn->copySrc))
+    return false;
+  for (const RISCVPrintfInsn &insn : windowInsns) {
+    if (insn.offset <= copyInsn->offset)
+      continue;
+    if (!insn.supported || insn.controlFlow ||
+        riscvPrintfInsnWritesReg(insn, argReg))
+      return false;
+  }
+
+  size_t copyIndex = allInsns.size();
+  for (size_t i = 0; i != allInsns.size(); ++i)
+    if (allInsns[i].offset == copyInsn->offset) {
+      copyIndex = i;
+      break;
+    }
+  if (copyIndex == allInsns.size())
+    return false;
+
+  int savedReg = copyInsn->copySrc;
+  for (size_t i = copyIndex; i > 0; --i) {
+    const RISCVPrintfInsn &lo = allInsns[i - 1];
+    if (!riscvPrintfInsnWritesReg(lo, savedReg))
+      continue;
+    if (!lo.addi || lo.rd != savedReg || i < 2)
+      return false;
+    const RISCVPrintfInsn &hi = allInsns[i - 2];
+    if (!hi.lui || hi.rd != lo.rs1)
+      return false;
+
+    Defined *hiSym = nullptr, *loSym = nullptr;
+    int64_t hiAddend = 0, loAddend = 0;
+    if (!findRISCVPrintfAbsRel<ELFT>(sec, hi.offset, R_RISCV_HI20, hiSym,
+                                     hiAddend) ||
+        !findRISCVPrintfAbsRel<ELFT>(sec, lo.offset, R_RISCV_LO12_I, loSym,
+                                     loAddend))
+      return false;
+    if (hiSym != loSym || hiAddend != loAddend)
+      return false;
+    std::string text;
+    if (!isRISCVReadOnlyCStringTarget(*loSym, loAddend, text) ||
+        !isRISCVPrintfNonFloatFormat(text))
+      return false;
+    candidate.copyIndex = copyIndex;
+    candidate.hiIndex = i - 2;
+    candidate.loIndex = i - 1;
+    candidate.savedReg = savedReg;
+    candidate.format = std::move(text);
+    return true;
+  }
+  return false;
+}
+
+enum class RISCVPrintfLocalCalleeSavedResult {
+  Proven,
+  ExternalEntry,
+  Failed,
+};
+
+template <class ELFT>
+static RISCVPrintfLocalCalleeSavedResult
+proveRISCVPrintfLocalDominatingCalleeSavedFormat(
+    InputSectionBase &sec, int argReg, ArrayRef<RISCVPrintfInsn> windowInsns,
+    const RISCVPrintfFunctionDecode &decoded,
+    const DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>>
+        &controlFlowRelocs,
+    RISCVPrintfCalleeSavedCandidate &candidate) {
+  if (!findRISCVPrintfCalleeSavedCandidate<ELFT>(
+          sec, argReg, windowInsns, decoded.instructions, candidate))
+    return RISCVPrintfLocalCalleeSavedResult::Failed;
+
+  uint64_t initStart = decoded.instructions[candidate.hiIndex].offset;
+  uint64_t initComplete = decoded.instructions[candidate.loIndex].offset;
+  uint64_t copyOffset = decoded.instructions[candidate.copyIndex].offset;
+  if (hasRISCVPrintfExternalEntryToInterval(sec, controlFlowRelocs, initStart,
+                                            copyOffset))
+    return RISCVPrintfLocalCalleeSavedResult::ExternalEntry;
+
+  for (const RISCVPrintfInsn &insn : decoded.instructions) {
+    if (insn.offset <= initComplete)
+      continue;
+    if (insn.offset >= copyOffset)
+      break;
+    if (!insn.supported || riscvPrintfInsnWritesReg(insn, candidate.savedReg))
+      return RISCVPrintfLocalCalleeSavedResult::Failed;
+    if (!insn.controlFlow)
+      continue;
+    if (isRISCVPrintfNormalDirectCall(controlFlowRelocs, insn) ||
+        isRISCVPrintfReturn(insn))
+      continue;
+    const RISCVPrintfControlFlowReloc *target =
+        getRISCVPrintfDirectBranchTarget(controlFlowRelocs, insn);
+    if (!target || !target->hasTarget)
+      return RISCVPrintfLocalCalleeSavedResult::Failed;
+  }
+  return RISCVPrintfLocalCalleeSavedResult::Proven;
+}
+
+template <class ELFT>
+static bool proveRISCVPrintfLoopCarriedCalleeSavedFormat(
+    InputSectionBase &sec, int argReg, ArrayRef<RISCVPrintfInsn> windowInsns,
+    const RISCVPrintfFunctionDecode &decoded,
+    const DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>>
+        &controlFlowRelocs,
+    RISCVPrintfCalleeSavedCandidate &candidate) {
+  if (candidate.savedReg < 0 &&
+      !findRISCVPrintfCalleeSavedCandidate<ELFT>(
+          sec, argReg, windowInsns, decoded.instructions, candidate))
+    return false;
+
+  uint64_t initStart = decoded.instructions[candidate.hiIndex].offset;
+  uint64_t initComplete = decoded.instructions[candidate.loIndex].offset;
+  uint64_t copyOffset = decoded.instructions[candidate.copyIndex].offset;
+  DenseSet<uint64_t> decodedOffsets;
+  for (const RISCVPrintfInsn &insn : decoded.instructions)
+    decodedOffsets.insert(insn.offset);
+  if (!decodedOffsets.contains(initStart) ||
+      !decodedOffsets.contains(initComplete) || !decodedOffsets.contains(copyOffset))
+    return false;
+
+  uint64_t regionEnd = copyOffset;
+  bool sawBackedge = false;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &entry : controlFlowRelocs) {
+      uint64_t source = entry.first;
+      for (const RISCVPrintfControlFlowReloc &r : entry.second) {
+        if (!isRISCVPrintfDirectBranchOrJumpReloc(r.type))
+          continue;
+        if (!r.hasTarget || r.targetSection != &sec)
+          continue;
+        if (source > regionEnd && r.targetOffset > initComplete &&
+            r.targetOffset <= regionEnd) {
+          if (source < decoded.start || source >= decoded.end ||
+              source >= decoded.decodedEnd || r.targetOffset < decoded.start ||
+              r.targetOffset >= decoded.end ||
+              r.targetOffset >= decoded.decodedEnd ||
+              !decodedOffsets.contains(source) ||
+              !decodedOffsets.contains(r.targetOffset))
+            return false;
+          sawBackedge = true;
+          regionEnd = source;
+          changed = true;
+        }
+      }
+    }
+  }
+  if (!sawBackedge || regionEnd >= decoded.end || regionEnd >= decoded.decodedEnd)
+    return false;
+
+  if (hasRISCVPrintfExternalEntryToInterval(sec, controlFlowRelocs, initStart,
+                                            regionEnd))
+    return false;
+
+  for (const RISCVPrintfInsn &insn : decoded.instructions) {
+    if (insn.offset <= initComplete)
+      continue;
+    if (insn.offset > regionEnd)
+      break;
+    if (!insn.supported || riscvPrintfInsnWritesReg(insn, candidate.savedReg))
+      return false;
+    if (!insn.controlFlow)
+      continue;
+    if (isRISCVPrintfNormalDirectCall(controlFlowRelocs, insn) ||
+        isRISCVPrintfReturn(insn))
+      continue;
+    const RISCVPrintfControlFlowReloc *target =
+        getRISCVPrintfDirectBranchTarget(controlFlowRelocs, insn);
+    if (!target || !target->hasTarget)
+      return false;
+  }
+  return true;
+}
+
+struct RISCVPrintfRegDef {
+  bool proven = false;
+  std::string format;
+};
+
+template <class ELFT>
+static RISCVPrintfRegDef classifyRISCVPrintfRegDef(
+    InputSectionBase &sec, ArrayRef<RISCVPrintfInsn> insns, size_t beforeIndex,
+    int reg, unsigned depth = 0) {
+  RISCVPrintfRegDef result;
+  if (reg <= 0 || depth > 6)
+    return result;
+  for (size_t i = beforeIndex; i > 0; --i) {
+    const RISCVPrintfInsn &def = insns[i - 1];
+    if (!riscvPrintfInsnWritesReg(def, reg))
+      continue;
+    if (def.copy)
+      return classifyRISCVPrintfRegDef<ELFT>(sec, insns, i - 1, def.copySrc,
+                                             depth + 1);
+    if (!def.addi || def.rd != reg || i < 2)
+      return result;
+    const RISCVPrintfInsn &hi = insns[i - 2];
+    if (!hi.lui || hi.rd != def.rs1)
+      return result;
+    Defined *hiSym = nullptr, *loSym = nullptr;
+    int64_t hiAddend = 0, loAddend = 0;
+    if (!findRISCVPrintfAbsRel<ELFT>(sec, hi.offset, R_RISCV_HI20, hiSym,
+                                     hiAddend) ||
+        !findRISCVPrintfAbsRel<ELFT>(sec, def.offset, R_RISCV_LO12_I, loSym,
+                                     loAddend))
+      return result;
+    if (hiSym != loSym || hiAddend != loAddend)
+      return result;
+    if (isRISCVReadOnlyCStringTarget(*loSym, loAddend, result.format) &&
+        isRISCVPrintfNonFloatFormat(result.format))
+      result.proven = true;
+    return result;
+  }
+  return result;
+}
+
+static bool riscvPrintfStackSlotRangeClean(ArrayRef<RISCVPrintfInsn> insns,
+                                           uint64_t beginOff,
+                                           uint64_t endOff,
+                                           int64_t stackOffset) {
+  for (const RISCVPrintfInsn &insn : insns) {
+    if (insn.offset < beginOff || insn.offset > endOff)
+      continue;
+    if (!insn.supported || riscvPrintfInsnMayModifySP(insn))
+      return false;
+    if (insn.stackStore && insn.stackOffset == stackOffset)
+      return false;
+  }
+  return true;
+}
+
+template <class ELFT>
+static bool proveRISCVPrintfLoopCarriedStackFormat(
+    InputSectionBase &sec, int argReg, const RISCVPrintfFunctionDecode &decoded,
+    uint64_t callOff,
+    const DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>>
+        &controlFlowRelocs) {
+  ArrayRef<RISCVPrintfInsn> allInsns = decoded.instructions;
+  size_t callIndex = allInsns.size();
+  for (size_t i = 0; i != allInsns.size(); ++i)
+    if (allInsns[i].offset == callOff) {
+      callIndex = i;
+      break;
+    }
+  if (callIndex == allInsns.size())
+    return false;
+
+  const RISCVPrintfInsn *load = nullptr;
+  size_t loadIndex = 0;
+  for (size_t i = callIndex; i > 0; --i) {
+    const RISCVPrintfInsn &insn = allInsns[i - 1];
+    if (!riscvPrintfInsnWritesReg(insn, argReg))
+      continue;
+    if (insn.stackLoad && insn.rs1 == 2) {
+      load = &insn;
+      loadIndex = i - 1;
+    }
+    break;
+  }
+  if (!load)
+    return false;
+
+  const RISCVPrintfInsn *store = nullptr;
+  size_t storeIndex = 0;
+  for (size_t i = loadIndex; i > 0; --i) {
+    const RISCVPrintfInsn &candidate = allInsns[i - 1];
+    if (!candidate.stackStore || candidate.rs1 != 2 ||
+        candidate.stackOffset != load->stackOffset)
+      continue;
+    store = &candidate;
+    storeIndex = i - 1;
+    break;
+  }
+  if (!store)
+    return false;
+
+  RISCVPrintfRegDef def =
+      classifyRISCVPrintfRegDef<ELFT>(sec, allInsns, storeIndex, store->copySrc);
+  if (!def.proven)
+    return false;
+
+  uint64_t storeOffset = store->offset;
+  uint64_t loadOffset = load->offset;
+  DenseSet<uint64_t> decodedOffsets;
+  for (const RISCVPrintfInsn &insn : decoded.instructions)
+    decodedOffsets.insert(insn.offset);
+  if (!decodedOffsets.contains(storeOffset) || !decodedOffsets.contains(loadOffset))
+    return false;
+
+  uint64_t regionEnd = loadOffset;
+  bool sawBackedge = false;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &entry : controlFlowRelocs) {
+      uint64_t source = entry.first;
+      for (const RISCVPrintfControlFlowReloc &r : entry.second) {
+        if (!isRISCVPrintfDirectBranchOrJumpReloc(r.type))
+          continue;
+        if (!r.hasTarget || r.targetSection != &sec)
+          continue;
+        if (source > regionEnd && r.targetOffset > storeOffset &&
+            r.targetOffset <= regionEnd) {
+          if (source < decoded.start || source >= decoded.end ||
+              source >= decoded.decodedEnd || r.targetOffset < decoded.start ||
+              r.targetOffset >= decoded.end ||
+              r.targetOffset >= decoded.decodedEnd ||
+              !decodedOffsets.contains(source) ||
+              !decodedOffsets.contains(r.targetOffset))
+            return false;
+          sawBackedge = true;
+          regionEnd = source;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  if (!sawBackedge)
+    return false;
+  if (!riscvPrintfStackSlotRangeClean(allInsns, storeOffset + store->size,
+                                      regionEnd, load->stackOffset))
+    return false;
+  if (hasRISCVPrintfExternalEntryToInterval(sec, controlFlowRelocs, storeOffset,
+                                            regionEnd))
+    return false;
+
+  for (const RISCVPrintfInsn &insn : decoded.instructions) {
+    if (insn.offset <= storeOffset)
+      continue;
+    if (insn.offset > regionEnd)
+      break;
+    if (!insn.controlFlow)
+      continue;
+    if (isRISCVPrintfNormalDirectCall(controlFlowRelocs, insn) ||
+        isRISCVPrintfReturn(insn))
+      continue;
+    const RISCVPrintfControlFlowReloc *target =
+        getRISCVPrintfDirectBranchTarget(controlFlowRelocs, insn);
+    if (!target || !target->hasTarget)
+      return false;
+  }
+  return true;
 }
 
 template <class ELFT, class RelTy>
@@ -4607,6 +5242,59 @@ static bool proveRISCVPrintfEntryCalleeSavedFormat(InputSectionBase &sec,
          isRISCVPrintfNonFloatFormat(text);
 }
 
+template <class ELFT, class RelTy>
+static bool proveRISCVPrintfCallsiteFormat(InputSectionBase &sec,
+                                           Defined &source, const RelTy &rel,
+                                           Defined &target) {
+  if (proveRISCVPrintfDirectAbsFormat<ELFT>(sec, source, rel, target) ||
+      proveRISCVPrintfEntryCalleeSavedFormat<ELFT>(sec, source, rel, target))
+    return true;
+
+  int argReg = getRISCVPrintfFormatArgReg(target.getName());
+  if (argReg < 0 || !(sec.flags & SHF_EXECINSTR))
+    return false;
+  RISCVPrintfFunctionDecode decoded;
+  if (!decodeRISCVPrintfFunction(sec, source, decoded))
+    return false;
+
+  SmallVector<RISCVPrintfInsn, 0> windowInsns;
+  if (!collectRISCVPrintfInsnsBeforeCall(decoded, rel.r_offset, windowInsns, 16))
+    return false;
+
+  DenseMap<uint64_t, SmallVector<RISCVPrintfControlFlowReloc, 0>>
+      controlFlowRelocs = getRISCVPrintfControlFlowRelocs<ELFT>(sec);
+  RISCVPrintfCalleeSavedCandidate candidate;
+  RISCVPrintfLocalCalleeSavedResult local =
+      proveRISCVPrintfLocalDominatingCalleeSavedFormat<ELFT>(
+          sec, argReg, windowInsns, decoded, controlFlowRelocs, candidate);
+  if (local == RISCVPrintfLocalCalleeSavedResult::Proven)
+    return true;
+  if (local == RISCVPrintfLocalCalleeSavedResult::ExternalEntry &&
+      proveRISCVPrintfLoopCarriedCalleeSavedFormat<ELFT>(
+          sec, argReg, windowInsns, decoded, controlFlowRelocs, candidate))
+    return true;
+
+  if (proveRISCVPrintfLoopCarriedStackFormat<ELFT>(
+          sec, argReg, decoded, rel.r_offset, controlFlowRelocs))
+    return true;
+
+  for (size_t i = windowInsns.size(); i > 0; --i) {
+    const RISCVPrintfInsn &def = windowInsns[i - 1];
+    if (!def.supported)
+      return false;
+    if (!riscvPrintfInsnWritesReg(def, argReg))
+      continue;
+    for (size_t j = i; j < windowInsns.size(); ++j)
+      if (!windowInsns[j].supported || windowInsns[j].controlFlow ||
+          riscvPrintfInsnWritesReg(windowInsns[j], argReg))
+        return false;
+    RISCVPrintfRegDef regDef =
+        classifyRISCVPrintfRegDef<ELFT>(sec, windowInsns, i, argReg);
+    return regDef.proven;
+  }
+  return false;
+}
+
 static bool isRISCVPrintfCallPair(ArrayRef<uint8_t> content, uint64_t off) {
   if (off > content.size() || content.size() - off < 8)
     return false;
@@ -4682,10 +5370,7 @@ template <class ELFT> static void specializeRISCVPrintf() {
       sawRoute = true;
       if (!seenCalls.insert({sec, rel.r_offset, target}).second)
         continue;
-      if (!proveRISCVPrintfDirectAbsFormat<ELFT>(*sec, *source, rel,
-                                                 *target) &&
-          !proveRISCVPrintfEntryCalleeSavedFormat<ELFT>(*sec, *source, rel,
-                                                        *target))
+      if (!proveRISCVPrintfCallsiteFormat<ELFT>(*sec, *source, rel, *target))
         return;
     }
   }
