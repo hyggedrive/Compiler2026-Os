@@ -379,6 +379,10 @@ def print_riscv_function_sections_split: FF<"print-riscv-function-sections-split
   HelpText<"Print RISC-V function section split audit statistics">,
   Flags<[HelpHidden]>;
 
+def print_riscv_printf_stack_proof: FF<"print-riscv-printf-stack-proof">,
+  HelpText<"Print RISC-V printf stack-slot proof diagnostics">,
+  Flags<[HelpHidden]>;
+
 def riscv_printf_specialization: FF<"riscv-printf-specialization">,
   HelpText<"Enable experimental RISC-V printf specialization">,
   Flags<[HelpHidden]>;

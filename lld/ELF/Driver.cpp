@@ -1371,6 +1371,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printMemoryUsage = args.hasArg(OPT_print_memory_usage);
   config->printRISCVFunctionSectionsSplit =
       args.hasArg(OPT_print_riscv_function_sections_split);
+  config->printRISCVPrintfStackProof =
+      args.hasArg(OPT_print_riscv_printf_stack_proof);
   config->riscvPrintfSpecialization =
       args.hasArg(OPT_riscv_printf_specialization);
   config->printArchiveStats = args.getLastArgValue(OPT_print_archive_stats);
@@ -4520,6 +4522,65 @@ static bool riscvPrintfStackSlotRangeClean(ArrayRef<RISCVPrintfInsn> insns,
   return true;
 }
 
+struct RISCVPrintfStackProofDiag {
+  uint64_t attempts = 0;
+  uint64_t loadRecognized = 0;
+  uint64_t storeFound = 0;
+  uint64_t storeConstFormat = 0;
+  uint64_t fullDecodeOk = 0;
+  uint64_t backedgeFound = 0;
+  uint64_t backedgeTargetResolved = 0;
+  uint64_t loopRangeClean = 0;
+  uint64_t initialEntrySafe = 0;
+  uint64_t proofSuccess = 0;
+
+  bool firstFailure = false;
+  uint64_t callOffset = UINT64_MAX;
+  uint64_t loadOffset = UINT64_MAX;
+  int64_t stackOffset = INT64_MAX;
+  uint64_t storeOffset = UINT64_MAX;
+  int storeSourceReg = -1;
+  std::string storeFormat = "none";
+  uint64_t backedgeSource = UINT64_MAX;
+  uint64_t backedgeTarget = UINT64_MAX;
+  std::string failReason = "none";
+};
+
+static std::string riscvPrintfHexOrNone(uint64_t value) {
+  if (value == UINT64_MAX)
+    return "none";
+  return (Twine("0x") + Twine::utohexstr(value)).str();
+}
+
+static std::string riscvPrintfIntOrNone(int64_t value) {
+  if (value == INT64_MAX)
+    return "none";
+  return Twine(value).str();
+}
+
+static std::string riscvPrintfOneLine(StringRef value) {
+  std::string out;
+  for (char c : value) {
+    if (c == '\n')
+      out += "\\n";
+    else if (c == '\t')
+      out += "\\t";
+    else if (c == '\r')
+      out += "\\r";
+    else
+      out.push_back(c);
+  }
+  return out;
+}
+
+static void recordRISCVPrintfStackFailure(RISCVPrintfStackProofDiag *diag,
+                                          StringRef reason) {
+  if (!diag || diag->firstFailure)
+    return;
+  diag->firstFailure = true;
+  diag->failReason = reason.str();
+}
+
 template <class ELFT>
 static bool findRISCVPrintfAbsRel(InputSectionBase &sec, uint64_t off,
                                   RelType wanted, Defined *&sym,
@@ -4588,16 +4649,23 @@ template <class ELFT>
 static bool riscvPrintfStackSlotPathSafe(InputSectionBase &sec,
                                          ArrayRef<RISCVPrintfInsn> insns,
                                          size_t storeIndex, size_t loadIndex,
-                                         int64_t stackOffset) {
+                                         int64_t stackOffset,
+                                         RISCVPrintfStackProofDiag *diag) {
   uint64_t storeOff = insns[storeIndex].offset;
   uint64_t loadOff = insns[loadIndex].offset;
   if (!riscvPrintfStackSlotRangeClean(insns, storeOff + insns[storeIndex].size,
-                                      loadOff, stackOffset))
+                                      loadOff, stackOffset)) {
+    recordRISCVPrintfStackFailure(diag, "store-load-range-clobbered");
     return false;
+  }
+  if (diag)
+    ++diag->loopRangeClean;
 
   RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
-  if (rels.areRelocsRel())
+  if (rels.areRelocsRel()) {
+    recordRISCVPrintfStackFailure(diag, "unsupported-rel-relocations");
     return false;
+  }
 
   SmallVector<std::pair<uint64_t, uint64_t>, 0> localEdges;
   for (const auto &rel : rels.relas) {
@@ -4605,8 +4673,10 @@ static bool riscvPrintfStackSlotPathSafe(InputSectionBase &sec,
     if (!isRISCVPrintfLocalBranchRel(type))
       continue;
     uint64_t target = 0;
-    if (!getRISCVPrintfRelTargetOffset<ELFT>(sec, rel, target))
+    if (!getRISCVPrintfRelTargetOffset<ELFT>(sec, rel, target)) {
+      recordRISCVPrintfStackFailure(diag, "backedge-target-unresolved");
       return false;
+    }
     localEdges.push_back({rel.r_offset, target});
   }
 
@@ -4619,16 +4689,30 @@ static bool riscvPrintfStackSlotPathSafe(InputSectionBase &sec,
 
     // An edge from before the initializer into the store/load interval would
     // bypass the constant store.
-    if (source < storeOff)
+    if (source < storeOff) {
+      recordRISCVPrintfStackFailure(diag, "external-entry");
       return false;
+    }
 
     // A normal loop backedge may re-enter between the initializer and the load.
     // It is safe only if the whole loop interval preserves the stack slot.
     if (source > loadOff && target < source) {
-      if (sawBackedge)
+      if (sawBackedge) {
+        recordRISCVPrintfStackFailure(diag, "unsupported-control-flow");
         return false;
-      if (!riscvPrintfStackSlotRangeClean(insns, target, source, stackOffset))
+      }
+      if (diag) {
+        ++diag->backedgeFound;
+        ++diag->backedgeTargetResolved;
+        diag->backedgeSource = source;
+        diag->backedgeTarget = target;
+      }
+      if (!riscvPrintfStackSlotRangeClean(insns, target, source, stackOffset)) {
+        recordRISCVPrintfStackFailure(diag, "loop-range-clobbered");
         return false;
+      }
+      if (diag)
+        ++diag->loopRangeClean;
       sawBackedge = true;
       loopStart = target;
       loopEnd = source;
@@ -4637,12 +4721,17 @@ static bool riscvPrintfStackSlotPathSafe(InputSectionBase &sec,
 
     // Other incoming edges into the store/load interval are not modeled unless
     // they originate inside the same linear interval.
-    if (source > loadOff)
+    if (source > loadOff) {
+      recordRISCVPrintfStackFailure(diag, "external-entry");
       return false;
+    }
   }
 
-  if (!sawBackedge)
+  if (!sawBackedge) {
+    if (diag)
+      ++diag->initialEntrySafe;
     return true;
+  }
 
   for (auto [source, target] : localEdges) {
     bool sourceInLoop = source >= loopStart && source <= loopEnd;
@@ -4655,8 +4744,11 @@ static bool riscvPrintfStackSlotPathSafe(InputSectionBase &sec,
       continue;
 
     // Any other external direct edge into the loop body is an unmodeled entry.
+    recordRISCVPrintfStackFailure(diag, "external-entry");
     return false;
   }
+  if (diag)
+    ++diag->initialEntrySafe;
   return true;
 }
 
@@ -4664,22 +4756,35 @@ template <class ELFT, class RelTy>
 static bool proveRISCVPrintfLoopCarriedStackFormat(InputSectionBase &sec,
                                                    Defined &source,
                                                    const RelTy &rel,
-                                                   Defined &target) {
+                                                   Defined &target,
+                                                   RISCVPrintfStackProofDiag *diag) {
+  if (diag) {
+    ++diag->attempts;
+    diag->callOffset = rel.r_offset;
+  }
   int argReg = getRISCVPrintfFormatArgReg(target.getName());
-  if (argReg < 0 || !(sec.flags & SHF_EXECINSTR))
+  if (argReg < 0 || !(sec.flags & SHF_EXECINSTR)) {
+    recordRISCVPrintfStackFailure(diag, "unsupported-target");
     return false;
+  }
   ArrayRef<uint8_t> data = sec.content();
-  if (rel.r_offset < source.value || rel.r_offset > data.size())
+  if (rel.r_offset < source.value || rel.r_offset > data.size()) {
+    recordRISCVPrintfStackFailure(diag, "call-out-of-range");
     return false;
+  }
 
   SmallVector<RISCVPrintfInsn, 0> insns;
   for (uint64_t off = source.value; off < rel.r_offset;) {
     RISCVPrintfInsn insn;
-    if (!decodeRISCVPrintfInsn(data, off, insn))
+    if (!decodeRISCVPrintfInsn(data, off, insn)) {
+      recordRISCVPrintfStackFailure(diag, "decode-stops-at-call");
       return false;
+    }
     insns.push_back(insn);
     off += insn.size;
   }
+  if (diag)
+    ++diag->fullDecodeOk;
 
   const RISCVPrintfInsn *load = nullptr;
   size_t loadIndex = 0;
@@ -4687,14 +4792,23 @@ static bool proveRISCVPrintfLoopCarriedStackFormat(InputSectionBase &sec,
     const RISCVPrintfInsn &insn = insns[i - 1];
     if (!riscvPrintfInsnWritesReg(insn, argReg))
       continue;
-    if (!insn.stackLoad || insn.rs1 != 2)
+    if (!insn.stackLoad || insn.rs1 != 2) {
+      recordRISCVPrintfStackFailure(diag, "no-stack-load");
       return false;
+    }
     load = &insn;
     loadIndex = i - 1;
     break;
   }
-  if (!load)
+  if (!load) {
+    recordRISCVPrintfStackFailure(diag, "no-stack-load");
     return false;
+  }
+  if (diag) {
+    ++diag->loadRecognized;
+    diag->loadOffset = load->offset;
+    diag->stackOffset = load->stackOffset;
+  }
 
   const RISCVPrintfInsn *store = nullptr;
   size_t storeIndex = 0;
@@ -4707,15 +4821,32 @@ static bool proveRISCVPrintfLoopCarriedStackFormat(InputSectionBase &sec,
     storeIndex = i - 1;
     break;
   }
-  if (!store)
+  if (!store) {
+    recordRISCVPrintfStackFailure(diag, "no-store");
     return false;
+  }
+  if (diag) {
+    ++diag->storeFound;
+    diag->storeOffset = store->offset;
+    diag->storeSourceReg = store->rs2;
+  }
 
   std::string text;
   if (!proveRISCVPrintfRegConstantFormat<ELFT>(sec, insns, storeIndex,
-                                               store->rs2, text))
+                                               store->rs2, text)) {
+    recordRISCVPrintfStackFailure(diag, "store-source-not-constant");
     return false;
-  return riscvPrintfStackSlotPathSafe<ELFT>(sec, insns, storeIndex, loadIndex,
-                                            load->stackOffset);
+  }
+  if (diag) {
+    ++diag->storeConstFormat;
+    diag->storeFormat = text;
+  }
+  if (!riscvPrintfStackSlotPathSafe<ELFT>(sec, insns, storeIndex, loadIndex,
+                                          load->stackOffset, diag))
+    return false;
+  if (diag)
+    ++diag->proofSuccess;
+  return true;
 }
 
 template <class ELFT>
@@ -4884,6 +5015,9 @@ template <class ELFT> static void specializeRISCVPrintf() {
       config->relocatable)
     return;
 
+  RISCVPrintfStackProofDiag stackDiag;
+  RISCVPrintfStackProofDiag *stackDiagPtr =
+      config->printRISCVPrintfStackProof ? &stackDiag : nullptr;
   SmallVector<Defined *, 0> printfCores;
   for (ELFFileBase *file : ctx.objectFiles)
     for (Symbol *sym : file->getSymbols())
@@ -4897,6 +5031,7 @@ template <class ELFT> static void specializeRISCVPrintf() {
     return;
 
   bool sawRoute = false;
+  bool routesSafe = true;
   std::set<std::tuple<InputSectionBase *, uint64_t, Defined *>> seenCalls;
   for (InputSectionBase *sec : ctx.inputSections) {
     if (!sec || sec == &InputSection::discarded || !sec->file ||
@@ -4938,15 +5073,64 @@ template <class ELFT> static void specializeRISCVPrintf() {
       sawRoute = true;
       if (!seenCalls.insert({sec, rel.r_offset, target}).second)
         continue;
-      if (!proveRISCVPrintfDirectAbsFormat<ELFT>(*sec, *source, rel,
-                                                 *target) &&
-          !proveRISCVPrintfEntryCalleeSavedFormat<ELFT>(*sec, *source, rel,
-                                                        *target) &&
-          !proveRISCVPrintfLoopCarriedStackFormat<ELFT>(*sec, *source, rel,
-                                                        *target))
+      bool direct =
+          proveRISCVPrintfDirectAbsFormat<ELFT>(*sec, *source, rel, *target);
+      bool entry = false;
+      bool stack = false;
+      if (!direct)
+        entry = proveRISCVPrintfEntryCalleeSavedFormat<ELFT>(*sec, *source,
+                                                             rel, *target);
+      if (!direct && !entry)
+        stack = proveRISCVPrintfLoopCarriedStackFormat<ELFT>(
+            *sec, *source, rel, *target, stackDiagPtr);
+      if (!direct && !entry && !stack) {
+        routesSafe = false;
+        if (stackDiagPtr)
+          continue;
         return;
+      }
     }
   }
+  if (stackDiagPtr) {
+    message(Twine("printf_stack_attempts=") + Twine(stackDiag.attempts));
+    message(Twine("printf_stack_load_recognized=") +
+            Twine(stackDiag.loadRecognized));
+    message(Twine("printf_stack_store_found=") +
+            Twine(stackDiag.storeFound));
+    message(Twine("printf_stack_store_const_format=") +
+            Twine(stackDiag.storeConstFormat));
+    message(Twine("printf_stack_full_decode_ok=") +
+            Twine(stackDiag.fullDecodeOk));
+    message(Twine("printf_stack_backedge_found=") +
+            Twine(stackDiag.backedgeFound));
+    message(Twine("printf_stack_backedge_target_resolved=") +
+            Twine(stackDiag.backedgeTargetResolved));
+    message(Twine("printf_stack_loop_range_clean=") +
+            Twine(stackDiag.loopRangeClean));
+    message(Twine("printf_stack_initial_entry_safe=") +
+            Twine(stackDiag.initialEntrySafe));
+    message(Twine("printf_stack_proof_success=") +
+            Twine(stackDiag.proofSuccess));
+    if (stackDiag.firstFailure) {
+      std::string line =
+          (Twine("printf_stack_first_failure call_offset=") +
+           riscvPrintfHexOrNone(stackDiag.callOffset) +
+           " load_offset=" + riscvPrintfHexOrNone(stackDiag.loadOffset) +
+           " stack_offset=" + riscvPrintfIntOrNone(stackDiag.stackOffset) +
+           " store_offset=" + riscvPrintfHexOrNone(stackDiag.storeOffset) +
+           " store_source_reg=" + Twine(stackDiag.storeSourceReg) +
+           " store_format=\"" + riscvPrintfOneLine(stackDiag.storeFormat) +
+           "\" backedge_source=" +
+           riscvPrintfHexOrNone(stackDiag.backedgeSource) +
+           " backedge_target=" +
+           riscvPrintfHexOrNone(stackDiag.backedgeTarget) +
+           " fail_reason=" + stackDiag.failReason)
+              .str();
+      message(line);
+    }
+  }
+  if (!routesSafe)
+    return;
   if (!sawRoute)
     return;
 
