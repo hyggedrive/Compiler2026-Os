@@ -4503,6 +4503,23 @@ static bool riscvPrintfInsnMayModifySP(const RISCVPrintfInsn &insn) {
   return riscvPrintfInsnWritesReg(insn, 2);
 }
 
+static bool riscvPrintfStackSlotRangeClean(ArrayRef<RISCVPrintfInsn> insns,
+                                           uint64_t beginOff,
+                                           uint64_t endOff,
+                                           int64_t stackOffset) {
+  for (const RISCVPrintfInsn &insn : insns) {
+    if (insn.offset < beginOff || insn.offset > endOff)
+      continue;
+    if (riscvPrintfInsnMayModifySP(insn))
+      return false;
+    if (insn.stackStore && insn.stackOffset == stackOffset)
+      return false;
+    if (insn.memoryStore && !insn.stackStore)
+      return false;
+  }
+  return true;
+}
+
 template <class ELFT>
 static bool findRISCVPrintfAbsRel(InputSectionBase &sec, uint64_t off,
                                   RelType wanted, Defined *&sym,
@@ -4572,21 +4589,17 @@ static bool riscvPrintfStackSlotPathSafe(InputSectionBase &sec,
                                          ArrayRef<RISCVPrintfInsn> insns,
                                          size_t storeIndex, size_t loadIndex,
                                          int64_t stackOffset) {
-  for (size_t i = storeIndex + 1; i < loadIndex; ++i) {
-    const RISCVPrintfInsn &insn = insns[i];
-    if (riscvPrintfInsnMayModifySP(insn))
-      return false;
-    if (insn.stackStore && insn.stackOffset == stackOffset)
-      return false;
-    if (insn.memoryStore && !insn.stackStore)
-      return false;
-  }
+  uint64_t storeOff = insns[storeIndex].offset;
+  uint64_t loadOff = insns[loadIndex].offset;
+  if (!riscvPrintfStackSlotRangeClean(insns, storeOff + insns[storeIndex].size,
+                                      loadOff, stackOffset))
+    return false;
 
   RelsOrRelas<ELFT> rels = sec.template relsOrRelas<ELFT>();
   if (rels.areRelocsRel())
     return false;
-  uint64_t storeOff = insns[storeIndex].offset;
-  uint64_t loadOff = insns[loadIndex].offset;
+
+  SmallVector<std::pair<uint64_t, uint64_t>, 0> localEdges;
   for (const auto &rel : rels.relas) {
     RelType type = rel.getType(config->isMips64EL);
     if (!isRISCVPrintfLocalBranchRel(type))
@@ -4594,8 +4607,55 @@ static bool riscvPrintfStackSlotPathSafe(InputSectionBase &sec,
     uint64_t target = 0;
     if (!getRISCVPrintfRelTargetOffset<ELFT>(sec, rel, target))
       return false;
-    if (rel.r_offset < storeOff && target > storeOff && target <= loadOff)
+    localEdges.push_back({rel.r_offset, target});
+  }
+
+  bool sawBackedge = false;
+  uint64_t loopStart = 0;
+  uint64_t loopEnd = 0;
+  for (auto [source, target] : localEdges) {
+    if (!(target > storeOff && target <= loadOff))
+      continue;
+
+    // An edge from before the initializer into the store/load interval would
+    // bypass the constant store.
+    if (source < storeOff)
       return false;
+
+    // A normal loop backedge may re-enter between the initializer and the load.
+    // It is safe only if the whole loop interval preserves the stack slot.
+    if (source > loadOff && target < source) {
+      if (sawBackedge)
+        return false;
+      if (!riscvPrintfStackSlotRangeClean(insns, target, source, stackOffset))
+        return false;
+      sawBackedge = true;
+      loopStart = target;
+      loopEnd = source;
+      continue;
+    }
+
+    // Other incoming edges into the store/load interval are not modeled unless
+    // they originate inside the same linear interval.
+    if (source > loadOff)
+      return false;
+  }
+
+  if (!sawBackedge)
+    return true;
+
+  for (auto [source, target] : localEdges) {
+    bool sourceInLoop = source >= loopStart && source <= loopEnd;
+    bool targetInLoop = target >= loopStart && target <= loopEnd;
+    if (!targetInLoop || sourceInLoop)
+      continue;
+
+    // Allow the initial entry into the loop header only after the initializer.
+    if (target == loopStart && source > storeOff && source < loopStart)
+      continue;
+
+    // Any other external direct edge into the loop body is an unmodeled entry.
+    return false;
   }
   return true;
 }
