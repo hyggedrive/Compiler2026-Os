@@ -4527,6 +4527,11 @@ struct RISCVPrintfStackProofDiag {
   uint64_t loadRecognized = 0;
   uint64_t storeFound = 0;
   uint64_t storeConstFormat = 0;
+  uint64_t storeSourceDirectAbs = 0;
+  uint64_t storeSourceCopy = 0;
+  uint64_t storeSourceCalleeSaved = 0;
+  uint64_t storeSourceStackLoad = 0;
+  uint64_t storeSourceUnknown = 0;
   uint64_t fullDecodeOk = 0;
   uint64_t backedgeFound = 0;
   uint64_t backedgeTargetResolved = 0;
@@ -4544,6 +4549,24 @@ struct RISCVPrintfStackProofDiag {
   uint64_t backedgeSource = UINT64_MAX;
   uint64_t backedgeTarget = UINT64_MAX;
   std::string failReason = "none";
+};
+
+enum class RISCVPrintfRegDefKind {
+  Unknown,
+  DirectAbs,
+  Copy,
+  CalleeSaved,
+  StackLoad,
+};
+
+struct RISCVPrintfRegDefDiag {
+  RISCVPrintfRegDefKind kind = RISCVPrintfRegDefKind::Unknown;
+  uint64_t offset = UINT64_MAX;
+  int copySrc = -1;
+  bool copySrcIsCalleeSaved = false;
+  bool constantFormatProven = false;
+  std::string format = "none";
+  std::string reason = "not-proven";
 };
 
 static std::string riscvPrintfHexOrNone(uint64_t value) {
@@ -4581,10 +4604,38 @@ static void recordRISCVPrintfStackFailure(RISCVPrintfStackProofDiag *diag,
   diag->failReason = reason.str();
 }
 
+static void countRISCVPrintfRegDefKind(RISCVPrintfStackProofDiag *diag,
+                                       RISCVPrintfRegDefKind kind) {
+  if (!diag)
+    return;
+  switch (kind) {
+  case RISCVPrintfRegDefKind::DirectAbs:
+    ++diag->storeSourceDirectAbs;
+    return;
+  case RISCVPrintfRegDefKind::Copy:
+    ++diag->storeSourceCopy;
+    return;
+  case RISCVPrintfRegDefKind::CalleeSaved:
+    ++diag->storeSourceCalleeSaved;
+    return;
+  case RISCVPrintfRegDefKind::StackLoad:
+    ++diag->storeSourceStackLoad;
+    return;
+  case RISCVPrintfRegDefKind::Unknown:
+    ++diag->storeSourceUnknown;
+    return;
+  }
+}
+
 template <class ELFT>
 static bool findRISCVPrintfAbsRel(InputSectionBase &sec, uint64_t off,
                                   RelType wanted, Defined *&sym,
                                   int64_t &addend);
+
+template <class ELFT>
+static RISCVPrintfRegDefDiag classifyRISCVPrintfRegDef(
+    InputSectionBase &sec, ArrayRef<RISCVPrintfInsn> insns, size_t beforeIndex,
+    int reg, unsigned depth = 0);
 
 template <class ELFT>
 static bool proveRISCVPrintfRegConstantFormat(InputSectionBase &sec,
@@ -4592,38 +4643,106 @@ static bool proveRISCVPrintfRegConstantFormat(InputSectionBase &sec,
                                               size_t beforeIndex, int reg,
                                               std::string &text,
                                               unsigned depth = 0) {
-  if (reg <= 0 || depth > 4)
+  RISCVPrintfRegDefDiag diag =
+      classifyRISCVPrintfRegDef<ELFT>(sec, insns, beforeIndex, reg, depth);
+  if (!diag.constantFormatProven)
     return false;
+  text = diag.format;
+  return true;
+}
+
+template <class ELFT>
+static RISCVPrintfRegDefDiag classifyRISCVPrintfRegDef(
+    InputSectionBase &sec, ArrayRef<RISCVPrintfInsn> insns, size_t beforeIndex,
+    int reg, unsigned depth) {
+  RISCVPrintfRegDefDiag diag;
+  if (reg <= 0 || depth > 4)
+    return diag;
   for (size_t i = beforeIndex; i > 0; --i) {
     const RISCVPrintfInsn &def = insns[i - 1];
     if (!riscvPrintfInsnWritesReg(def, reg))
       continue;
 
     if (def.copy) {
+      diag.kind = RISCVPrintfRegDefKind::Copy;
+      diag.offset = def.offset;
       int src = def.size == 2 ? def.rs2 : def.rs1;
-      return proveRISCVPrintfRegConstantFormat<ELFT>(
-          sec, insns, i - 1, src, text, depth + 1);
+      diag.copySrc = src;
+      diag.copySrcIsCalleeSaved = isRISCVIntegerCalleeSavedReg(src);
+      RISCVPrintfRegDefDiag srcDiag =
+          classifyRISCVPrintfRegDef<ELFT>(sec, insns, i - 1, src, depth + 1);
+      if (srcDiag.constantFormatProven) {
+        diag.constantFormatProven = true;
+        diag.format = srcDiag.format;
+        diag.reason = "none";
+      } else {
+        diag.reason =
+            srcDiag.reason.empty() ? "copy-source-not-constant" : srcDiag.reason;
+      }
+      return diag;
     }
 
-    if (!def.addi || def.rd != reg || i < 2)
-      return false;
+    if (def.stackLoad) {
+      diag.kind = RISCVPrintfRegDefKind::StackLoad;
+      diag.offset = def.offset;
+      diag.reason = "stack-load-source";
+      return diag;
+    }
+
+    if (!def.addi || def.rd != reg || i < 2) {
+      diag.kind = isRISCVIntegerCalleeSavedReg(reg)
+                      ? RISCVPrintfRegDefKind::CalleeSaved
+                      : RISCVPrintfRegDefKind::Unknown;
+      diag.offset = def.offset;
+      diag.reason = "unsupported-definition";
+      return diag;
+    }
     const RISCVPrintfInsn &hi = insns[i - 2];
-    if (!hi.lui || hi.rd != def.rs1)
-      return false;
+    if (!hi.lui || hi.rd != def.rs1) {
+      diag.kind = isRISCVIntegerCalleeSavedReg(reg)
+                      ? RISCVPrintfRegDefKind::CalleeSaved
+                      : RISCVPrintfRegDefKind::Unknown;
+      diag.offset = def.offset;
+      diag.reason = "missing-hi20";
+      return diag;
+    }
 
     Defined *hiSym = nullptr, *loSym = nullptr;
     int64_t hiAddend = 0, loAddend = 0;
     if (!findRISCVPrintfAbsRel<ELFT>(sec, hi.offset, R_RISCV_HI20, hiSym,
                                      hiAddend) ||
         !findRISCVPrintfAbsRel<ELFT>(sec, def.offset, R_RISCV_LO12_I, loSym,
-                                     loAddend))
-      return false;
-    if (hiSym != loSym || hiAddend != loAddend)
-      return false;
-    return isRISCVReadOnlyCStringTarget(*loSym, loAddend, text) &&
-           isRISCVPrintfNonFloatFormat(text);
+                                     loAddend)) {
+      diag.kind = RISCVPrintfRegDefKind::DirectAbs;
+      diag.offset = def.offset;
+      diag.reason = "abs-reloc-not-found";
+      return diag;
+    }
+    if (hiSym != loSym || hiAddend != loAddend) {
+      diag.kind = RISCVPrintfRegDefKind::DirectAbs;
+      diag.offset = def.offset;
+      diag.reason = "abs-reloc-mismatch";
+      return diag;
+    }
+    diag.kind = RISCVPrintfRegDefKind::DirectAbs;
+    diag.offset = def.offset;
+    if (!isRISCVReadOnlyCStringTarget(*loSym, loAddend, diag.format)) {
+      diag.reason = "target-not-string";
+      return diag;
+    }
+    if (!isRISCVPrintfNonFloatFormat(diag.format)) {
+      diag.reason = "format-has-float";
+      return diag;
+    }
+    diag.constantFormatProven = true;
+    diag.reason = "none";
+    return diag;
   }
-  return false;
+  if (isRISCVIntegerCalleeSavedReg(reg)) {
+    diag.kind = RISCVPrintfRegDefKind::CalleeSaved;
+    diag.reason = "callee-saved-source-not-locally-proven";
+  }
+  return diag;
 }
 
 static bool isRISCVPrintfLocalBranchRel(RelType type) {
@@ -4831,15 +4950,21 @@ static bool proveRISCVPrintfLoopCarriedStackFormat(InputSectionBase &sec,
     diag->storeSourceReg = store->rs2;
   }
 
-  std::string text;
-  if (!proveRISCVPrintfRegConstantFormat<ELFT>(sec, insns, storeIndex,
-                                               store->rs2, text)) {
-    recordRISCVPrintfStackFailure(diag, "store-source-not-constant");
+  RISCVPrintfRegDefDiag defDiag =
+      classifyRISCVPrintfRegDef<ELFT>(sec, insns, storeIndex, store->rs2);
+  countRISCVPrintfRegDefKind(diag, defDiag.kind);
+  if (diag && defDiag.copySrcIsCalleeSaved)
+    ++diag->storeSourceCalleeSaved;
+  if (!defDiag.constantFormatProven) {
+    std::string reason = "store-source-not-constant";
+    if (!defDiag.reason.empty())
+      reason = (Twine("store-source-") + defDiag.reason).str();
+    recordRISCVPrintfStackFailure(diag, reason);
     return false;
   }
   if (diag) {
     ++diag->storeConstFormat;
-    diag->storeFormat = text;
+    diag->storeFormat = defDiag.format;
   }
   if (!riscvPrintfStackSlotPathSafe<ELFT>(sec, insns, storeIndex, loadIndex,
                                           load->stackOffset, diag))
@@ -5099,6 +5224,16 @@ template <class ELFT> static void specializeRISCVPrintf() {
             Twine(stackDiag.storeFound));
     message(Twine("printf_stack_store_const_format=") +
             Twine(stackDiag.storeConstFormat));
+    message(Twine("printf_stack_store_source_direct_abs=") +
+            Twine(stackDiag.storeSourceDirectAbs));
+    message(Twine("printf_stack_store_source_copy=") +
+            Twine(stackDiag.storeSourceCopy));
+    message(Twine("printf_stack_store_source_callee_saved=") +
+            Twine(stackDiag.storeSourceCalleeSaved));
+    message(Twine("printf_stack_store_source_stack_load=") +
+            Twine(stackDiag.storeSourceStackLoad));
+    message(Twine("printf_stack_store_source_unknown=") +
+            Twine(stackDiag.storeSourceUnknown));
     message(Twine("printf_stack_full_decode_ok=") +
             Twine(stackDiag.fullDecodeOk));
     message(Twine("printf_stack_backedge_found=") +
