@@ -1375,7 +1375,8 @@ static void readConfigs(opt::InputArgList &args) {
   config->printRISCVLibcSpecializationAudit =
       args.hasArg(OPT_print_riscv_libc_specialization_audit);
   config->riscvPrintfSpecialization =
-      args.hasArg(OPT_riscv_printf_specialization);
+      args.hasFlag(OPT_riscv_printf_specialization,
+                   OPT_no_riscv_printf_specialization, false);
   config->riscvLibcSpecializationAuditDumpFailedCalls = args::getInteger(
       args, OPT_riscv_libc_specialization_audit_dump_failed_calls, 0);
   config->riscvLibcSpecializationAuditDumpCallOffsets =
@@ -1804,6 +1805,10 @@ static void setConfigs(opt::InputArgList &args) {
 
   if (!args.hasArg(OPT_relax_gp, OPT_no_relax_gp))
     config->relaxGP = isRISCV32;
+
+  if (!args.hasArg(OPT_riscv_printf_specialization,
+                   OPT_no_riscv_printf_specialization))
+    config->riscvPrintfSpecialization = isRISCV32;
 
   if (!args.hasArg(OPT_riscv_function_sections_split_debug_relocs,
                    OPT_no_riscv_function_sections_split_debug_relocs))
